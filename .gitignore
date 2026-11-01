@@ -1,0 +1,12 @@
+# Generated from the game or built from it: stays local.
+/build/
+/gen/
+/out/
+/work/
+/host/out/
+
+# Editor and Python leftovers
+__pycache__/
+*.pyc
+.vs/
+.vscode/

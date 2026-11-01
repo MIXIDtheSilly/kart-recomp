@@ -1,0 +1,168 @@
+# Kart static recompilation
+
+Goal: run the game's AArch64 code natively on x86-64 Windows by translating it ahead of time
+to C++ and compiling it with MSVC.
+
+The game files are never committed or redistributed. Every tool here reads them from a local dump,
+and `out/`, `gen/`, `build/` and `work/` hold code derived from the game: keep them private.
+
+## What the binaries look like (measured)
+
+| module  | role                    | code     | instructions | functions | coverage |
+|---------|-------------------------|----------|--------------|-----------|----------|
+| main    | the game                | 40.2 MiB | 10.5 M       | 183,009   | 100 %    |
+| sdk     | Nintendo SDK + libc++   | 7.5 MiB  | 2.0 M        | 44,712    | 99.86 %  |
+| subsdk0 | `nnEcli` (eShop client) | 2.5 MiB  | 0.6 M        | 6,300     | 100 %    |
+| rtld    | dynamic loader          | 8 KiB    | 2 k          | 32        | 100 %    |
+
+* `main` makes no syscalls; it reaches the console only through 1,289 sdk imports.
+* 121 k indirect calls (`blr`, mostly C++ virtual calls) and 13.9 k indirect jumps
+  (2.2 k switch tables, the rest indirect tail calls).
+* Pointer authentication is used everywhere (`pacibsp`/`retab`); the translator treats it as a no-op.
+
+## Architecture (current route: Eglantine backend)
+
+```
+ rtld/main/subsdk0/sdk (AArch64) --lift.py--> <module>_*.cpp --MSVC /MD--> build/<module>.lib
+                                                                              │
+ Eglantine (F:\switch2\ref\Eglantine, branch aot-backend, GPL-3.0)            │
+   core/arm/aot/arm_aot.cpp   CPU backend replacing dynarmic  ◄───────────────┘
+   kernel, Switch 2 services, GPU (Ampere/NVN2), audio: unchanged emulator code
+```
+
+* Generated code is **position-independent**: every address is `MB + offset`, where `MB` is the
+  module's load base (`g_base_<module>`), set by the loader hook. ASLR therefore works.
+* Guest memory is the emulator's fastmem arena: `hp(a) = g_membase + a`. Pages the GPU tracks are
+  protected; a vectored exception handler calls `Memory::InvalidateNCE` and retries (as NCE does).
+* Each guest thread runs on its own boost.context fiber. `svc` switches back to the kernel
+  (`HaltReason::SupervisorCall`), the next `RunThread` resumes after it. Loop back-edges poll
+  `c->halt` so `SignalInterrupt` can preempt spinning threads.
+* Indirect calls look up `<module>_table` (with a per-thread cache). The loader checks every
+  module's build id against the one the code was recompiled from.
+* Run with `EDEN_AOT=1`; without it the emulator uses dynarmic as before.
+
+## Standalone runtime (`host/`, in progress)
+
+`host\build.bat` links the same module libraries into `host\out\kart.exe <dump dir>`, with no emulator:
+
+| file | role |
+|------|------|
+| `main.cpp` | loads the NSOs from `exefs/` (LZ4) at the console's addresses, runtime entry points, crash handler |
+| `memory.cpp` | 512 GiB guest view over a physical pool, the kernel's block map (`svcQueryMemory`), remap notifications |
+| `kernel.cpp` | system calls; guest threads are host threads under a per-core priority scheduler; mutex / condition variable / address arbiter / events under one kernel lock |
+| `ipc.cpp` | HIPC with CMIF, TIPC, domains (shared by cloned sessions) and control commands |
+| `services/` | sm, applet (appletOE), fs (RomFS image built over the loose `romfs/` dir, saves in `user/save`), hid, audren, time, acc, pctl, nifm (offline), friend, lm |
+| `services/hid.cpp` | one Pro Controller on player 1, from every SDL3 gamepad (DualSense, DualShock, Xbox, Switch Pro; XInput if SDL can't start) and the keyboard (when the window has the focus), written into the hid shared memory in Eden's `SharedMemoryFormat` layout every 4 ms |
+| `services/audio.cpp` | audren on Eglantine's `audio_core.lib` (Eden's renderer: voices, mixes, effects, output through cubeb/WASAPI, paced by the output stream); kernel objects it takes are stand-ins (the rendered event, the process for guest memory, the transfer memory's address) |
+| `services/opus.cpp` | `hwopus` on libopus (the movies' audio) |
+| `services/gsv.cpp` | the Switch 2 graphics server: `nx2:gsv` and the sessions it hands out (`syncpt`, `gpu`, `vi2`, `nvsrv`, the video decoder), ported from Eglantine's `nx2_gsv.h`. GPU-only regions get host memory in the code region; sparse regions are backed 4 MiB at a time as the GPU writes them; `vi2` 229 composites the presented image |
+| `nv/` | Eglantine's nvdrv devices (`nvhost-as-gpu`, `-gpu`, `-ctrl`, `-ctrl-gpu`, `nvmap`, container, syncpoints) behind `nx2:nvsrv`, with `Kernel::KEvent` mapped to host events (`nv/kevent.h`) |
+| `video.cpp`, `vma.cpp` | links Eglantine's `video_core.lib` (Ampere command processing, shader recompiler, Vulkan renderer): defines the 19 emulator-core symbols it needs (`Core::System` accessors, guest memory reads, GPU-cached page tracking, clock), the Win32 window, renderer settings (Eglantine's), and the CPU-write fault path |
+| `overrides.cpp`, `graphics.cpp`, `nvn.cpp` | the earlier native-NVN experiment, off unless `HOST_HLE_GRAPHICS=1` |
+
+`rtld` relocates the modules itself, as on the console. Logs go to `host\out\user\host.log`
+(video_core logs through Eglantine's logger); `HOST_IPC_TRACE=1` logs every service request.
+
+Guest memory is Eden's `Common::HostMemory`: a physical pool (16 GiB committed, `HOST_PHYS_GIB`)
+mapped into the 512 GiB fastmem view. The GPU reads the pool directly, so pages it caches can be
+write-protected in the view. `svcMapMemory` and shared memory are real aliases of physical pages.
+
+The host compiles with Eglantine's core flags (`egl.rsp`: its defines and include paths, `/GR-`), so
+class layouts match the prebuilt libraries in `F:\switch2\ref\egl-build`. Rebuild those first
+(`build_egl.bat`) when Eglantine's `video_core` changes.
+
+Status: playable. Runs the game's real NVN driver: title screen, menus, course videos, races.
+On the RTX 3080: menus 60 fps, races about 43-50 fps (Eglantine: 40-55), with sound.
+
+Controls (Eden's defaults): left stick WASD, right stick IJKL, D-pad arrows, A = C, B = X, X = V,
+Y = Z, L = Q, R = E, ZL = R, ZR = T, + = M or Enter, - = N. Gamepads map by position (the bottom
+face button, Cross or Xbox A, is B; the right one A), triggers are ZL/ZR, Options/Start is +,
+Create/Back and the touchpad are -. F3 toggles the performance overlay (FPS, frame time, GPU
+fence wait, RAM) in the top-left corner.
+
+What it took, beyond the services:
+* **Scheduling as on the console**: one guest thread per core (cores 0-5 from the NPDM), the
+  highest-priority ready thread runs, a thread runs on any core of its affinity mask. With every
+  thread running in parallel the game's job workers read data before it was written. Threads give
+  up their core when they wait, sleep or make a service request; preemption uses `ctx.halt`.
+  `svcSleepThread(0)` yields only to equal or higher priority. `HOST_NO_SCHED=1` turns it off.
+* **The GPU follows the CPU's mappings**: when the guest maps or unmaps memory under a GPU
+  mapping, the SMMU pages are mapped again (`nvhost_as_gpu::Nx2Remap`). Stale, the GPU read pages
+  the pool had given to other memory and ran them as commands.
+* Faults on pages another thread is remapping are retried (Windows unmaps a whole view to unmap
+  part of it). The guest counter runs at 31.25 MHz (the Switch 2 SDK's constant). The host timer
+  resolution is raised to 0.5 ms as in Eden (frames took twice as long at the default).
+* **CPU writes to GPU-cached pages** are tracked per store, as Eden's write path and Eglantine's
+  AOT handler do: the fault reports 32 bytes at the address (`OnCPUWrite`; on GPU-modified pages
+  collected in `GPUDirtyMemoryManager`), the page stays write-protected, and the store runs against
+  the page's backing memory (its address register is moved there for one single-stepped
+  instruction, `video::on_single_step`). The collected writes are applied in order before every
+  GPFIFO submit (`nvhost_gpu::SubmitGPFIFOImpl`), not only at fences. Reporting whole pages
+  (`HOST_WRITE_FAULT=page`) made the buffer cache drop the GPU's data in the rest of the page and
+  upload stale guest memory over it: objects or the whole world drawn black every other frame.
+  Applying the writes only at fences left frames with stale data (stretched triangles, empty
+  frames). `HOST_WRITE_FAULT=sync` downloads the page and waits for the host GPU on each fault.
+  Races ~20k redirected stores/s, 40-50 fps.
+* **GPU results the CPU reads** (its auto-exposure among them: read as zeros, the world was white)
+  reach guest memory through read traps (`Memory::RasterizerArmReadTraps`): GPU-written pages lose
+  all access until the CPU's first read, which downloads them and makes the buffer cache copy that
+  range back at every fence. `HOST_READ_TRAPS=0` turns them off. `EDEN_NX2_BUFFER_DOWNLOADS=1`
+  copies every GPU-written buffer back instead; those copies land after the CPU has written the
+  next frame's data next to them (camera data: frames of streaks).
+* **Testing for flicker**: `HOST_FRAME_CAPTURE_EVERY=1` with `HOST_FRAME_CAPTURE_FROM/_TO` and
+  `HOST_FRAME_CAPTURE_WIDTH=640` captures consecutive frames; compare neighbours for cells that go
+  dark or bright for one capture.
+* **Memory**: the pool is 24 GiB (`HOST_PHYS_GIB`). Sparse GPU regions (two ~6 GB virtual textures)
+  get 4 MiB blocks as the GPU first writes them and keep them while the region lives (~250 MB more
+  per course); GPU-only memory leaves the pool's last GiB to the game, past that sparse writes drop.
+* **Disk pipeline cache** (`user/cache/shader/<title>`): loaded at GPU start, new pipelines are saved
+  as they're built. Without it every run compiled each pipeline again (hitches at every new scene).
+  `nx2:vi2 hitch` log lines name frames over 100 ms.
+* Video: gsv 902/906/1002 sessions decode with Eglantine's `Nx2VideoDecoder` (FFmpeg, VP9) into the
+  output images (gsv 991/911/961), counting finished frames on a syncpoint of their own.
+* Unknown TIPC commands reply like Eglantine's auto stub: the result and one zero word, the rest
+  of the message keeps the request's words (the SDK reads them back).
+
+Presents wait for the frame's own GPU fence. `HOST_FRAMES_AHEAD=1` waits for the previous one's
+(Eglantine's default): faster, but the game then rewrites command memory the GPU hasn't read
+(`EDEN_NX2_PB_CHECK=1` reports it) and the GPU soon runs other data; some completion the game
+waits on is answered too early (every buffer slot is always reported free).
+
+Run options: `HOST_VULKAN_DEVICE` (default 2), `HOST_RENDER_HIDDEN=1` and
+`HOST_FRAME_CAPTURE=<dir>` (a PNG every 300 presents) for hidden test runs, `HOST_DUMP_AFTER=<s>`
+(guest thread states), `HOST_NV_TRACE=1` (ioctls), `HOST_INPUT_SCRIPT="<s>:<buttons>:<duration>;..."`
+(scripted presses for test runs, e.g. `30:L+R:0.4;35:A:0.2`), `HOST_ASTC=cpu|async` (ASTC decodes
+on the GPU by default; async shows streamed textures black until decoded), `HOST_AUDIO_MUTE=1`, `HOST_NO_OVERLAY=1`. A crash dump lists
+every guest thread.
+
+NVN cannot be replaced function by function. The driver is in `sdk` (a sorted table of 698 names
+at sdk+0xb79b90, implementations at sdk+0xd95168). A trace of the real driver in Eglantine
+(`EDEN_AOT_NVN_TRACE`, `EDEN_AOT_NVN_PROCS`; see `arm_aot.cpp`) shows the game calls 196 of them,
+only for objects and state. It writes draws (~55k a second) and compute dispatches straight into
+command memory as Ampere methods and Turing MME macro calls. So the host runs the real NVN driver
+and Eglantine's GPU consumes the command stream.
+
+## Tools
+
+| tool | purpose |
+|------|---------|
+| `nso.py` | unpack NSOs, verify hashes, symbols/relocs/init arrays, ELF for Ghidra |
+| `scan.py` | instruction census |
+| `funcs.py` | function bounds from `.eh_frame` plus call targets |
+| `a64.py`, `neon.py` | instruction decoder → C++ (integer, FP, atomics, NEON) |
+| `lift.py` | per-function C++, switch-table recovery (reaching definitions), chunked output |
+| `difftest.py` | compare recompiled leaf functions with Unicorn, registers + memory |
+| `build_lib.py`, `build_all.py` | compile modules into static libraries |
+| `gen_glue.py` | module descriptors (`gen/aot_modules.cpp`) |
+
+Verification so far: 2,481 integer and 997 SIMD leaf functions identical to Unicorn on every case.
+
+## Rebuilding
+
+```
+python tools/build_all.py          # lift + compile rtld, main, subsdk0, sdk (~25 min)
+python tools/gen_glue.py
+cmake -S <Eglantine> -B <build> -DEDEN_AOT_DIR=F:/switch2/recomp ...
+cmake --build <build> --target yuzu-cmd
+set EDEN_AOT=1 && eden-cli.exe -g "<dump>\exefs\main"
+```
