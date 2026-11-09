@@ -1,7 +1,9 @@
 #include "pools.h"
 #include "textures.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -27,6 +29,7 @@ struct Pool {
 };
 std::shared_mutex g_lock;
 std::map<u64, Pool> g_pools;  // by guest start; pools may overlap (aliases of the same storage)
+std::atomic<u64> g_pools_gen{1};  // steps at every change of g_pools
 std::mutex g_window_lock;
 std::unordered_map<u64, Imported> g_windows;  // by k
 
@@ -79,6 +82,7 @@ void pool_add(u64 addr, u64 size) {
     std::unique_lock lk{g_lock};
     if (auto it = g_pools.find(addr); it != g_pools.end() && it->second.own) release_import(it->second.im);
     g_pools[addr] = p;
+    g_pools_gen.fetch_add(1, std::memory_order_release);
 }
 
 void pool_del(u64 addr) {
@@ -92,11 +96,31 @@ void pool_del(u64 addr) {
         defer([im]() mutable { release_import(im); });
     }
     g_pools.erase(it);
+    g_pools_gen.fetch_add(1, std::memory_order_release);
 }
 
 bool pool_find(u64 addr, u64 len, BufferRef& out) {
+    // Every buffer of every draw comes through here: what was found last for this address's page, per thread. An entry
+    // answers for the addresses from its pool's start up to the next pool's, where the search below finds that pool first.
+    struct Last {
+        u64 gen = 0, start = 0, next = 0, end = 0, offset = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceAddress gpu = 0;
+    };
+    constexpr u64 NLast = 1 << 12;
+    thread_local std::unique_ptr<Last[]> last{new Last[NLast]};   // (few threads get here)
+    Last& l = last[(addr >> 12) & (NLast - 1)];
+    const u64 gen = g_pools_gen.load(std::memory_order_acquire);
+    if (l.gen == gen && addr >= l.start && addr < l.next && addr + len <= l.end) {
+        out.buffer = l.buffer;
+        out.offset = l.offset + (addr - l.start);
+        out.size = l.end - addr;
+        out.gpu = l.gpu + (addr - l.start);
+        return true;
+    }
     std::shared_lock lk{g_lock};
     auto it = g_pools.upper_bound(addr);
+    const u64 next = it == g_pools.end() ? UINT64_MAX : it->first;
     // Overlapping pools: the nearest start at or below addr that holds the whole range, looking
     // back a few entries (pools nest only when the game aliases storage).
     for (int tries = 0; it != g_pools.begin() && tries < 8; tries++) {
@@ -107,6 +131,7 @@ bool pool_find(u64 addr, u64 len, BufferRef& out) {
             out.offset = p.offset + (addr - it->first);
             out.size = p.size - (addr - it->first);
             out.gpu = p.gpu + (addr - it->first);
+            if (tries == 0) l = {gen, it->first, next, it->first + p.size, p.offset, p.buffer, p.gpu};
             return true;
         }
     }

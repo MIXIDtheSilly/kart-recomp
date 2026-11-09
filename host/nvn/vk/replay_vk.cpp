@@ -925,7 +925,10 @@ void run_streams() {
 void vk_rp_submit(u64 queue, std::vector<const uint8_t*> handles, u64 fence) {
     Stream& s = g_streams.emplace_back();
     s.queue = queue, s.origin = g_queue_origin_ll.load(), s.fence = fence;
+    static size_t typical = 0;
+    s.recs.reserve(typical);
     for (const uint8_t* h : handles) collect(h, s.recs);
+    typical = std::max(typical, s.recs.size());
     if (!feasible() && g_streams.size() < MaxHeld) {
         if (!g_hold_first.load()) g_hold_first.store(g_streams.front().fence);
         return;

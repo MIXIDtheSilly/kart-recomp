@@ -30,6 +30,7 @@
 #include "format.h"
 #include "nvn_map.h"
 #include "pools.h"
+#include "replay_async.h"
 #include "replay_int.h"
 #include "shaders.h"
 #include "sparse.h"
@@ -186,6 +187,13 @@ VkSampler g_default_sampler = VK_NULL_HANDLE;
 
 // The Vulkan sampler of each sampler handle, made from its parameters at its first use (reset when the game registers
 // the handle again): looking it up by parameters every binding cost several percent of the submitting thread.
+// With the renderer on its own thread everything under g_tab_mu runs on that thread, several times a draw: no lock then.
+struct TabLock {
+    const bool on = !nvn::async_replay();
+    TabLock() { if (on) g_tab_mu.lock(); }
+    ~TabLock() { if (on) g_tab_mu.unlock(); }
+    TabLock(const TabLock&) = delete;
+};
 std::vector<VkSampler> g_samp_vk;   // under g_tab_mu
 std::vector<u64> g_samp_gen;        // as TexEntry::gen, per sampler handle (under g_tab_mu)
 u64 g_reg_gen = 0;                  // the last generation handed out (under g_tab_mu)
@@ -193,7 +201,7 @@ u64 g_reg_gen = 0;                  // the last generation handed out (under g_t
 VkSampler sampler_for(u32 id) {
     samp_par p;
     {
-        std::scoped_lock lk{g_tab_mu};
+        TabLock lk;
         if (id >= g_samp.size() || !g_samp[id].first) return g_default_sampler;
         if (id < g_samp_vk.size() && g_samp_vk[id]) return g_samp_vk[id];
         p = g_samp[id].second;
@@ -607,6 +615,8 @@ void warm_up(std::vector<PipeDesc> list) {
         }
         LOG("nvk: pipeline warm-up: %zu pipelines in the list, done in %llu ms on %u threads (%zu not used yet)", list.size(),
             static_cast<unsigned long long>((host_ns() - t0) / 1'000'000), n, made);
+        // Long only when the driver had to compile them (a new driver, or the layouts changed): keep what it made
+        if (host_ns() - t0 > 10'000'000'000ull) save_pcache();
     }).detach();
 }
 
@@ -788,7 +798,7 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
     const u64 ck = static_cast<u64>(id) | static_cast<u64>(want) << 32 | static_cast<u64>(storage) << 40;
     TexEntry e;
     {
-        std::scoped_lock lk{g_tab_mu};
+        TabLock lk;
         if (id >= g_tex.size() || !g_tex[id].valid) return VK_NULL_HANDLE;
         if (auto it = g_view_cache.find(ck); it != g_view_cache.end() && it->second.gen == g_tex[id].gen && it->second.epoch == epoch)
             return it->second.view;
@@ -841,20 +851,48 @@ struct DrawArgs {
 // scratch hold them): the draws of a pass mostly bind the same buffers and textures, and making a set (resolving
 // handles to views, addresses to buffers, vkUpdateDescriptorSets) cost a fifth of the submitting thread.
 // g_bind_epoch changes whenever what a handle or address resolves to may have (textures.h). HOST_NVN_NO_SET_CACHE=1: off.
-std::unordered_map<u64, VkDescriptorSet> g_set_cache;   // cleared at draw_sub_begin
+// Open addressing, emptied by stepping g_set_gen at draw_sub_begin: a key at most once (bind_stage looks before it keeps).
+struct SetSlot {
+    u64 key = 0, gen = 0;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+};
+constexpr size_t SetSlots = 1 << 15;
+std::vector<SetSlot> g_set_cache(SetSlots);
+u64 g_set_gen = 1;
+size_t g_set_kept = 0;
 u64 g_set_hits = 0, g_set_made = 0;
+
+VkDescriptorSet set_find(u64 key) {
+    for (size_t i = key & (SetSlots - 1);; i = (i + 1) & (SetSlots - 1)) {
+        const SetSlot& e = g_set_cache[i];
+        if (e.gen != g_set_gen) return VK_NULL_HANDLE;
+        if (e.key == key) return e.set;
+    }
+}
+
+void set_keep(u64 key, VkDescriptorSet set) {
+    if (g_set_kept >= SetSlots / 2) return;
+    g_set_kept++;
+    size_t i = key & (SetSlots - 1);
+    while (g_set_cache[i].gen == g_set_gen) i = (i + 1) & (SetSlots - 1);
+    g_set_cache[i] = {key, g_set_gen, set};
+}
 
 // What stage sh's descriptor set is made from in state s; 0 = not to be cached.
 u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
     static const bool off = getenv("HOST_NVN_NO_SET_CACHE") != nullptr;
     if (off || dump_active() || dump_tracing()) return 0;
     const u32 st = sh->stage;
-    thread_local std::vector<u8> k;
-    k.clear();
-    auto put = [](const void* p, size_t n) { k.insert(k.end(), static_cast<const u8*>(p), static_cast<const u8*>(p) + n); };
+    thread_local std::vector<u8> k(1 << 14);
+    size_t used = 0;
+    auto put = [&used](const void* p, size_t n) {
+        if (used + n > k.size()) k.resize(std::max(k.size() * 2, used + n));
+        std::memcpy(k.data() + used, p, n);
+        used += n;
+    };
     const u64 head[2] = {reinterpret_cast<u64>(sh), g_bind_epoch.load(std::memory_order_relaxed)};
     put(head, sizeof head);
-    std::optional<std::scoped_lock<std::mutex>> tab;   // g_tab_mu, from the first texture binding on
+    std::optional<TabLock> tab;   // from the first texture binding on
     for (const Binding& b : sh->bindings) {
         switch (b.kind) {
         case BKind::Support: put(&da.vp_w, 4), put(&da.vp_h, 4); break;
@@ -886,7 +924,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
             const u32 h = b.kind == BKind::Tex ? s.tex[st][b.reg] : s.img[st][b.reg];
             u64 g[3] = {h, 0, 0};
             const u32 tid = h & 0xfffff, sid = h >> 20;
-            if (!tab) tab.emplace(g_tab_mu);
+            if (!tab) tab.emplace();
             if (tid < g_tex.size()) g[1] = g_tex[tid].gen;
             if (b.kind == BKind::Tex && sid < g_samp_gen.size()) g[2] = g_samp_gen[sid];
             put(g, sizeof g);
@@ -895,7 +933,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
         default: break;
         }
     }
-    const u64 h = Common::CityHash64(reinterpret_cast<const char*>(k.data()), k.size());
+    const u64 h = Common::CityHash64(reinterpret_cast<const char*>(k.data()), used);
     return h ? h : 1;
 }
 
@@ -945,9 +983,9 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     const u32 st = sh->stage;
     const u64 key = stage_key(s, sh, da);
     if (key && !(dump_active() && !dump_brief()))   // (a dump notes every binding of every draw)
-        if (auto it = g_set_cache.find(key); it != g_set_cache.end()) {
+        if (const VkDescriptorSet kept = set_find(key)) {
             g_set_hits++;
-            vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &it->second, 0, nullptr);
+            vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
             return true;
         }
     g_set_made++;
@@ -1122,7 +1160,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     }
     if (!writes.empty()) vkUpdateDescriptorSets(ctx().dev, static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &set, 0, nullptr);
-    if (key && !g_used_placeholder) g_set_cache.emplace(key, set);
+    if (key && !g_used_placeholder) set_keep(key, set);
     return true;
 }
 
@@ -1369,6 +1407,9 @@ namespace {
 // A GPU hang surfaces about 5 s late (Windows' timeout), long after the draw that caused it was recorded. What a device loss needs is the
 // first use of each pipeline, the likely culprits: these draws are traced, and vk_fail logs the ring.
 void trace_first_use(VkPipeline pipe, const Shader* a, const Shader* b) {
+    static VkPipeline last = VK_NULL_HANDLE;
+    if (pipe == last) return;
+    last = pipe;
     static std::unordered_set<VkPipeline> seen;
     if (!seen.insert(pipe).second) return;
     dump_trace(true);
@@ -1670,7 +1711,7 @@ u32 draw_written_word(volatile void* host) {
 void draw_sub_begin(u64 done) {
     draw_init();
     g_written.clear();
-    g_set_cache.clear();
+    g_set_gen++, g_set_kept = 0;
     g_view_cache.clear();
     dyn_reset();
     Device& c = ctx();
