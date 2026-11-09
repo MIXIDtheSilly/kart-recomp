@@ -8,12 +8,15 @@ and <gen dir>/<module>_stats.json (coverage and the most common unsupported enco
 import argparse
 import collections
 import json
+import os
+import re
 import struct
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import a64  # noqa: E402
+import patches  # noqa: E402
 
 try:
     import capstone
@@ -295,6 +298,7 @@ POLL = "if (c->halt) guest_yield(c); "
 
 # Generated function names carry the module so several modules link into one binary.
 PREFIX = "f"
+PATCHES = {}  # pc -> replacement C++ statements (patches.py)
 
 
 def fname(addr):
@@ -359,16 +363,22 @@ def lift_function(mod, start, size, with_asm, stats, entries=None):
     for targets in jt.values():
         labels.update(targets)
 
-    body = []
+    # One unit per instruction: its label, its line and the instructions it may continue at (for --regcache)
+    index = {pc: i for i, (pc, w, ins) in enumerate(insns)}
+    units = []
     for i, (pc, w, ins) in enumerate(insns):
-        if pc in labels:
-            body.append(f"L_{pc:x}:")
+        unit = {"label": f"L_{pc:x}:" if pc in labels else None, "text": None, "succ": []}
+        units.append(unit)
         comment = f"  // {pc:x}: {disasm(w, pc)}" if with_asm else ""
         if ins is None:
-            body.append(f"    guest_trap(c, {a64.guest_addr(pc)}, 0xFFFF);  // unsupported{comment}")
+            unit["text"] = f"    guest_trap(c, {a64.guest_addr(pc)}, 0xFFFF);  // unsupported{comment}"
             continue
-        lines = list(ins.code)
         k = ins.kind
+        if pc in PATCHES and k == "op":
+            lines = list(PATCHES[pc])
+            comment += " [patched]" if comment else ""
+        else:
+            lines = list(ins.code)
         if k == "b":
             if start <= ins.target < end:
                 lines.append(f"{POLL if ins.target <= pc else ''}goto L_{ins.target:x};")
@@ -397,16 +407,36 @@ def lift_function(mod, start, size, with_asm, stats, entries=None):
                 lines.append(f"call_indirect(c, {ins.reg}); return;")
         elif k == "ret":
             lines.append("return;")
-        body.append("    " + " ".join(lines) + comment if lines else f"   {comment}" if comment else None)
-    body = [b for b in body if b is not None]
+        unit["text"] = "    " + " ".join(lines) + comment if lines else f"   {comment}" if comment else None
+        internal = start <= getattr(ins, "target", -1) < end
+        if k == "b":
+            unit["succ"] = [index[ins.target]] if internal else []
+        elif k == "bcond":
+            unit["succ"] = ([index[ins.target]] if internal else []) + [i + 1]
+        elif k == "ijump":
+            unit["succ"] = sorted({index[t] for t in jt[pc]}) if pc in jt else []
+        elif k not in ("ret", "trap"):
+            unit["succ"] = [i + 1]
 
     last = insns[-1][2] if insns else None
     if last is None or last.kind not in ("b", "ret", "trap", "ijump"):
         if end in mod.starts:
             callees.add(end)
-            body.append(f"    {fname(end)}(c); return;  // falls through into the next function")
+            units.append({"label": None, "text": f"    {fname(end)}(c); return;  // falls through into the next function", "succ": []})
         else:
-            body.append(f"    guest_trap(c, {a64.guest_addr(end)}, 0xFFFE);  // fell off the end")
+            units.append({"label": None, "text": f"    guest_trap(c, {a64.guest_addr(end)}, 0xFFFE);  // fell off the end", "succ": []})
+    for u in units:   # (an instruction at the end continues at the line past it, if any)
+        u["succ"] = [j for j in u["succ"] if j < len(units)]
+    decls = []
+    if REGCACHE:
+        decls = regcache(units, [index[e] for e in entries] if entries else [0])
+    body = []
+    for u in units:
+        if u["label"]:
+            body.append(u["label"])
+        if u["text"] is not None:
+            body.append(u["text"])
+    head = "".join(d + "\n" for d in decls)
 
     if unsupported:
         stats["functions_with_unsupported"] += 1
@@ -419,15 +449,170 @@ def lift_function(mod, start, size, with_asm, stats, entries=None):
     if entries:
         rname = f"{PREFIX}_r_{start:x}"
         cases = " ".join(f"case {e:#x}ull: goto L_{e:x};" for e in entries)
-        code = (f"void {rname}(Ctx* c, uint64_t entry) {{\n    switch (entry) {{ {cases} }}\n" + "\n".join(body) + "\n}\n"
+        code = (f"void {rname}(Ctx* c, uint64_t entry) {{\n" + head + f"    switch (entry) {{ {cases} }}\n" + "\n".join(body) + "\n}\n"
                 + "".join(f"void {fname(e)}(Ctx* c) {{ {rname}(c, {e:#x}ull); }}\n" for e in entries))
     else:
-        code = f"void {fname(start)}(Ctx* c) {{\n" + "\n".join(body) + "\n}\n"
+        code = f"void {fname(start)}(Ctx* c) {{\n" + head + "\n".join(body) + "\n}\n"
     if any(len(t) > 256 for pc, t in jt.items() if pc not in exact_tables):
         # Thousands of possible goto targets make MSVC's optimizer run for hours; these few
         # functions are compiled unoptimised instead.
         code = '#pragma optimize("", off)\n' + code + '#pragma optimize("", on)\n'
     return code, callees, not unsupported
+
+
+# ------------------------------------------------------------------ register caching (--regcache)
+# The guest registers, sp and the flags a function uses live in C++ locals instead of the Ctx: every c->x[n] was a
+# memory access, and as stores through guest pointers might alias the Ctx to the compiler, none stayed in a host
+# register. The locals go back to the Ctx before anything that may read or change it (calls, system calls, traps,
+# returns) and are read again after it. g_membase and the module base are read once per function too.
+
+REG_RE = re.compile(r"c->x\[(\d+)\]")
+FLAG_RE = re.compile(r"c->(n|z|cf|vf)\b")
+FLAG_HELPERS_RE = re.compile(r"\b(adds64|adds32|logic_flags64|logic_flags32|fcmp_flags|set_nzcv|get_nzcv)(<[^<>()]*>)?\(c([,)])")
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z_0-9]*)(<[^<>()]*>)?\(c([,)])")
+KEEP_C = {"excl_store", "excl_load_pair", "excl_store_pair", "guest_yield"}   # read only the monitor / nothing of the registers
+NORETURN = {"guest_trap", "guest_unresolved_jump"}
+WRITE_RE = re.compile(r"\bX_(\d+)\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)")
+RETURN_RE = re.compile(r"\breturn;")
+
+
+def rewrite_line(text):
+    """A line with registers, sp and flags as locals and its escapes wrapped: \\x01W<n>\\x01 (write back) and \\x01R
+    (read again) placeholders, filled in by regcache. -> (text, escapes, ends): whether it has escapes that
+    continue, and whether every way through it leaves the function."""
+    text = FLAG_HELPERS_RE.sub(lambda m: f"{m.group(1)}{m.group(2) or ''}(&F{m.group(3)}", text)
+    text = REG_RE.sub(r"X_\1", text)
+    text = text.replace("c->sp", "SP_")
+    text = FLAG_RE.sub(r"F.\1", text)
+    text = re.sub(r"\b(ld|st)<([^<>()]*)>\(", lambda m: f"{m.group(1)}m<{m.group(2)}>(M_, ", text)
+    res, i, resumes = [], 0, False
+    while True:
+        m = CALL_RE.search(text, i)
+        r = RETURN_RE.search(text, i)
+        if r and (not m or r.start() < m.start()):
+            res.append(text[i:r.start()])
+            res.append("{ \x01W return; }")
+            i = r.end()
+            continue
+        if not m:
+            res.append(text[i:])
+            break
+        name = m.group(1)
+        if name in KEEP_C:
+            res.append(text[i:m.end()])
+            i = m.end()
+            continue
+        # the statement: to the closing parenthesis of this call and its ';'
+        before = text[:m.start()].rstrip()
+        assert not before or before[-1] in ";{}):", (name, text[max(0, m.start() - 60):m.end() + 20])
+        j = m.end()
+        if m.group(3) == ",":
+            depth = 1
+            while depth:
+                ch = text[j]
+                depth += ch == "("
+                depth -= ch == ")"
+                j += 1
+        assert text[j] == ";", (name, text[m.start():j + 10])
+        stmt = text[m.start():j + 1]
+        res.append(text[i:m.start()])
+        k = j + 1
+        tail = re.match(r"\s*return;", text[k:])
+        if tail:
+            res.append("{ \x01W " + stmt + " return; }")
+            k += tail.end()
+        elif name in NORETURN:
+            res.append("{ \x01W " + stmt + " }")
+        else:
+            res.append("{ \x01W " + stmt + " \x01R }")
+            resumes = True
+        i = k
+    return "".join(res), resumes
+
+
+SP_BIT, FLAGS_BIT = 1 << 32, 1 << 33
+
+
+def written_bits(text):
+    bits = 0
+    for n in WRITE_RE.findall(text):
+        bits |= 1 << int(n)
+    if re.search(r"\bSP_\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", text):
+        bits |= SP_BIT
+    if "&F" in text or re.search(r"\bF\.(n|z|cf|vf)\s*=(?!=)", text) or re.search(r"\bF\s*=(?!=)", text):
+        bits |= FLAGS_BIT
+    return bits
+
+
+def regcache(units, entries):
+    """Rewrites the units' lines to keep registers in locals; -> the function's declarations. A write-back stores
+    the locals that may differ from the Ctx there: written since the entry or the last escape on some way to it."""
+    escapes = []
+    for u in units:
+        if u["text"] is None:
+            u["w"], u["resumes"] = 0, False
+            continue
+        u["text"], u["resumes"] = rewrite_line(u["text"])
+        u["w"] = written_bits(u["text"].replace("\x01R", ""))
+    # forward dataflow: registers that may differ from the Ctx on entry to each unit
+    dirty = [None] * len(units)
+    work = []
+    for e in entries:
+        dirty[e] = 0
+        work.append(e)
+    while work:
+        i = work.pop()
+        u = units[i]
+        out = 0 if u["resumes"] else dirty[i] | u["w"]
+        for j in u["succ"]:
+            if dirty[j] is None or (dirty[j] | out) != dirty[j]:
+                dirty[j] = out if dirty[j] is None else dirty[j] | out
+                work.append(j)
+    text_all = "\n".join(u["text"] for u in units if u["text"])
+    regs = sorted({int(n) for n in re.findall(r"\bX_(\d+)\b", text_all)})
+    sp_used = "SP_" in text_all
+    flags_used = "F." in text_all or "&F" in text_all or "F = " in text_all
+    rl = [f"X_{n} = c->x[{n}];" for n in regs]
+    if sp_used:
+        rl.append("SP_ = c->sp;")
+    if flags_used:
+        rl.append("F = Flags{c->n, c->z, c->cf, c->vf};")
+    reload = " ".join(rl)
+
+    def write_back(bits):
+        wb = [f"c->x[{n}] = X_{n};" for n in range(32) if bits >> n & 1]
+        if bits & SP_BIT:
+            wb.append("c->sp = SP_;")
+        if bits & FLAGS_BIT:
+            wb.append("c->n = F.n; c->z = F.z; c->cf = F.cf; c->vf = F.vf;")
+        return " ".join(wb)
+
+    uses_mb = False
+    for i, u in enumerate(units):
+        if u["text"] is None:
+            continue
+        # (unreachable units: everything their line writes)
+        t = u["text"].replace("\x01W", write_back((dirty[i] or 0) | u["w"])).replace("\x01R", reload)
+        if re.search(r"\bMB\b", t):
+            uses_mb = True
+            t = re.sub(r"\bMB\b", "MB_", t)
+        u["text"] = t
+    decls = []
+    if "M_" in text_all:
+        decls.append("const uintptr_t M_ = g_membase;")
+    if uses_mb:
+        decls.append("const uint64_t MB_ = MB;")
+    if regs:
+        decls.append("uint64_t " + ", ".join(f"X_{n} = c->x[{n}]" for n in regs) + ";")
+    if sp_used:
+        decls.append("uint64_t SP_ = c->sp;")
+    if flags_used:
+        decls.append("Flags F{c->n, c->z, c->cf, c->vf};")
+    return ["    " + " ".join(decls)] if decls else []
+
+
+# LIFT_REGCACHE=0: registers stay in the Ctx (the code as before)
+REGCACHE = os.environ.get("LIFT_REGCACHE", "1") != "0"
 
 
 def tail_call(mod, target, pc, callees):
@@ -446,11 +631,15 @@ def main():
     ap.add_argument("--chunk", type=int, default=600)
     ap.add_argument("--asm", action="store_true", help="annotate each line with its disassembly")
     ap.add_argument("--stats-only", action="store_true")
+    ap.add_argument("--hot", help="file of function names (<module>_<hex>, one a line): lifted into <module>_hot_*.cpp, "
+                                  "a few a file, which build_lib.py compiles with MSVC's huge-function optimization")
+    ap.add_argument("--hot-chunk", type=int, default=6)
     a = ap.parse_args()
 
     mod = Module(Path(a.out), a.module)
-    global PREFIX
+    global PREFIX, PATCHES
     PREFIX = f"{a.module}"
+    PATCHES = patches.find(a.module, mod)
     gen = Path(a.gen)
     gen.mkdir(parents=True, exist_ok=True)
     funcs = mod.funcs
@@ -462,18 +651,29 @@ def main():
     stats = {"functions": 0, "instructions": 0, "functions_with_unsupported": 0, "jump_tables": 0,
              "jump_tables_superset": 0, "indirect_tail_calls": 0, "blocked_by": collections.Counter(), "unsupported_insns": collections.Counter()}
     clean = []
-    chunk, chunk_callees, chunk_defs, n = [], set(), set(), 0
+    hot = set()
+    if a.hot:
+        for name in Path(a.hot).read_text().split():
+            if name.startswith(a.module + "_"):
+                hot.add(int(name[len(a.module) + 1:], 16))
 
-    def flush():
-        nonlocal chunk, chunk_callees, chunk_defs, n
-        if not chunk or a.stats_only:
-            chunk, chunk_callees, chunk_defs = [], set(), set()
-            return
-        decls = "".join(f"void {fname(t)}(Ctx* c);\n" for t in sorted(chunk_callees | chunk_defs))
-        write_if_changed(gen / f"{a.module}_{n:03}.cpp",
-                         f'#include "cpu.h"\n\nextern uint64_t g_base_{a.module};\n#define MB g_base_{a.module}\n\n{decls}\n' + "\n".join(chunk))
-        n += 1
-        chunk, chunk_callees, chunk_defs = [], set(), set()
+    # A chunk of functions to a file; hot functions still count toward the chunk they would be in (so the other
+    # files stay the same) but go to the hot files.
+    class Chunk:
+        def __init__(self, name, size):
+            self.name, self.size, self.n = name, size, 0
+            self.code, self.callees, self.defs, self.count = [], set(), set(), 0
+
+        def flush(self):
+            if self.code and not a.stats_only:
+                decls = "".join(f"void {fname(t)}(Ctx* c);\n" for t in sorted(self.callees | self.defs))
+                write_if_changed(gen / f"{a.module}_{self.name}{self.n:03}.cpp",
+                                 f'#include "cpu.h"\n\nextern uint64_t g_base_{a.module};\n#define MB g_base_{a.module}\n\n{decls}\n' + "\n".join(self.code))
+            if self.count:
+                self.n += 1
+            self.code, self.callees, self.defs, self.count = [], set(), set(), 0
+
+    normal, hotc = Chunk("", a.chunk), Chunk("hot_", a.hot_chunk)
 
     region_members = {}
     for f in funcs:
@@ -481,6 +681,7 @@ def main():
             region_members.setdefault(f["region"], []).append(f)
     for idx, f in enumerate(funcs):
         start = mod.base + f["addr"]
+        is_hot = f["addr"] in hot or any(m["addr"] in hot for m in region_members.get(f.get("region"), []))
         if "region" in f:
             if f["region"] != f["addr"]:
                 continue  # lifted together with the region's first entry
@@ -489,23 +690,31 @@ def main():
             code, callees, ok = lift_function(mod, start, sum(m["size"] for m in members), a.asm, stats, entries)
             if ok:
                 clean.extend(m["addr"] for m in members)
-            chunk_defs.update(entries)
+            defs = set(entries)
         else:
             code, callees, ok = lift_function(mod, start, f["size"], a.asm, stats)
             if ok:
                 clean.append(f["addr"])
-            chunk_defs.add(start)
-        chunk.append(code)
-        chunk_callees |= {t for t in callees if t in mod.starts}
-        if len(chunk) >= a.chunk:
-            flush()
+            defs = {start}
+        normal.count += 1
+        hotc.count += is_hot
+        target = hotc if is_hot else normal
+        target.code.append(code)
+        target.defs |= defs
+        target.callees |= {t for t in callees if t in mod.starts}
+        if normal.count >= normal.size:
+            normal.flush()
+        if hotc.count >= hotc.size:
+            hotc.flush()
         if idx % 20000 == 0 and idx:
             print(f"  {idx:,}/{len(funcs):,}", flush=True)
-    flush()
+    normal.flush()
+    hotc.flush()
     if not a.stats_only and not a.only:
-        for old in gen.glob(f"{a.module}_[0-9][0-9][0-9].cpp"):
-            if int(old.stem.rsplit("_", 1)[1]) >= n:
-                old.unlink()
+        for ch, pat in ((normal, "[0-9][0-9][0-9]"), (hotc, "hot_[0-9][0-9][0-9]")):
+            for old in gen.glob(f"{a.module}_{pat}.cpp"):
+                if int(old.stem.rsplit("_", 1)[1]) >= ch.n:
+                    old.unlink()
 
     if not a.stats_only:
         lifted = [mod.base + f["addr"] for f in funcs]

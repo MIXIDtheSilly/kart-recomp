@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "cpu.h"
@@ -120,6 +121,9 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> scratch0(SCRATCH_SIZE), stack0(STACK_SIZE);
     std::vector<uint64_t> diffs;
     CaseIn ci;
+    const char* be = std::getenv("HARNESS_BENCH");
+    const int bench_n = be ? std::atoi(be) : 0;
+    long long bench_ticks = 0, bench_calls = 0;
     while (std::fread(&ci, sizeof ci, 1, in) == 1) {
         std::memcpy(reinterpret_cast<void*>(base + rw_off), pristine.data() + rw_off, image_size - rw_off);
         fill(SCRATCH, SCRATCH_SIZE, ci.seed);
@@ -137,7 +141,25 @@ int main(int argc, char** argv) {
 
         CaseOut co{};
         GuestFn fn = lookup_fn(main_table, main_table_size, ci.fn - base);
+        const Ctx init = c;
         co.status = fn ? run_guarded(fn, &c) : 1;
+        // HARNESS_BENCH=<n>: each case that ran cleanly again n times from the same registers (memory as left)
+        if (bench_n && fn && co.status == 0) {
+            LARGE_INTEGER t0, t1;
+            QueryPerformanceCounter(&t0);
+            for (int k = 0; k < bench_n; k++) {
+                Ctx cb = init;
+                run_guarded(fn, &cb);
+            }
+            QueryPerformanceCounter(&t1);
+            bench_ticks += t1.QuadPart - t0.QuadPart, bench_calls += bench_n;
+            std::memcpy(reinterpret_cast<void*>(SCRATCH), scratch0.data(), SCRATCH_SIZE);
+            std::memcpy(reinterpret_cast<void*>(STACK), stack0.data(), STACK_SIZE);
+            Ctx again = init;
+            std::memcpy(reinterpret_cast<void*>(base + rw_off), pristine.data() + rw_off, image_size - rw_off);
+            co.status = run_guarded(fn, &again);
+            c = again;
+        }
         std::memcpy(co.x, c.x, sizeof co.x);
         co.sp = c.sp;
         co.nzcv = get_nzcv(&c);
@@ -152,5 +174,11 @@ int main(int argc, char** argv) {
         std::fwrite(diffs.data(), 8, diffs.size(), out);
     }
     std::fclose(out);
+    if (bench_n) {
+        LARGE_INTEGER fq;
+        QueryPerformanceFrequency(&fq);
+        std::fprintf(stderr, "bench: %lld calls, %.1f ns per call\n", bench_calls,
+                     bench_calls ? 1e9 * bench_ticks / fq.QuadPart / bench_calls : 0.0);
+    }
     return 0;
 }

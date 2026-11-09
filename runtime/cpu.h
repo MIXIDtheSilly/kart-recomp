@@ -46,6 +46,14 @@ void guest_yield(Ctx* c);  // called at loop back-edges when c->halt is set
 uint64_t host_cntvct();
 uint64_t host_cntfrq();
 
+// ------------------------------------------------------------------ game patches (tools/patches.py)
+
+// The frame loop's present-interval mode: -1 = the game's own, 0 = dynamic (from the whole frame's
+// time), 1 = every vblank, 2 = every other vblank (30 fps). Set by the runtime before the game runs.
+inline int32_t g_mkw_frame_mode = -1;
+// The frame loop's object (x19 at that site, set every frame): [+0x214] is the current frame's interval.
+inline uint64_t g_mkw_frame_obj = 0;
+
 // ------------------------------------------------------------------ memory
 
 // Host address of guest address 0 (the emulator's fastmem arena; 0 for identity mapping).
@@ -54,6 +62,10 @@ static inline void* hp(uint64_t a) { return reinterpret_cast<void*>(g_membase + 
 
 template <class T> static inline T ld(uint64_t a) { T v; std::memcpy(&v, hp(a), sizeof v); return v; }
 template <class T> static inline void st(uint64_t a, T v) { std::memcpy(hp(a), &v, sizeof v); }
+// The same with the arena's base passed in: generated code reads g_membase once per function (a store through a
+// guest pointer could otherwise be the global itself to the compiler, which then reloads it after every store).
+template <class T> static inline T ldm(uintptr_t m, uint64_t a) { T v; std::memcpy(&v, reinterpret_cast<void*>(m + a), sizeof v); return v; }
+template <class T> static inline void stm(uintptr_t m, uint64_t a, T v) { std::memcpy(reinterpret_cast<void*>(m + a), &v, sizeof v); }
 
 template <class T> static inline T ld_acq(uint64_t a) { return std::atomic_ref<T>(*static_cast<T*>(hp(a))).load(std::memory_order_acquire); }
 template <class T> static inline void st_rel(uint64_t a, T v) { std::atomic_ref<T>(*static_cast<T*>(hp(a))).store(v, std::memory_order_release); }
@@ -132,25 +144,30 @@ template <class T> static inline uint32_t excl_store_pair(Ctx* c, uint64_t a, ui
 
 // ------------------------------------------------------------------ flags
 
-static inline void set_nzcv(Ctx* c, unsigned v) { c->n = (v >> 3) & 1; c->z = (v >> 2) & 1; c->cf = (v >> 1) & 1; c->vf = v & 1; }
-static inline uint64_t get_nzcv(Ctx* c) { return static_cast<uint64_t>(c->n << 3 | c->z << 2 | c->cf << 1 | c->vf) << 28; }
+// The flag helpers take a Ctx or, in generated code, a function's local copy of the flags (lift.py --regcache).
+struct Flags {
+    uint8_t n, z, cf, vf;
+};
 
-static inline uint64_t adds64(Ctx* c, uint64_t a, uint64_t b, unsigned ci) {
+template <class C> static inline void set_nzcv(C* c, unsigned v) { c->n = (v >> 3) & 1; c->z = (v >> 2) & 1; c->cf = (v >> 1) & 1; c->vf = v & 1; }
+template <class C> static inline uint64_t get_nzcv(C* c) { return static_cast<uint64_t>(c->n << 3 | c->z << 2 | c->cf << 1 | c->vf) << 28; }
+
+template <class C> static inline uint64_t adds64(C* c, uint64_t a, uint64_t b, unsigned ci) {
     uint64_t r;
     c->cf = _addcarry_u64(static_cast<unsigned char>(ci), a, b, &r);
     c->n = r >> 63; c->z = r == 0;
     c->vf = ((~(a ^ b) & (a ^ r)) >> 63) & 1;
     return r;
 }
-static inline uint32_t adds32(Ctx* c, uint32_t a, uint32_t b, unsigned ci) {
+template <class C> static inline uint32_t adds32(C* c, uint32_t a, uint32_t b, unsigned ci) {
     unsigned int r;
     c->cf = _addcarry_u32(static_cast<unsigned char>(ci), a, b, &r);
     c->n = r >> 31; c->z = r == 0;
     c->vf = ((~(a ^ b) & (a ^ r)) >> 31) & 1;
     return r;
 }
-static inline uint64_t logic_flags64(Ctx* c, uint64_t r) { c->n = r >> 63; c->z = r == 0; c->cf = 0; c->vf = 0; return r; }
-static inline uint32_t logic_flags32(Ctx* c, uint32_t r) { c->n = r >> 31; c->z = r == 0; c->cf = 0; c->vf = 0; return r; }
+template <class C> static inline uint64_t logic_flags64(C* c, uint64_t r) { c->n = r >> 63; c->z = r == 0; c->cf = 0; c->vf = 0; return r; }
+template <class C> static inline uint32_t logic_flags32(C* c, uint32_t r) { c->n = r >> 31; c->z = r == 0; c->cf = 0; c->vf = 0; return r; }
 
 // ------------------------------------------------------------------ integer helpers
 
@@ -197,7 +214,7 @@ static inline uint32_t crc32c_64(uint32_t acc, uint64_t v) { return static_cast<
 
 // ------------------------------------------------------------------ floating point
 
-static inline void fcmp_flags(Ctx* c, double a, double b) {
+template <class C> static inline void fcmp_flags(C* c, double a, double b) {
     if (std::isnan(a) || std::isnan(b)) set_nzcv(c, 0b0011);
     else if (a == b) set_nzcv(c, 0b0110);
     else if (a < b) set_nzcv(c, 0b1000);
