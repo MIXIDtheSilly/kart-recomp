@@ -29,8 +29,9 @@ int present_hz() {
     }();
     return hz;
 }
-// Frames follow the present interval the game sets (1 = 60 fps, 2 = 30 fps ...)
-int present_itv(const win_t* o) { return o->interval > 0 ? o->interval : 1; }
+// Frames follow the present interval the game sets (1 = 60 fps, 2 = 30 fps ...), except in the dynamic frame mode (cpu.h g_mkw_frame_mode 0):
+// there the game marks a frame that ran late as 2, and holding it for two vblanks would keep the game at 30 fps (as pace_to_vblank in gsv.cpp)
+int present_itv(const win_t* o) { return g_mkw_frame_mode == 0 || o->interval <= 0 ? 1 : o->interval; }
 uint64_t present_period(const win_t* o) { const int hz = present_hz(); return hz > 0 ? (uint64_t)present_itv(o) * 1000000000ull / (uint64_t)hz : 0; }
 
 // Present pacer. Semantics as vsync: present slot = previous present slot + period. Early -> wait until the present slot; late by less than one period -> present immediately and keep the original
