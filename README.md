@@ -69,7 +69,9 @@ write-protected in the view. `svcMapMemory` and shared memory are real aliases o
 
 The host compiles with Eglantine's core flags (`egl.rsp`: its defines and include paths, `/GR-`), so
 class layouts match the prebuilt libraries in `F:\switch2\ref\egl-build`. Rebuild those first
-(`build_egl.bat`) when Eglantine's `video_core` changes.
+(`build_egl.bat`) when Eglantine's `video_core` changes. `egl-build` is RelWithDebInfo with
+`CMAKE_CXX_FLAGS_RELWITHDEBINFO=/O2 /Ob2 /DNDEBUG` (CMake's default `/Ob1` inlines only functions
+marked inline: races ran ~5% slower).
 
 Status: playable. Runs the game's real NVN driver: title screen, menus, course videos, races.
 On the RTX 3080: menus 60 fps, races about 43-50 fps (Eglantine: 40-55), with sound.
@@ -88,10 +90,18 @@ What it took, beyond the services:
   `svcSleepThread(0)` yields only to equal or higher priority. `HOST_NO_SCHED=1` turns it off.
 * **The GPU follows the CPU's mappings**: when the guest maps or unmaps memory under a GPU
   mapping, the SMMU pages are mapped again (`nvhost_as_gpu::Nx2Remap`). Stale, the GPU read pages
-  the pool had given to other memory and ran them as commands.
+  the pool had given to other memory and ran them as commands. GPU unmaps (regions and memory
+  the game destroys) wait for the GPU thread to finish the work queued before them, maps happen at
+  once; a queued unmap skips what was mapped again after it was queued (title 1 destroys and
+  re-creates GPU-only regions at the same addresses at course loads: the late unmap left the new
+  region unmapped). `HOST_STALE_UNMAP=1` restores the old behaviour.
 * Faults on pages another thread is remapping are retried (Windows unmaps a whole view to unmap
   part of it). The guest counter runs at 31.25 MHz (the Switch 2 SDK's constant). The host timer
   resolution is raised to 0.5 ms as in Eden (frames took twice as long at the default).
+  Guest sleeps under 4 ms wait on the clock for their last 700 us (`HOST_SLEEP_SPIN_US`, 0 = timer
+  only): the game's job loops sleep 20 us between polls (main thread and workers ~100 times a
+  second each in races) and a Windows timer made each ~0.5 ms. Races +2-4% (A/B pairs 42.1/44.0,
+  41.0/42.0 fps).
 * **CPU writes to GPU-cached pages** are tracked per store, as Eden's write path and Eglantine's
   AOT handler do: the fault reports 32 bytes at the address (`OnCPUWrite`; on GPU-modified pages
   collected in `GPUDirtyMemoryManager`), the page stays write-protected, and the store runs against
@@ -115,6 +125,12 @@ What it took, beyond the services:
 * **Memory**: the pool is 24 GiB (`HOST_PHYS_GIB`). Sparse GPU regions (two ~6 GB virtual textures)
   get 4 MiB blocks as the GPU first writes them and keep them while the region lives (~250 MB more
   per course); GPU-only memory leaves the pool's last GiB to the game, past that sparse writes drop.
+  Sparse blocks without GPU writes for 30 s (`HOST_TRIM_SPARSE_S`) and, every 60 s
+  (`HOST_TRIM_GPU_ONLY`), the whole GPU-only regions leave the working set (`VirtualUnlock`; 0 turns
+  either off): their data was uploaded already and comes back from the standby list or pagefile if
+  read again. Guest memory resident after 10 minutes of races: ~3 GB instead of ~6 GB, same frame
+  rate. `HOST_MEM_REPORT=1` logs residency per kind once a minute. The overlay's RAM counts pages
+  mapped in both views (guest address space and the GPU's) once; the working set counts them twice.
 * **Disk pipeline cache** (`user/cache/shader/<title>`): loaded at GPU start, new pipelines are saved
   as they're built. Without it every run compiled each pipeline again (hitches at every new scene).
   `nx2:vi2 hitch` log lines name frames over 100 ms.
@@ -125,8 +141,63 @@ What it took, beyond the services:
 
 Presents wait for the frame's own GPU fence. `HOST_FRAMES_AHEAD=1` waits for the previous one's
 (Eglantine's default): faster, but the game then rewrites command memory the GPU hasn't read
-(`EDEN_NX2_PB_CHECK=1` reports it) and the GPU soon runs other data; some completion the game
-waits on is answered too early (every buffer slot is always reported free).
+(`EDEN_NX2_PB_CHECK=1` reports it, with the small entries' words at submit in host.log) and the GPU
+soon runs other data (crash ~16 s in). The rewritten entries are NVN's 3-word queue-ring commands,
+read 320 ms after submit. The game's render thread already builds frame N+1 while N runs; one more
+frame lets it reuse N's memory. Copying entries at submit is no fix: NVN2 also submits command
+buffers before writing them, behind a semaphore (NX2_NOTES row 50).
+`HOST_FRAMES_AHEAD_AFTER=<presents>` starts running ahead only after boot: menus then hold 60 fps
+with ~0 ms fence wait, and the one run that got through course select raced at ~60 fps (vs ~40).
+But 4 of 5 runs broke at the course-select load (~100 s): GPU state from garbage commands, then a
+crash or a GPU hang. Waiting until every channel had read all command lists submitted before the
+previous present (also ones suspended on semaphores) changed nothing, so unread GPFIFO entries are
+not the cause. What the traces show: per frame, channel 2 compute releases 1..5 on a sync
+semaphore (0x21f6693040 / ..140, alternating per frame) that channel 1 acquires (>= 1..5); the CPU
+resets it to 0 (no GPU release of 0 ever), and channel 2 itself waits on CPU-released gates
+(..3000 / ..3100). At the crash, channel 1 resumed on ..3140 right after channel 2's gate and then
+parsed commands the CPU was still writing. The open question is which ordering the console
+guarantees there and the emulated GPU doesn't. `EDEN_NX2_LONG_ACQUIRE_MS=<ms>` logs channel waits
+on semaphores longer than that; `EDEN_NX2_SEM_WATCH=<address>` every release/acquire on one.
+What limits a race (2026-11-05, `HOST_TIMELINE`): a frame (~21-23 ms) is the GPU threads running
+the submitted frame (~11 ms, while the render thread waits in present) and then the render thread
+building the next one (~9 ms). Running ahead does not overlap them: with present no longer waiting,
+the render thread instead waits ~26 ms right after present on an address-arbiter word another game
+thread releases (the next frame's simulation data). Race frames therefore stay at ~22 ms whatever
+the GPU side does; tried without gain: draining the split's front less (`EDEN_NX2_SPLIT_OWN_ACQUIRES`,
+the back then idles only ~3%), the modules built with `/arch:AVX2`, spinning before sleeping in kernel
+waits (`HOST_SPIN_US`). Guest cores are ~45-60% busy (`HOST_SCHED_STATS=1`), the game's busiest job
+threads 25-40%: the game's own job chain sets the pace. The zone profiler (`EDEN_NX2_GPU_PROFILE=1`)
+adds so much per-call time that it shows the back thread saturated; sampling shows it ~70% busy.
+2026-11-06 re-check (correcting the above): the game's threads are mostly idle in races (main
+thread ~17% of a core, the busiest job thread ~27%, cores 280% of 600%); `HOST_SCHED_STATS=1` now
+also logs wakeup latency (~20k/s, mean ~9 us: not a cost) and the threads that queue longest for a
+core (low-priority single-core threads; the main thread ~12 ms/s). The render thread waits on the
+frame's fence ~19 of ~23 ms: the GPU emulation is the limit. Its two threads mostly wait for each
+other: the front ~45% in `GpuSplit::Drain` and ~18% for the host GPU (GPU-written command lists,
+below), the back ~50% idle - a frame costs about the front's work plus the back's plus the host
+GPU round trips, run one after another. GPU-written "command lists" are the 5 parameters of macro
+0xe50/0xe51 (topology, then count, instances, first, base vertex, base instance, written by the
+culling compute; ~9k/s, many with 0 instances): the macro writes base vertex/instance to the
+driver constant buffer (0x640/0x644) and draws once per instance. Not waiting for them
+(`EDEN_NX2_GPU_WRITTEN_COMMANDS=0`, stale words: missing trees) is ~6% faster (43.3/47.0,
+45.3/47.8). Diagnostics: `EDEN_NX2_GPU_WRITTEN_DUMP=1` (their words and the pending method),
+`EDEN_NX2_MACRO_TRACE=<method hex>,...` (parameters and register writes of 40 non-culled runs).
+
+Course-load crashes with frames ahead: during loads the split's back falls tens of ms behind, and
+the front's wait for it on one channel's acquire held every channel; the compute channel's
+CPU-released gate stayed unconsumed for 65 ms and the game recycled it (written back to 0), after
+which the next gate opened early and the graphics channel parsed half-written commands. Acquires
+whose word holds its final value now suspend without waiting for the back (`EDEN_NX2_SPLIT_DRAINLESS=0`
+reverts), and compute QMD releases are tracked per word, but loads still break with frames ahead:
+the remaining waits are on words with queued releases.
+
+Diagnostics: `HOST_TIMELINE=<file>` (submits, fences, syncpoint waits, presents, guest waits of 100+
+us, sleeps; microseconds), `HOST_POLL_VA=<hex>,...` (with the timeline: changes of guest words, with
+the steady clock of the front trace), `EDEN_NX2_FRONT_TRACE=1` (the GPU front's last 512 acquires,
+resumes, releases, QMD signals and entries, dumped at garbage commands or a failed macro),
+`HOST_SCHED_STATS=1` (guest core use and ready-queue waits every 5 s), `EDEN_NX2_SPLIT_ACQUIRE_STATS=1`
+(why acquires wait for the back, unknown writes by source). `HOST_FRAMES_AHEAD_ALL=1` also waits for
+every channel's fence at present (no change).
 
 Run options: `HOST_VULKAN_DEVICE` (default 2), `HOST_RENDER_HIDDEN=1` and
 `HOST_FRAME_CAPTURE=<dir>` (a PNG every 300 presents) for hidden test runs, `HOST_DUMP_AFTER=<s>`

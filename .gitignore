@@ -10,3 +10,7 @@ __pycache__/
 *.pyc
 .vs/
 .vscode/
+
+# Built by tools/texbake/build.bat
+/tools/texbake/*.exe
+/tools/texbake/*.obj
