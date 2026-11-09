@@ -120,6 +120,95 @@ struct Var {
     bool builtin = false;
 };
 
+// The game's vertex shaders read the base vertex and base instance from driver constants, c[0] + 0x640 and 0x644, where
+// the console's draw macro puts them. For an indirect draw only the GPU knows them: the culling shaders write them into
+// the draw's record, and the CPU's copy says 0. Those reads become the built-ins, which hold the values the draw really
+// used; a tree drawn with base instance 0 instead took another instance's transform for that frame.
+void use_base_builtins(std::vector<u32>& w, const Shader& sh) {
+    enum { OpCapability = 17, OpEntryPoint = 15, OpTypeInt = 21, OpTypePointer = 32, OpConstant = 43, OpFunction = 54, OpVariable = 59, OpLoad = 61,
+           OpStore = 62, OpAccessChain = 65, OpInBoundsAccessChain = 66, OpDecorate = 71, OpBitcast = 124 };
+    enum { DecBuiltIn = 11, DecBinding = 33, BuiltInBaseVertex = 4424, BuiltInBaseInstance = 4425, CapDrawParameters = 4427, Input = 1 };
+    u32 c0_binding = UINT32_MAX;
+    for (const Binding& b : sh.bindings)
+        if (b.kind == BKind::Drv0) c0_binding = b.binding;
+    if (c0_binding == UINT32_MAX || w[1] < 0x10300) return;   // (the built-ins are core from SPIR-V 1.3)
+
+    u32 c0 = 0, int_ty = 0, ptr_ty = 0, vars[2] = {};
+    bool has_cap = false;
+    std::unordered_map<u32, u32> consts, chains;   // chains: access chain id -> 0 base vertex, 1 base instance
+    for (size_t i = 5; i < w.size(); i += w[i] >> 16) {
+        const u32 op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > w.size()) return;
+        if (op == OpCapability && w[i + 1] == CapDrawParameters) has_cap = true;
+        else if (op == OpDecorate && w[i + 2] == DecBinding && w[i + 3] == c0_binding) c0 = w[i + 1];
+        else if (op == OpDecorate && w[i + 2] == DecBuiltIn && (w[i + 3] == BuiltInBaseVertex || w[i + 3] == BuiltInBaseInstance)) vars[w[i + 3] - BuiltInBaseVertex] = w[i + 1];
+        else if (op == OpTypeInt && w[i + 2] == 32 && w[i + 3] == 1) int_ty = w[i + 1];
+        else if (op == OpTypePointer && w[i + 2] == Input && w[i + 3] == int_ty && int_ty) ptr_ty = w[i + 1];
+        else if (op == OpConstant && n == 4) consts[w[i + 2]] = w[i + 3];
+        else if ((op == OpAccessChain || op == OpInBoundsAccessChain) && n == 7 && w[i + 3] == c0) {
+            const auto a = consts.find(w[i + 5]), b = consts.find(w[i + 6]);
+            if (a != consts.end() && b != consts.end() && a->second == 100 && b->second < 2) chains[w[i + 2]] = b->second;
+        }
+    }
+    if (chains.empty() || !int_ty) return;
+    for (size_t i = 5; i < w.size(); i += w[i] >> 16)
+        if ((w[i] & 0xffff) == OpStore && chains.count(w[i + 1])) return;
+
+    u32 bound = w[3];
+    const bool want[2] = {std::any_of(chains.begin(), chains.end(), [](auto& c) { return c.second == 0; }),
+                          std::any_of(chains.begin(), chains.end(), [](auto& c) { return c.second == 1; })};
+    u32 added[2] = {};
+    for (int k = 0; k < 2; k++)
+        if (want[k] && !vars[k]) vars[k] = added[k] = bound++;
+    const bool need_ptr = (added[0] || added[1]) && !ptr_ty;
+    if (need_ptr) ptr_ty = bound++;
+
+    std::vector<u32> o(w.begin(), w.begin() + 5);
+    o.reserve(w.size() + 32);
+    bool cap_done = has_cap, decs_done = false, vars_done = false;
+    for (size_t i = 5; i < w.size(); i += w[i] >> 16) {
+        const u32 op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!cap_done && op != OpCapability) {
+            o.insert(o.end(), {OpCapability | 2u << 16, CapDrawParameters});
+            cap_done = true;
+        }
+        // annotations come right before the first type, constant or global
+        if (!decs_done && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == OpVariable)) {
+            for (int k = 0; k < 2; k++)
+                if (added[k]) o.insert(o.end(), {OpDecorate | 4u << 16, added[k], DecBuiltIn, static_cast<u32>(BuiltInBaseVertex + k)});
+            decs_done = true;
+        }
+        if (!vars_done && op == OpFunction) {
+            if (need_ptr) o.insert(o.end(), {OpTypePointer | 4u << 16, ptr_ty, Input, int_ty});
+            for (int k = 0; k < 2; k++)
+                if (added[k]) o.insert(o.end(), {OpVariable | 4u << 16, ptr_ty, added[k], Input});
+            vars_done = true;
+        }
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && chains.count(w[i + 2])) continue;
+        if (op == OpLoad && chains.count(w[i + 3])) {
+            const u32 var = vars[chains[w[i + 3]]];
+            if (w[i + 1] == int_ty) {
+                o.insert(o.end(), {OpLoad | 4u << 16, int_ty, w[i + 2], var});
+            } else {
+                const u32 tmp = bound++;
+                o.insert(o.end(), {OpLoad | 4u << 16, int_ty, tmp, var, OpBitcast | 4u << 16, w[i + 1], w[i + 2], tmp});
+            }
+            continue;
+        }
+        if (op == OpEntryPoint) {
+            const u32 extra = (added[0] ? 1 : 0) + (added[1] ? 1 : 0);
+            o.push_back(op | (n + extra) << 16);
+            o.insert(o.end(), w.begin() + i + 1, w.begin() + i + n);
+            for (int k = 0; k < 2; k++)
+                if (added[k]) o.push_back(added[k]);
+            continue;
+        }
+        o.insert(o.end(), w.begin() + i, w.begin() + i + n);
+    }
+    o[3] = bound;
+    w = std::move(o);
+}
+
 // Reads the SPIR-V's resources into sh (descriptor types, counts, vertex inputs, colour outputs) and
 // moves its descriptor set to sh.set. False when it is malformed.
 bool reflect(std::vector<u32>& w, Shader& sh, const Row& row) {
@@ -298,6 +387,9 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
         sh->unsupported = "malformed SPIR-V";
         return sh;
     }
+    // HOST_NVN_BASE_BUILTINS=0: the shaders as translated
+    static const bool base_builtins = !getenv("HOST_NVN_BASE_BUILTINS") || atoi(getenv("HOST_NVN_BASE_BUILTINS")) != 0;
+    if (row.stage == SH_VS && base_builtins) use_base_builtins(words, *sh);
     if ((row.stage == SH_TS || row.stage == SH_MS) && !ctx().feat.mesh_shader) sh->unsupported = "no mesh shaders on this GPU";
     Device& c = ctx();
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
