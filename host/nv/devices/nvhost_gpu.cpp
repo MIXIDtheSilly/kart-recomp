@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <mutex>
+#include <map>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/core.h"
@@ -19,12 +21,29 @@
 #include "nv/devices/nvhost_gpu.h"
 #include "nv/devices/nx2_stub_device.h"
 #include "nv/nvdrv.h"
+#include "nv/nvsrv.h"
 #include "core/memory.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/puller.h"
 #include "video_core/memory_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+
+extern std::atomic<unsigned long long> g_host_present_count;
+
+namespace {
+std::mutex g_channel_fences_lock;
+std::map<s32, std::pair<u32, u32>> g_channel_fences;  // bind id -> latest fence
+}  // namespace
+
+namespace nv {
+std::vector<std::pair<u32, u32>> latest_channel_fences() {
+    std::scoped_lock lk{g_channel_fences_lock};
+    std::vector<std::pair<u32, u32>> fences;
+    for (const auto& [channel, fence] : g_channel_fences) fences.push_back(fence);
+    return fences;
+}
+}  // namespace nv
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -406,6 +425,10 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementW
     return result;
 }
 
+namespace {
+thread_local bool g_logged_small_submit = false;
+}
+
 NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandList&& entries) {
     LOG_TRACE(Service_NVDRV, "called, gpfifo={:X}, num_entries={:X}, flags={:X}", params.address,
               params.num_entries, params.flags.raw);
@@ -434,6 +457,23 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 system.ApplicationMemory().ReadBlock(entry.addr.Value(), words.data(),
                                                      words.size() * sizeof(u32));
                 entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
+                // Small entries (NVN's queue-internal commands) with their words, for the first few.
+                static std::atomic<int> small_logged{0};
+                if (entry.size <= 8 && small_logged++ < 6000) {
+                    g_logged_small_submit = true;
+                    std::string text;
+                    for (u32 w : words) text += fmt::format(" {:08x}", w);
+                    LOG("nx2: submit entry %#llx+%#x (of %zu, flags %#x, fence id %u):%s", entry.addr.Value(),
+                        static_cast<u32>(entry.size.Value()), entries.command_lists.size(), params.flags.raw,
+                        channel_syncpoint, text.c_str());
+                }
+                // Command buffers (big entries) with the present they were submitted after, to
+                // see how many frames apart the game reuses their memory.
+                static std::atomic<int> big_logged{0};
+                if (entry.size >= 0x100 && big_logged++ < 30000) {
+                    LOG("nx2: submit cmdbuf %#llx+%#x after present %llu (fence id %u)", entry.addr.Value(),
+                        static_cast<u32>(entry.size.Value()), g_host_present_count.load(), channel_syncpoint);
+                }
                 // Host: does the GPU see the same bytes at this address as the CPU right now?
                 if (channel_state->memory_manager) {
                     std::vector<u32> gpu_words(entry.size);
@@ -448,6 +488,35 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                             static_cast<void*>(mem::backing_ptr(entry.addr.Value())));
                     }
                 }
+            }
+        }
+        // With frames ahead the present returns before the GPU thread reaches this frame's work,
+        // and the game then refills command memory it already submitted. Keep the words as
+        // submitted (video_core dma_pusher: lists that waited behind an acquire are copied again
+        // at the resume, as the game writes them just before releasing it; upstream cce6d44af2).
+        // Opt-in, EDEN_NX2_PB_SNAPSHOT=1: waiting for each frame, memory is current at the parse,
+        // and with HOST_FRAMES_AHEAD the game still broke right after running ahead started, with
+        // or without the copies (2026-11-06).
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (snapshot && channel_state->memory_manager && channel_state->payload) {
+            // Before the copy: a suspension during it must count as one after it.
+            entries.snapshot_suspensions =
+                channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
+            size_t words = 0;
+            for (const auto& entry : entries.command_lists) {
+                words += entry.size;
+            }
+            entries.submitted_words.resize(words);
+            entries.submitted_offsets.reserve(entries.command_lists.size());
+            size_t offset = 0;
+            for (const auto& entry : entries.command_lists) {
+                entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                channel_state->memory_manager->ReadBlockUnsafe(
+                    entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
+                offset += entry.size;
             }
         }
     }
@@ -469,6 +538,11 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+    if (g_logged_small_submit) {
+        g_logged_small_submit = false;
+        LOG("nx2: submit fence out (%u, %u), increment %u, guest value now %u", channel_syncpoint, params.fence.value,
+            increment, system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(channel_syncpoint));
+    }
     // Host: CPU writes to GPU-modified memory are collected (video::on_cpu_write_fault) and applied
     // when the GPU syncs, which video_core does at fences only; these commands may read them
     // before the next one (seen as frames with stale vertex/constant data). Apply them first, in
@@ -496,6 +570,20 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                  "nx2 SubmitGPFIFO entries={} flags={:#x} fence_out=({}, {}) guest_value={}",
                  params.num_entries, flags.raw, params.fence.id, params.fence.value,
                  system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(params.fence.id));
+    }
+    if (increment > 0) {
+        std::scoped_lock lk{g_channel_fences_lock};
+        g_channel_fences[bind_id] = {params.fence.id, params.fence.value};
+    }
+    if (g_timeline_on) {
+        TIMELINE("submit ch=%d n=%u fence=%u:%u", bind_id, static_cast<u32>(params.num_entries), params.fence.id,
+                 params.fence.value);
+        if (increment > 0) {
+            system.Host1x().GetSyncpointManager().RegisterGuestAction(params.fence.id, params.fence.value,
+                                                  [bind_id, id = params.fence.id, value = params.fence.value] {
+                                                      TIMELINE("fence ch=%d fence=%u:%u", bind_id, id, value);
+                                                  });
+        }
     }
     flags.raw = 0;
 

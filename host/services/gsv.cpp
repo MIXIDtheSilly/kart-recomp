@@ -6,6 +6,7 @@
 // GPU address == CPU address; GPU-only memory gets host-allocated backing in the alias region.
 
 #include <windows.h>
+#include <psapi.h>
 #include <timeapi.h>
 
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <thread>
 
+#include "common/host_memory.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/service/nvnflinger/pixel_format.h"
@@ -36,8 +38,56 @@
 #include "../nv/devices/nx2_stub_device.h"
 #include "../nv/nvsrv.h"
 
+// Presents so far (submit logging in nvhost_gpu.cpp).
+std::atomic<unsigned long long> g_host_present_count{0};
+
+namespace VideoCommon {
+// video_core (texture cache, EDEN_NX2_FRAME_DUMP): present number of a frame found broken.
+extern std::atomic<u64> g_nx2_frame_dump_request;
+}
+
 namespace ipc {
 namespace {
+
+// HOST_GARBAGE_DUMP=1: scores each frame capture for the garbage-frame bug (world turned into
+// vertical streaks, or into a flat colour while the HUD stays) like scratchpad garbage.py, logs
+// hits and asks video_core to dump that frame's draws (with EDEN_NX2_FRAME_DUMP=1).
+void check_garbage(const u8* rgba, int w, int h, u64 present) {
+    static const bool enabled = std::getenv("HOST_GARBAGE_DUMP") != nullptr;
+    if (!enabled) return;
+    std::vector<float> l(size_t(w) * h);
+    for (size_t i = 0; i < l.size(); ++i)
+        l[i] = 0.299f * rgba[i * 4] + 0.587f * rgba[i * 4 + 1] + 0.114f * rgba[i * 4 + 2];
+    const auto at = [&](int x, int y) { return l[size_t(y) * w + x]; };
+    float worst = 0;
+    for (int qy = 0; qy < 2; ++qy) {
+        for (int qx = 0; qx < 2; ++qx) {
+            const int x0 = qx * w / 2, x1 = (qx + 1) * w / 2, y0 = qy * h / 2, y1 = (qy + 1) * h / 2;
+            double dh = 0, dv = 0;
+            size_t nh = 0, nv = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x + 1 < x1; ++x, ++nh) dh += std::abs(at(x + 1, y) - at(x, y));
+            for (int y = y0; y + 1 < y1; ++y)
+                for (int x = x0; x < x1; ++x, ++nv) dv += std::abs(at(x, y + 1) - at(x, y));
+            dh /= double(std::max<size_t>(nh, 1));
+            dv /= double(std::max<size_t>(nv, 1));
+            if (dh > 4) worst = std::max(worst, float(dh / (dv + 0.5)));
+        }
+    }
+    // Detail of the centre (HUD corners left out), against the previous capture.
+    double detail = 0;
+    size_t n = 0;
+    for (int y = h / 5; y + 1 < h * 4 / 5; ++y)
+        for (int x = w / 5; x + 1 < w * 4 / 5; ++x, ++n)
+            detail += std::abs(at(x + 1, y) - at(x, y)) + std::abs(at(x, y + 1) - at(x, y));
+    detail /= double(std::max<size_t>(n, 1));
+    static double previous_detail = 0;
+    const bool flat = detail < 3 && previous_detail > 4 * detail && previous_detail > 6;
+    previous_detail = detail;
+    if (worst < 3 && !flat) return;
+    LOG("garbage frame at present %llu: streak ratio %.1f, detail %.2f", present, worst, detail);
+    VideoCommon::g_nx2_frame_dump_request.store(present);
+}
 
 using ::Service::Nvidia::Devices::Nx2GpuMemoryRegistry;
 
@@ -132,7 +182,9 @@ struct Syncpt : Service {
             ev->clear();
             req.syncpoint = id;
             req.pending = true;
-            req.handle = on_sync(id, value, [sh = shared, &req, ev] {
+            TIMELINE("syncwait slot=%u fence=%u:%u now=%u", slot, id, value, sync_value(id));
+            req.handle = on_sync(id, value, [sh = shared, &req, ev, slot, id, value] {
+                TIMELINE("syncdone slot=%u fence=%u:%u", slot, id, value);
                 std::scoped_lock lk{sh->m};
                 if (!sh->alive) return;
                 req.pending = false;
@@ -203,6 +255,8 @@ struct Gpu : Service {
         u64 size;
         std::vector<u8> blocks;
         bool warned = false;
+        std::vector<u32> last_write;  // per block, now_s() of the last GPU write
+        std::vector<u8> trimmed;      // per block, out of the working set since that write
     };
     struct Released {
         Backing b;
@@ -218,7 +272,7 @@ struct Gpu : Service {
     std::map<u64, SparseRegion> sparse;  // by GPU address
     std::map<u64, Backing> gpu_only;     // by GPU address (whole regions and sparse blocks)
     std::vector<Released> released;
-    u64 gpu_only_bytes = 0, gpu_only_peak = 0, sparse_blocks = 0;
+    u64 gpu_only_bytes = 0, gpu_only_peak = 0, sparse_blocks = 0, trimmed_blocks = 0;
 
     std::shared_ptr<kern::ServiceEvent> event(u32 id) { return events.get(id % NumIds); }
 
@@ -308,6 +362,62 @@ struct Gpu : Service {
         });
     }
 
+    // HOST_MEM_REPORT=1 (diagnostic): at most once a minute, on a region create, how much of the
+    // GPU-only memory (whole regions, sparse blocks) and of the whole guest pool is resident.
+    void report_residency() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("HOST_MEM_REPORT");
+            return v && v[0] == '1';
+        }();
+        static auto next = std::chrono::steady_clock::now();
+        if (!enabled || std::chrono::steady_clock::now() < next) return;
+        next = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+        std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info;
+        const auto resident = [&](u8* base, u64 size) {
+            u64 n = 0;
+            for (u64 off = 0; off < size; off += 65536 * mem::PageSize) {
+                const u64 pages = std::min<u64>(65536, (size - off) / mem::PageSize);
+                info.resize(pages);
+                for (u64 i = 0; i < pages; ++i) info[i].VirtualAddress = base + off + i * mem::PageSize;
+                if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(pages * sizeof(info[0]))))
+                    continue;
+                for (const auto& e : info) n += e.VirtualAttributes.Valid;
+            }
+            return n * mem::PageSize;
+        };
+        u64 size[2]{}, res[2]{};
+        for (const auto& [gpu_address, b] : gpu_only) {
+            auto it = sparse.upper_bound(gpu_address);
+            const bool is_sparse = it != sparse.begin() && gpu_address < std::prev(it)->first + std::prev(it)->second.size;
+            size[is_sparse] += b.size;
+            for (const auto& run : mem::phys_runs(b.addr, b.size)) res[is_sparse] += resident(mem::phys_ptr(run.phys), run.size);
+        }
+        const u64 pool = mem::phys_pool_bytes();
+        u64 shared_pages = 0;
+        const auto resident_counting_shared = [&](u8* base, u64 size) {
+            u64 n = 0;
+            for (u64 off = 0; off < size; off += 65536 * mem::PageSize) {
+                const u64 pages = std::min<u64>(65536, (size - off) / mem::PageSize);
+                info.resize(pages);
+                for (u64 i = 0; i < pages; ++i) info[i].VirtualAddress = base + off + i * mem::PageSize;
+                if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(pages * sizeof(info[0]))))
+                    continue;
+                for (const auto& e : info) {
+                    n += e.VirtualAttributes.Valid;
+                    shared_pages += e.VirtualAttributes.Valid && e.VirtualAttributes.ShareCount >= 2;
+                }
+            }
+            return n * mem::PageSize;
+        };
+        const u64 all = resident_counting_shared(mem::phys_ptr(0), pool);
+        PROCESS_MEMORY_COUNTERS pmc{};
+        GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
+        LOG("nx2:gpu residency: GPU-only regions %llu of %llu MiB, sparse blocks %llu of %llu MiB, whole pool %llu MiB "
+            "resident (%llu MiB also in another view; %llu MiB allocated), %lu page faults so far",
+            res[0] >> 20, size[0] >> 20, res[1] >> 20, size[1] >> 20, all >> 20, (shared_pages * mem::PageSize) >> 20,
+            (pool - mem::phys_free_bytes()) >> 20, pmc.PageFaultCount);
+    }
+
     // 214: GPU-only region [start, last] (words 3-6), flags word 7, slot word 11.
     void create_region(Request& r) {
         const u64 start = W64(r, 3), last = W64(r, 5);
@@ -316,9 +426,30 @@ struct Gpu : Service {
             const u64 size = last + 1 - start;
             std::scoped_lock lk{region_lock};
             free_released();
+            report_residency();
+            // The game creates a region again at the same address without destroying it first
+            // (0x86a8c10000: 22 times in the first 90 s, 300 MB -> 1 GB): the old backing was
+            // overwritten in the map and never returned, ~5 GiB of GPU-only memory after 90 s.
+            // Release it as 215 would (upstream Eglantine 2447022ff1). HOST_KEEP_RECREATED=1 = old.
+            static const bool keep_recreated = std::getenv("HOST_KEEP_RECREATED") != nullptr;
+            if (!keep_recreated) {
+                u64 old_size = 0;
+                if (auto it = sparse.find(start); it != sparse.end()) old_size = it->second.size;
+                else if (auto it2 = gpu_only.find(start); it2 != gpu_only.end()) old_size = it2->second.size;
+                if (old_size != 0) {
+                    static u32 logged = 0;
+                    if (logged++ < 16)
+                        LOG("nx2:gpu 214: region %#llx created again (%#llx -> %#llx): releasing the old backing", start,
+                            old_size, size);
+                    release_region(start, start + old_size - 1);
+                }
+            }
             if (flags & SparseRegionFlag) {
                 // Backed block by block as the GPU writes it (back_sparse_write).
-                sparse[start] = {size, std::vector<u8>((size + SparseBlockSize - 1) / SparseBlockSize)};
+                const size_t blocks = (size + SparseBlockSize - 1) / SparseBlockSize;
+                auto& region = sparse[start] = {size, std::vector<u8>(blocks)};
+                region.last_write.resize(blocks);
+                region.trimmed.resize(blocks);
                 Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
                 Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
                 Tegra::Nx2AddSparseSpan(start, size);
@@ -340,30 +471,95 @@ struct Gpu : Service {
         {
             std::scoped_lock lk{region_lock};
             free_released();
-            if (last > first) {
-                if (sparse.erase(first)) {
-                    Tegra::Nx2SparseRegionDestroyed(first);
-                    Nx2GpuMemoryRegistry::Get().DestroySparse(first, last - first + 1);
-                } else {
-                    Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+            if (last > first) release_region(first, last);
+        }
+        signal_after_gpu(W(r, 8));
+    }
+
+    // Unmaps the region [first, last] and hands its backing (whole region or sparse blocks) to
+    // free_released, which returns it once the GPU thread is past this point. Caller holds region_lock.
+    void release_region(u64 first, u64 last) {
+        if (sparse.erase(first)) {
+            Tegra::Nx2SparseRegionDestroyed(first);
+            Nx2GpuMemoryRegistry::Get().DestroySparse(first, last - first + 1);
+        } else {
+            Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+        }
+        std::shared_ptr<std::atomic<bool>> done;
+        for (auto it = gpu_only.lower_bound(first); it != gpu_only.end() && it->first <= last;) {
+            if (it->first + it->second.size - 1 > last) {
+                ++it;
+                continue;
+            }
+            Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.addr, it->second.size);
+            if (!done) {
+                done = std::make_shared<std::atomic<bool>>(false);
+                gpu().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            }
+            released.push_back({it->second, done});
+            it = gpu_only.erase(it);
+        }
+    }
+
+    static u32 now_s() {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return static_cast<u32>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    // Sparse blocks the GPU has not written for a while leave the working set
+    // (HOST_TRIM_SPARSE_S=<seconds without writes>, default 30, 0 = never). They hold texture data
+    // the texture cache already uploaded and reads again only when it re-creates an image; Windows
+    // keeps the pages (standby list or pagefile), so a later read faults them back in. Without this
+    // they stay resident for the whole session (~2.3 GB after three courses).
+    void trim_idle_blocks() {
+        static const u32 idle = [] {
+            const char* v = std::getenv("HOST_TRIM_SPARSE_S");
+            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 30u;
+        }();
+        if (idle == 0) return;
+        // Also, every HOST_TRIM_GPU_ONLY seconds (default 60, 0 = never), all of the whole GPU-only
+        // regions, written or not (no per-write tracking there; hot pages fault back). Their ~1 GB
+        // resident stayed out of the working set in 10-minute races; page faults and frame
+        // counts matched runs without the trim.
+        static const u32 gpu_only_every = [] {
+            const char* v = std::getenv("HOST_TRIM_GPU_ONLY");
+            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 60u;
+        }();
+        static u32 next_gpu_only = 0;
+        std::vector<Backing> todo;
+        {
+            std::scoped_lock lk{region_lock};
+            const u32 now = now_s();
+            if (gpu_only_every != 0 && now >= next_gpu_only) {
+                next_gpu_only = now + gpu_only_every;
+                for (const auto& [gpu_address, b] : gpu_only) {
+                    auto it = sparse.upper_bound(gpu_address);
+                    if (it == sparse.begin() || gpu_address >= std::prev(it)->first + std::prev(it)->second.size)
+                        todo.push_back(b);
                 }
-                std::shared_ptr<std::atomic<bool>> done;
-                for (auto it = gpu_only.lower_bound(first); it != gpu_only.end() && it->first <= last;) {
-                    if (it->first + it->second.size - 1 > last) {
-                        ++it;
-                        continue;
+            }
+            for (auto& [start, region] : sparse) {
+                for (size_t k = 0; k < region.blocks.size(); ++k) {
+                    if (region.blocks[k] != BlockBacked || region.trimmed[k] || now - region.last_write[k] < idle) continue;
+                    if (auto it = gpu_only.find(start + k * SparseBlockSize); it != gpu_only.end()) {
+                        todo.push_back(it->second);
+                        region.trimmed[k] = 1;
                     }
-                    Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.addr, it->second.size);
-                    if (!done) {
-                        done = std::make_shared<std::atomic<bool>>(false);
-                        gpu().RunInOrder([done] { done->store(true, std::memory_order_release); });
-                    }
-                    released.push_back({it->second, done});
-                    it = gpu_only.erase(it);
                 }
             }
         }
-        signal_after_gpu(W(r, 8));
+        if (todo.empty()) return;
+        // Both views of the pages: the GPU's (backing pool) and the guest address space.
+        u8* const guest_view = mem::host_memory().VirtualBasePointer();
+        for (const Backing& b : todo) {
+            for (const auto& run : mem::phys_runs(b.addr, b.size)) VirtualUnlock(mem::phys_ptr(run.phys), run.size);
+            VirtualUnlock(guest_view + b.addr, b.size);
+        }
+        trimmed_blocks += todo.size();
+        static std::atomic<int> logged{0};
+        if (logged++ < 64)
+            LOG("nx2:gpu: %zu idle sparse blocks / GPU-only regions left the working set (%llu so far)", todo.size(),
+                trimmed_blocks);
     }
 
     // Before a GPU write that may land in a sparse region (usually on the GPU thread): the blocks
@@ -388,7 +584,10 @@ struct Gpu : Service {
         {
             std::scoped_lock lk{region_lock};
             for_regions([&](u64 start, SparseRegion& region, u64 a, u64 b) {
+                const u32 now = now_s();
                 for (u64 k = a; k <= b; k++) {
+                    region.last_write[k] = now;
+                    region.trimmed[k] = 0;
                     if (region.blocks[k] == BlockEmpty) {
                         region.blocks[k] = BlockPending;
                         todo.push_back({start, k});
@@ -397,6 +596,19 @@ struct Gpu : Service {
                     }
                 }
             });
+        }
+        // HOST_SPARSE_STACKS=1: who writes new sparse blocks after boot (first 40, with call stacks).
+        static const bool stacks = [] { const char* v = std::getenv("HOST_SPARSE_STACKS"); return v && v[0] == '1'; }();
+        if (stacks && !todo.empty() && sparse_blocks >= 600) {
+            static std::atomic<int> shown{0};
+            if (shown++ < 40) {
+                void* frames[16];
+                const USHORT n = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+                std::string trace;
+                for (USHORT i = 0; i < n; ++i) trace += " < " + host_symbol(reinterpret_cast<u64>(frames[i]));
+                LOG("nx2:gpu: new sparse block(s) region %#llx block %llu for write %#llx+%#llx:%s", todo[0].region,
+                    todo[0].block, gpu_address, size, trace.c_str());
+            }
         }
         const auto t0 = std::chrono::steady_clock::now();
         struct Timer {
@@ -453,6 +665,18 @@ struct Gpu : Service {
             });
         }
     }
+
+    // Last member: stopped and joined first, while the regions it reads still exist.
+    std::jthread trimmer{[this](std::stop_token stop) {
+        std::mutex m;
+        std::condition_variable_any cv;
+        for (;;) {
+            std::unique_lock lk{m};
+            if (cv.wait_for(lk, stop, std::chrono::seconds{10}, [] { return false; }) || stop.stop_requested()) return;
+            lk.unlock();
+            trim_idle_blocks();
+        }
+    }};
 };
 
 // ------------------------------------------------------------------ native memory and images
@@ -591,7 +815,8 @@ struct Vi2 : Service {
     u64 shown_layout = 0;
     std::chrono::steady_clock::time_point next_vblank{}, last_present{};
     std::shared_ptr<Marker> previous_marker;
-    long long stats_frame = 0, stats_fence = 0;
+    std::vector<std::pair<u32, u32>> previous_channel_fences;
+    long long stats_frame = 0, stats_fence = 0, stats_vblanks = 0;
     int stats_count = 0;
     std::chrono::steady_clock::time_point overlay_start{};
     long long overlay_fence = 0;
@@ -625,6 +850,7 @@ struct Vi2 : Service {
     // frame's fence (one frame in flight), composites the image, paces to 60 Hz, hands every slot back.
     void present(Request& r) {
         presents++;
+        g_host_present_count.store(presents);
         const u32 image = W(r, 5), fence_id = ~W(r, 22), fence_value = W(r, 24);
         if (presents <= 4 || presents % 600 == 0)
             LOG("nx2:vi2 present #%llu image %u fence (%u, %u)", presents, image, fence_id, fence_value);
@@ -633,15 +859,33 @@ struct Vi2 : Service {
         // game then rewrites command memory the GPU hasn't read yet ("changed between submit and
         // execution" with EDEN_NX2_PB_CHECK=1) and the GPU runs other data as commands. Some
         // completion the game waits for is answered too early (all buffer slots are always free).
-        static const bool ahead = [] {
+        static const bool ahead_env = [] {
             const char* v = std::getenv("HOST_FRAMES_AHEAD");
             return v && v[0] == '1';
         }();
+        // HOST_FRAMES_AHEAD_AFTER=<presents>: start running ahead only after that many presents.
+        static const u64 ahead_after = [] {
+            const char* v = std::getenv("HOST_FRAMES_AHEAD_AFTER");
+            return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+        }();
+        const bool ahead = ahead_env && presents > ahead_after;
         const auto entered = std::chrono::steady_clock::now();
+        TIMELINE("present #%llu fence=%u:%u", presents, fence_id, fence_value);
         if (ahead) {
             wait_for_frame(previous_fence_id, previous_fence_value);
             previous_fence_id = fence_id;
             previous_fence_value = fence_value;
+            // HOST_FRAMES_AHEAD_ALL=1: also wait for every channel's work submitted before the
+            // previous present (the frame fence covers the graphics channel only; compute work
+            // the game synchronizes the next frame's semaphores with may still be running).
+            static const bool all_channels = [] {
+                const char* v = std::getenv("HOST_FRAMES_AHEAD_ALL");
+                return v && v[0] == '1';
+            }();
+            if (all_channels) {
+                for (const auto& [id, value] : previous_channel_fences) wait_for_frame(id, value);
+                previous_channel_fences = nv::latest_channel_fences();
+            }
             // The fence covers the frame's graphics work only. Everything the game submitted
             // before the previous present (other channels too) must have been read by the GPU
             // thread before the game reuses its command memory: the console's GPU is far ahead of
@@ -654,6 +898,7 @@ struct Vi2 : Service {
             wait_for_frame(fence_id, fence_value);
         }
         const auto waited = std::chrono::steady_clock::now();
+        TIMELINE("presented #%llu", presents);
         // Hitches: a present long after the previous one (game, GPU or host stalls).
         if (last_present != std::chrono::steady_clock::time_point{}) {
             const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(waited - last_present).count();
@@ -662,13 +907,15 @@ struct Vi2 : Service {
                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(waited - entered).count()));
         }
         composite(image, fence_id, fence_value);
-        pace_to_vblank();
+        pace_to_vblank(W(r, 12));
         // Where the present thread's time goes, per 600 presents.
         using us = std::chrono::microseconds;
         stats_fence += std::chrono::duration_cast<us>(waited - entered).count();
         if (last_present != std::chrono::steady_clock::time_point{})
             stats_frame += std::chrono::duration_cast<us>(entered - last_present).count();
         last_present = entered;
+        // The game clock advances by the frame's interval (vblanks) each frame: patches.py.
+        if (g_mkw_frame_obj) stats_vblanks += ld<u32>(g_mkw_frame_obj + 0x214);
         // The overlay's numbers, over half a second.
         overlay_frames++;
         overlay_fence += std::chrono::duration_cast<us>(waited - entered).count();
@@ -681,10 +928,12 @@ struct Vi2 : Service {
             overlay_fence = 0;
         }
         if (++stats_count == 600) {
-            LOG("nx2:vi2 last 600 presents: frame %lld us (%.1f fps), blocked on the GPU fence %lld us", stats_frame / 599,
-                599e6 / std::max<long long>(stats_frame, 1), stats_fence / 600);
+            LOG("nx2:vi2 last 600 presents: frame %lld us (%.1f fps), blocked on the GPU fence %lld us, game speed %.0f%%",
+                stats_frame / 599, 599e6 / std::max<long long>(stats_frame, 1), stats_fence / 600,
+                stats_vblanks * 1e6 / 60.0 / std::max<long long>(stats_frame, 1) * 100.0 * 599 / 600);
             stats_count = 0;
             stats_frame = stats_fence = 0;
+            stats_vblanks = 0;
         }
         reply(r, {0x7fff, 0, 0, 0, 0, 0});
     }
@@ -715,8 +964,23 @@ struct Vi2 : Service {
                 sync_value(id));
     }
 
-    void pace_to_vblank() {
-        const auto interval = std::chrono::nanoseconds{1'000'000'000LL / 60};
+    // timing: present word 12, (swap interval << 16) | refresh rate. The game's 30 fps scenes ask
+    // for 2 vblanks per frame and advance their clock by 2: paced at every vblank they ran at
+    // double speed (upstream Eglantine f8d38607b6). In the dynamic frame mode (cpu.h
+    // g_mkw_frame_mode 0) every present waits for one vblank only: holding the late frames the
+    // game marks as 2 for two would keep it at 30 fps. HOST_SWAP_INTERVAL=<n> forces the interval.
+    u32 swap_word = 0;
+    void pace_to_vblank(u32 timing) {
+        static const u32 forced = [] {
+            const char* v = std::getenv("HOST_SWAP_INTERVAL");
+            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        const u32 swap_interval = forced ? forced : g_mkw_frame_mode == 0 ? 1 : std::clamp<u32>(timing >> 16, 1, 4);
+        const u32 rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        static u32 swap_logs = 0;
+        if (timing != std::exchange(swap_word, timing) && swap_logs++ < 64)
+            LOG("nx2:vi2 present #%llu: swap interval %u at %u Hz (word 12 = %#x)", presents, swap_interval, rate, timing);
+        const auto interval = std::chrono::nanoseconds{1'000'000'000LL * swap_interval / rate};
         const auto now = std::chrono::steady_clock::now();
         if (now > next_vblank + interval) next_vblank = now;
         else if (now < next_vblank) std::this_thread::sleep_until(next_vblank);
@@ -795,13 +1059,14 @@ struct Vi2 : Service {
         auto pending = capture_pending;
         gpu().Renderer().RequestScreenshot(
             pixels->data(),
-            [pixels, layout, file = std::string{path}, pending](bool invert_y) {
+            [pixels, layout, file = std::string{path}, pending, present = presents](bool invert_y) {
                 const int w = static_cast<int>(layout.width), h = static_cast<int>(layout.height);
                 // The renderer writes BGRA; PNG wants RGBA with an opaque alpha.
                 for (size_t i = 0; i < pixels->size(); i += 4) {
                     std::swap((*pixels)[i], (*pixels)[i + 2]);
                     (*pixels)[i + 3] = 0xff;
                 }
+                check_garbage(pixels->data(), w, h, present);
                 stbi_flip_vertically_on_write(invert_y ? 1 : 0);
                 stbi_write_png(file.c_str(), w, h, 4, pixels->data(), w * 4);
                 pending->store(false);

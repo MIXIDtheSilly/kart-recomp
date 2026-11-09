@@ -7,7 +7,10 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <chrono>
 #include <thread>
+#include <vector>
+#include <intrin.h>
 #include <unordered_set>
 
 #include <filesystem>
@@ -33,6 +36,11 @@
 
 #include "memory.h"
 #include "video.h"
+
+namespace VideoCommon {
+// video_core debug hook (buffer_cache_base.h): set to video::debug_page_state at init.
+extern int (*g_nx2_debug_page_state)(u64 cpu_address);
+}  // namespace VideoCommon
 
 namespace video {
 Core::Frontend::EmuWindow* window();
@@ -70,14 +78,53 @@ bool System::IsPaused() const { return false; }
 // CPU writes to GPU-modified pages, applied by the GPU at its next sync (InvalidateGPUCache).
 std::array<GPUDirtyMemoryManager, Hardware::NUM_CPU_CORES> g_dirty;
 
+// The same writes as exact byte ranges. The managers above work in 64-byte units, and applying a
+// unit uploads all of it from guest memory, which never received what the GPU wrote: a store next
+// to bytes a compute shader wrote (the game's GPU particle simulation shares its buffers with the
+// CPU's spawn writes) put stale guest bytes over the GPU's, and those particles were drawn
+// screen-sized for a frame. Applying the exact range lets the buffer cache keep the GPU's bytes
+// around it. HOST_COLLECT_64=1 collects in 64-byte units again.
+std::mutex g_exact_lock;
+std::vector<std::pair<PAddr, size_t>> g_exact_writes;
+std::vector<std::pair<PAddr, size_t>> g_exact_gathered;
+
+bool collect_exact() {
+    static const bool exact = [] {
+        const char* v = std::getenv("HOST_COLLECT_64");
+        return !v || v[0] != '1';
+    }();
+    return exact;
+}
+
+void collect_write(u32 core, PAddr address, size_t size) {
+    if (!collect_exact()) {
+        g_dirty[core % g_dirty.size()].Collect(address, size);
+        return;
+    }
+    {
+        std::scoped_lock lk{g_exact_lock};
+        g_exact_writes.emplace_back(address, size);
+    }
+    GPUDirtyMemoryManager::MarkPending();
+}
+
 void System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback) {
     for (auto& manager : g_dirty) manager.Gather(callback);
+    {
+        std::scoped_lock lk{g_exact_lock};
+        g_exact_gathered.swap(g_exact_writes);
+    }
+    for (const auto& [address, size] : g_exact_gathered) callback(address, size);
+    g_exact_gathered.clear();
 }
 
 // The host's setup: guest memory interface, host1x and the GPU with its renderer (needs the window).
 void System::Initialize() {
     impl->memory.emplace(*this);
     impl->host1x.emplace(*this);
+    // With native NVN (HOST_NVN=native) the game never reaches the emulated GPU: the window is the
+    // native renderer's (nvn/vk), and audio_core still gets this System.
+    if (video::native_nvn()) return;
     VideoCore::CreateGPU(impl->gpu, *video::window(), *this);
     video::g_gpu_created = impl->gpu.has_value();
 }
@@ -302,8 +349,11 @@ Core::System& system() { return *g_system; }
 
 bool host_fences() {
     static const bool host = [] {
+        // Off by default: the streak frames it was meant to fix stayed (45 in 27020 frames over
+        // 16 min, as without it) and races ran ~35 fps instead of ~42 (the game's CPU no longer
+        // runs ahead of the host GPU).
         const char* v = std::getenv("HOST_GPU_FENCES");
-        return !v || std::strcmp(v, "guest") != 0;
+        return v && std::strcmp(v, "host") == 0;
     }();
     return host;
 }
@@ -324,6 +374,34 @@ HWND g_main = nullptr, g_overlay = nullptr;
 HFONT g_overlay_font = nullptr;
 bool g_overlay_on = std::getenv("HOST_NO_OVERLAY") == nullptr;
 constexpr int OverlayW = 230, OverlayH = 76, OverlayMargin = 8;
+
+// The working set counts a guest page once per view that maps it (the guest address space and
+// the GPU's view of the pool, Common::HostMemory): ~4 GB of a race's working set were such
+// doubles. A low-priority thread counts the pool's pages that are in both every 10 s while the
+// overlay is on; the overlay's RAM leaves them out once.
+std::atomic<u64> g_double_counted_bytes{0};
+void start_double_count() {
+    std::thread([] {
+        SetThreadDescription(GetCurrentThread(), L"overlay RAM count");
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(65536);
+        for (;; Sleep(10000)) {
+            if (!g_overlay_on) continue;
+            u8* const base = mem::phys_ptr(0);
+            const u64 size = mem::phys_pool_bytes();
+            u64 pages_in_both = 0;
+            for (u64 off = 0; off < size; off += info.size() * mem::PageSize) {
+                const u64 pages = std::min<u64>(info.size(), (size - off) / mem::PageSize);
+                for (u64 i = 0; i < pages; ++i) info[i].VirtualAddress = base + off + i * mem::PageSize;
+                if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(pages * sizeof(info[0]))))
+                    continue;
+                for (u64 i = 0; i < pages; ++i)
+                    pages_in_both += info[i].VirtualAttributes.Valid && info[i].VirtualAttributes.ShareCount >= 2;
+            }
+            g_double_counted_bytes = pages_in_both * mem::PageSize;
+        }
+    }).detach();
+}
 
 LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
@@ -359,7 +437,8 @@ LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         swprintf(line, 64, L"  --  FPS");
         text(0, white);
     }
-    swprintf(line, 64, L"RAM        %5.1f GB", pmc.WorkingSetSize / 1073741824.0);
+    const u64 doubled = std::min<u64>(g_double_counted_bytes.load(), pmc.WorkingSetSize);
+    swprintf(line, 64, L"RAM        %5.1f GB", (pmc.WorkingSetSize - doubled) / 1073741824.0);
     text(2, white);
     EndPaint(hwnd, &ps);
     return 0;
@@ -379,6 +458,7 @@ void create_overlay(HWND owner) {
     g_overlay_font = CreateFontW(-18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                  CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
     SetTimer(owner, 1, 250, nullptr);
+    start_double_count();
 }
 
 // Follows the game window's client corner; hidden with it (minimized) or when toggled off.
@@ -451,6 +531,8 @@ void apply_settings() {
     v.use_asynchronous_gpu_emulation.SetValue(true);
     v.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
     v.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
+    // HOST_EXTENDED_LOG=1: let eden_log.txt grow to 1 GiB instead of stopping at 100 MiB.
+    if (std::getenv("HOST_EXTENDED_LOG")) v.extended_logging.SetValue(true);
     // Fences (syncpoints, semaphore releases) signal once the host GPU is done and the buffers
     // copied back for the CPU are in guest memory (see host_fences).
     if (host_fences()) v.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Balanced);
@@ -475,7 +557,10 @@ void apply_settings() {
     v.use_disk_shader_cache.SetValue(true);
     v.use_vulkan_driver_pipeline_cache.SetValue(true);
     v.use_reactive_flushing.SetValue(true);
-    v.async_presentation.SetValue(true);  // vsync waits stay off the GPU thread
+    // Vsync waits stay off the GPU thread. HOST_ASYNC_PRESENT=0 presents on it (Eglantine
+    // NX2_NOTES row 118: a present-thread/scheduler race).
+    const char* async_present = std::getenv("HOST_ASYNC_PRESENT");
+    v.async_presentation.SetValue(!async_present || async_present[0] != '0');
     v.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
     // Audio (audio_core): cubeb output; HOST_AUDIO_MUTE=1 keeps test runs silent.
     const char* mute = std::getenv("HOST_AUDIO_MUTE");
@@ -487,6 +572,8 @@ void apply_settings() {
 
 }  // namespace
 
+int debug_page_state(u64 va);
+
 void init() {
     std::error_code ec;
     std::filesystem::create_directories(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), ec);
@@ -495,8 +582,51 @@ void init() {
     g_window = new HostWindow(create_window());
     g_system = new Core::System();
     g_system->Initialize();
+    if (native_nvn()) {
+        LOG("video: native NVN, the emulated GPU is not created");
+        return;
+    }
+    VideoCommon::g_nx2_debug_page_state = &debug_page_state;
     if (!g_gpu_created) fatal("could not create the GPU (Vulkan renderer)");
     LOG("video: GPU and Vulkan renderer created");
+}
+
+bool native_nvn() {
+    static const bool on = [] {
+        const char* v = std::getenv("HOST_NVN");
+        return v && std::strcmp(v, "native") == 0;
+    }();
+    return on;
+}
+
+HWND main_window() { return g_main; }
+
+// For video_core's debug checks (VideoCommon::g_nx2_debug_page_state): the view protection of a
+// guest page, | 0x1000 when the GPU caches it, | 0x2000 when it is read-trapped, | (guest pages
+// mapping its physical page) << 16.
+int debug_page_state(u64 va) {
+    const u64 page = va / mem::PageSize;
+    if (page >= mem::AddressSpaceSize / mem::PageSize) return -1;
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery(hp(page * mem::PageSize), &mbi, sizeof mbi);
+    int state = mbi.State == MEM_COMMIT ? static_cast<int>(mbi.Protect & 0xff) : 0;
+    if (page_cached(page)) state |= 0x1000;
+    // Guest pages mapping the same physical page (bits 16 and up; 1 = no alias).
+    std::vector<u64> others;
+    const u32 aliases = mem::alias_count(page * mem::PageSize, &others);
+    state |= static_cast<int>(std::min<u32>(aliases, 0x7fff) << 16);
+    if (aliases > 1) {
+        static std::atomic<int> logged{0};
+        if (logged++ < 32) {
+            std::string list;
+            for (const u64 a : others) list += std::format(" {:#x}", a);
+            LOG("video: guest page %#llx shares its physical page with %u other page(s):%s (cached %d)",
+                page * mem::PageSize, aliases - 1, list.c_str(), page_cached(page) ? 1 : 0);
+        }
+    }
+    std::scoped_lock lk{g_cached_lock};
+    if (g_trapped.contains(page)) state |= 0x2000;
+    return state;
 }
 
 void report_frame_stats(double fps, double frame_ms, double gpu_wait_ms) {
@@ -504,9 +634,44 @@ void report_frame_stats(double fps, double frame_ms, double gpu_wait_ms) {
     g_stats = {fps, frame_ms, gpu_wait_ms, true};
 }
 
+// HOST_POLL_VA=<addr>[,<addr>...] (hex, with HOST_TIMELINE): a thread samples these guest words
+// every few microseconds and logs each change, with the steady clock in microseconds (the clock
+// of video_core's EDEN_NX2_FRONT_TRACE), to line CPU writes up with the GPU thread's reads.
+static void start_poll_thread() {
+    const char* v = std::getenv("HOST_POLL_VA");
+    if (!v || !g_timeline_on) return;
+    std::vector<u64> addrs;
+    for (const char* p = v; *p;) {
+        char* end = nullptr;
+        addrs.push_back(std::strtoull(p, &end, 16));
+        p = *end == ',' ? end + 1 : end;
+        if (end == p && *p) break;
+    }
+    std::thread([addrs] {
+        std::vector<u32> last(addrs.size(), 0xffffffffu);
+        for (;;) {
+            for (size_t i = 0; i < addrs.size(); i++) {
+                const u8* ptr = mem::backing_ptr(addrs[i]);
+                if (!ptr) continue;
+                const u32 now = *reinterpret_cast<const volatile u32*>(ptr);
+                if (now != last[i]) {
+                    const long long steady = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    TIMELINE("poll %#llx %#x -> %#x steady=%lld", static_cast<unsigned long long>(addrs[i]), last[i],
+                             now, steady);
+                    last[i] = now;
+                }
+            }
+            for (int k = 0; k < 64; k++) _mm_pause();
+        }
+    }).detach();
+}
+
 void start() {
+    if (native_nvn()) return;
     g_system->GPU().Start();
     LOG("video: GPU thread started");
+    start_poll_thread();
     // The disk pipeline cache (user/cache/shader/<title>): loads the pipelines earlier runs built and
     // makes new ones save as they're built. Without it every run compiled each pipeline again the
     // first time it was drawn: hitches of 100+ ms at every new scene.
@@ -633,6 +798,91 @@ int redirectable_address_register(const u8* code) {
     return -1;
 }
 
+// The bytes the store at `code` writes to its memory operand, or 0 when the form is not known.
+// Covers what MSVC emits for the recompiled code and the CRT: moves, SSE/AVX stores and extracts,
+// read-modify-write ALU forms, atomics, SETcc. Collected writes upload exactly these bytes.
+u32 store_width(const u8* code) {
+    int i = 0;
+    bool opsize = false, rep_f3 = false, rep_f2 = false;
+    for (;; i++) {
+        const u8 b = code[i];
+        if (b == 0x66) opsize = true;
+        else if (b == 0xF3) rep_f3 = true;
+        else if (b == 0xF2) rep_f2 = true;
+        else if (b == 0xF0 || b == 0x67 || b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 || b == 0x65) {
+        } else break;
+    }
+    bool w = false;
+    if ((code[i] & 0xF0) == 0x40) w = (code[i++] & 8) != 0;
+    const u32 word = w ? 8 : (opsize ? 2 : 4);
+    if (code[i] == 0xC5 || code[i] == 0xC4) {
+        u32 map = 1, pp, l;
+        u8 op;
+        if (code[i] == 0xC5) {
+            pp = code[i + 1] & 3;
+            l = (code[i + 1] >> 2) & 1;
+            op = code[i + 2];
+        } else {
+            map = code[i + 1] & 0x1F;
+            w = (code[i + 2] & 0x80) != 0;
+            pp = code[i + 2] & 3;
+            l = (code[i + 2] >> 2) & 1;
+            op = code[i + 3];
+        }
+        const u32 vec = l ? 32 : 16;
+        if (map == 1) {
+            if (op == 0x11) return pp == 2 ? 4 : pp == 3 ? 8 : vec;  // vmovups/vmovss/vmovsd
+            if (op == 0x29 || op == 0x2B || op == 0xE7) return vec;  // vmovaps, vmovntps, vmovntdq
+            if (op == 0x7F && (pp == 1 || pp == 2)) return vec;     // vmovdqa/vmovdqu
+            if (op == 0x7E && pp == 1) return w ? 8 : 4;           // vmovd/vmovq to memory
+            if (op == 0xD6 || op == 0x13 || op == 0x17) return 8;  // vmovq, vmovlps, vmovhps
+        } else if (map == 2) {
+            if (op == 0x2E || op == 0x2F || op == 0x8E) return vec;  // masked stores (upper bound)
+        } else if (map == 3) {
+            if (op == 0x14) return 1;
+            if (op == 0x15) return 2;
+            if (op == 0x16) return w ? 8 : 4;
+            if (op == 0x17) return 4;
+            if (op == 0x19 || op == 0x39) return 16;  // vextractf128/vextracti128
+            if (op == 0x1D) return l ? 16 : 8;        // vcvtps2ph
+        }
+        return 0;
+    }
+    if (code[i] == 0x0F) {
+        const u8 op = code[i + 1];
+        if (op == 0x3A) {
+            const u8 op3 = code[i + 2];
+            if (op3 == 0x14) return 1;
+            if (op3 == 0x15) return 2;
+            if (op3 == 0x16) return w ? 8 : 4;
+            if (op3 == 0x17) return 4;
+            return 0;
+        }
+        if (op == 0x38) return code[i + 2] == 0xF1 ? word : 0;  // movbe
+        if (op == 0x11) return rep_f3 ? 4 : rep_f2 ? 8 : 16;    // movups/movupd/movss/movsd
+        if (op == 0x13 || op == 0x17 || op == 0xD6) return 8;   // movlps, movhps, movq
+        if (op == 0x29 || op == 0x2B || op == 0xE7) return 16;  // movaps, movntps, movntdq
+        if (op == 0x7F) return (opsize || rep_f3) ? 16 : 8;     // movdqa/movdqu, mmx movq
+        if (op == 0x7E && opsize) return w ? 8 : 4;             // movd/movq to memory
+        if (op == 0xC3) return w ? 8 : 4;                       // movnti
+        if (op == 0xB0 || op == 0xC0) return 1;                 // cmpxchg/xadd byte
+        if (op == 0xB1 || op == 0xC1 || op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBA) return word;
+        if (op == 0xC7) return w ? 16 : 8;                      // cmpxchg8b/16b
+        if (op >= 0x90 && op <= 0x9F) return 1;                 // setcc
+        return 0;
+    }
+    switch (code[i]) {
+    case 0x88: case 0xC6: case 0x86: case 0x80: case 0xFE: case 0xC0: case 0xD0: case 0xD2: case 0xF6:
+    case 0x00: case 0x08: case 0x10: case 0x18: case 0x20: case 0x28: case 0x30:
+        return 1;
+    case 0x89: case 0xC7: case 0x87: case 0x81: case 0x83: case 0xFF: case 0xC1: case 0xD1: case 0xD3: case 0xF7:
+    case 0x01: case 0x09: case 0x11: case 0x19: case 0x21: case 0x29: case 0x31:
+        return word;
+    default:
+        return 0;
+    }
+}
+
 // A store to a GPU-cached page being executed against the page's backing memory: the register that
 // was moved there and by how much (undone at the single-step exception after it).
 thread_local int t_redirect_reg = -1;
@@ -646,19 +896,54 @@ thread_local int t_redirect_count = 0;
 // applied at the GPU's next sync, and only those lose the GPU's data. Every store goes through
 // OnCPUWrite: it also drops the bytes from downloads still pending, which would otherwise copy the
 // GPU's older data over them before the collected write is applied.
+// HOST_WATCH_VA=<lo>-<hi> (hex): log write faults in that guest range and what the GPU caches
+// did with them (debug aid for CPU writes the caches miss).
+std::pair<u64, u64> watch_range() {
+    static const std::pair<u64, u64> range = [] {
+        const char* v = std::getenv("HOST_WATCH_VA");
+        if (!v) return std::pair<u64, u64>{0, 0};
+        char* end = nullptr;
+        const u64 lo = std::strtoull(v, &end, 16);
+        const u64 hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0;
+        return std::pair<u64, u64>{lo, hi};
+    }();
+    return range;
+}
+bool watched(u64 addr) {
+    const auto [lo, hi] = watch_range();
+    return addr >= lo && addr < hi;
+}
+
 void notify_write(u64 guest_addr, u64 size) {
     const u8* p = mem::backing_ptr(guest_addr);
     if (!p) return;
+    if (watched(guest_addr)) [[unlikely]] {
+        static std::atomic<u64> notes{0};
+        const u64 n = ++notes;
+        int devices = 0, collected = 0;
+        thread_local Common::ScratchBuffer<u32> watch_scratch;
+        DAddr first_device = 0;
+        g_system->Host1x().MemoryManager().ApplyOpOnPointer(p, watch_scratch, [&](DAddr address) {
+            if (devices++ == 0) first_device = address;
+        });
+        (void)collected;
+        if (n <= 64 || (n & (n - 1)) == 0)
+            LOG("watch: notify %#llx+%llu -> %d device address(es), first %#llx (%llu notifies)", guest_addr, size,
+                devices, static_cast<unsigned long long>(first_device), n);
+    }
     thread_local Common::ScratchBuffer<u32> scratch;
     static std::atomic<u32> next{0};
     thread_local const u32 core = next++ % Core::g_dirty.size();
     auto& gpu = g_system->GPU();
     g_system->Host1x().MemoryManager().ApplyOpOnPointer(p, scratch, [&](DAddr address) {
-        if (gpu.OnCPUWrite(address, size)) Core::g_dirty[core].Collect(address, size);
+        if (gpu.OnCPUWrite(address, size)) Core::collect_write(core, address, size);
     });
 }
 
 }  // namespace
+
+int store_address_register(const void* code) { return redirectable_address_register(static_cast<const u8*>(code)); }
+u32 store_bytes(const void* code) { return store_width(static_cast<const u8*>(code)); }
 
 bool on_single_step(void* context) {
     if (t_redirect_reg < 0) return false;
@@ -678,6 +963,15 @@ bool on_single_step(void* context) {
 
 bool on_cpu_write_fault(u64 guest_addr, void* context) {
     if (!g_system || guest_addr >= mem::AddressSpaceSize) return false;
+    if (watched(guest_addr)) [[unlikely]] {
+        static std::atomic<u64> faults{0};
+        const u64 n = ++faults;
+        if (n <= 64 || (n & (n - 1)) == 0) {
+            const u64 rip = context ? static_cast<CONTEXT*>(context)->Rip : 0;
+            LOG("watch: write fault %#llx at %s, cached %d, redirect pending %d (%llu faults)", guest_addr,
+                host_symbol(rip).c_str(), page_cached(guest_addr / mem::PageSize) ? 1 : 0, t_redirect_reg >= 0 ? 1 : 0, n);
+        }
+    }
     const u64 page = guest_addr / mem::PageSize;
     // A store to a page the GPU caches, as Eglantine's AOT handler does it: the caches are told
     // about these bytes only, the page stays protected, and the store itself goes to the page's
@@ -703,12 +997,20 @@ bool on_cpu_write_fault(u64 guest_addr, void* context) {
         (offset <= mem::PageSize - 32 || continues(page + 1))) {
         const int reg = redirectable_address_register(reinterpret_cast<const u8*>(ctx->Rip));
         if (reg >= 0) {
-            // The access size is unknown: 32 bytes covers every store the recompiled code emits,
-            // and the dirty tracking works in 64-byte units anyway.
+            // The bytes written, from the instruction (32 when its form is not known: that covers
+            // every store the recompiled code emits). The fault address is the first protected byte
+            // the store touches, so a store reaching in from the previous page is over-reported by
+            // the part it wrote there.
+            static const bool exact_width = [] {
+                const char* v = std::getenv("HOST_STORE_WIDTH");
+                return !v || v[0] != '0';
+            }();
+            const u32 decoded = exact_width ? store_width(reinterpret_cast<const u8*>(ctx->Rip)) : 0;
+            const u64 width = decoded != 0 ? decoded : 32;
             t_redirect_count = 0;
-            t_redirect_writes[t_redirect_count++] = {guest_addr, std::min<u64>(32, mem::PageSize - offset)};
-            if (offset > mem::PageSize - 32 && page_cached(page + 1))
-                t_redirect_writes[t_redirect_count++] = {(page + 1) * mem::PageSize, offset - (mem::PageSize - 32)};
+            t_redirect_writes[t_redirect_count++] = {guest_addr, std::min<u64>(width, mem::PageSize - offset)};
+            if (offset + width > mem::PageSize && page_cached(page + 1))
+                t_redirect_writes[t_redirect_count++] = {(page + 1) * mem::PageSize, offset + width - mem::PageSize};
             for (int i = 0; i < t_redirect_count; i++) notify_write(t_redirect_writes[i].first, t_redirect_writes[i].second);
             t_redirect_reg = reg;
             t_redirect_delta = reinterpret_cast<u64>(backing + offset) - reinterpret_cast<u64>(hp(guest_addr));
@@ -761,10 +1063,8 @@ bool on_cpu_write_fault(u64 guest_addr, void* context) {
         }
         if (!gpu.OnCPUWrite(address, mem::PageSize)) return;
         deferred = true;
-        // The dirty managers track 2 KiB units.
         static std::atomic<u32> next{0};
-        auto& dirty = Core::g_dirty[next++ % Core::g_dirty.size()];
-        for (u64 off = 0; off < mem::PageSize; off += 0x800) dirty.Collect(address + off, 0x800);
+        Core::collect_write(next++, address, mem::PageSize);
     });
     std::scoped_lock lk{g_cached_lock};
     if (page_cached(page) || view_protection() == PAGE_READONLY) {

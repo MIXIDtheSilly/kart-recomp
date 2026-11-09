@@ -166,4 +166,10 @@ void install() {
     install_nvn();
 }
 
+void install_display() {
+    // nv:: stays the sdk's own: nv::InitializeGraphics boots the gsv session (nn::gsv::BootWithTransferMemory)
+    // that nn::codec::video decodes through.
+    install_vi();
+}
+
 }  // namespace gfx

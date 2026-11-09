@@ -59,6 +59,7 @@ void add_remap_listener(RemapListener listener);
 // Physical memory behind [addr, addr + size), in address order (unmapped pages are skipped).
 std::vector<PhysRun> phys_runs(u64 addr, u64 size);
 // Host pointer to the backing of a guest page (the GPU's view), or nullptr if unmapped.
+u32 alias_count(u64 addr, std::vector<u64>* others);
 u8* backing_ptr(u64 addr);
 // Whether a guest page is mapped, after any map or unmap in progress on another thread has finished
 // (partly unmapping a view briefly unmaps all of it on Windows: a fault there is retried).
@@ -71,6 +72,7 @@ std::vector<PhysRun> phys_alloc(u64 size);
 void phys_free(const std::vector<PhysRun>& runs);
 u64 phys_free_bytes();  // what is left of the pool
 u8* phys_ptr(u64 phys);
+u64 phys_pool_bytes();  // size of the whole pool
 
 void set_perm(u64 addr, u64 size, u32 perm);
 void set_attr(u64 addr, u64 size, u32 mask, u32 attr);

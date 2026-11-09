@@ -5,8 +5,14 @@
 #include "common.h"
 
 namespace Core { class System; }
+struct HWND__;
 
 namespace video {
+
+// HOST_NVN=native: NVN is the host's own (nvn/), on its own Vulkan device; no emulated GPU.
+bool native_nvn();
+// The game window (created by init).
+::HWND__* main_window();
 
 // Applies the renderer settings and creates the window, the GPU and the Vulkan renderer.
 void init();
@@ -22,10 +28,9 @@ void report_frame_stats(double fps, double frame_ms, double gpu_wait_ms);
 // The emulator-core object the GPU and the graphics services work through.
 Core::System& system();
 
-// GPU fences count as reached for the game only once the host GPU has run the work before them
-// and the GPU results the CPU reads are copied back (host syncpoint values, delayed fences);
-// HOST_GPU_FENCES=guest: as soon as the GPU thread has queued them (the game then read results
-// before they were there).
+// HOST_GPU_FENCES=host: GPU fences count as reached for the game only once the host GPU has run
+// the work before them and the GPU results the CPU reads are copied back (host syncpoint values,
+// delayed fences). Default: as soon as the GPU thread has queued them (the game's CPU runs ahead).
 bool host_fences();
 
 // A guest write hit a page the GPU caches (write-protected in the view): drop the GPU's copies
@@ -34,6 +39,9 @@ bool host_fences();
 // may be redirected to the page's backing memory and single-stepped: on_single_step undoes that).
 bool on_cpu_write_fault(u64 guest_addr, void* context);
 bool on_single_step(void* context);
+// For the store at `code`: the register addressing its memory operand that can be moved (or -1), and the bytes it writes (0: unknown form).
+int store_address_register(const void* code);
+u32 store_bytes(const void* code);
 // A guest access to a page with an armed read trap (GPU-written, not yet read by the CPU).
 bool on_read_trap(u64 guest_addr, bool write);
 

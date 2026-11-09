@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <intrin.h>
+#include <thread>
 #include <random>
 
 #include "ipc.h"
@@ -53,11 +55,43 @@ void remove(std::unordered_map<u64, WaitList>& map, u64 key, KThread* t) {
     if (l.empty()) map.erase(it);
 }
 
+bool sched_stats();
 void wake(KThread* t, u32 result) {
+    if (sched_stats()) t->wake_ns = host_ns();
     t->woken = true;
     t->wait_result = result;
     t->wait_kind = 0;
     t->cv.notify_one();
+}
+
+// HOST_SPIN_US=<us>: a blocking thread (and one queued for a core) polls for that long before it
+// sleeps in the OS. The game's job system hands work between threads thousands of times a second;
+// each OS wakeup adds tens of microseconds to its frame. 0 (default) never spins.
+s64 spin_ns() {
+    static const s64 ns = [] {
+        const char* v = std::getenv("HOST_SPIN_US");
+        return v ? std::strtoll(v, nullptr, 10) * 1000 : 0LL;
+    }();
+    return ns;
+}
+
+// Polls (kernel lock released) until `done` or the spin time is over; true if done.
+template <typename F>
+bool spin_until(std::unique_lock<std::mutex>& lk, s64 limit_ns, F&& done) {
+    if (limit_ns <= 0) return false;
+    lk.unlock();
+    const u64 until = host_ns() + static_cast<u64>(limit_ns);
+    bool hit = false;
+    for (u32 i = 1;; i++) {
+        if (done()) {
+            hit = true;
+            break;
+        }
+        _mm_pause();
+        if ((i & 63) == 0 && host_ns() >= until) break;
+    }
+    lk.lock();
+    return hit;
 }
 
 // ------------------------------------------------------------------ scheduler
@@ -105,11 +139,85 @@ bool take_free_core(KThread* t) {
     return false;
 }
 
+// HOST_SCHED_STATS=1: every 5 s, how long ready threads queued for a core (by priority) and how
+// busy each core was (sampled), to tell whether the game waits for cores rather than for work.
+bool sched_stats() {
+    static const bool on = std::getenv("HOST_SCHED_STATS") != nullptr;
+    return on;
+}
+struct SchedStats {
+    u64 queued_ns[64] = {}, queued_count[64] = {};
+    u64 samples = 0, owned[NumCores] = {}, ready_sum = 0;
+    // Wakeups: from wake() until the woken thread runs again in the kernel (OS wakeup + kernel lock).
+    u64 woke_ns[64] = {}, woke_count[64] = {}, woke_hist[5] = {};
+};
+SchedStats g_sched_stats;  // under g_lock
+void start_sched_sampler() {
+    std::thread([] {
+        u64 last_report = host_ns();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds{200});
+            std::unique_lock lk{g_lock};
+            auto& st = g_sched_stats;
+            st.samples++;
+            for (s32 c = 0; c < NumCores; c++) {
+                st.owned[c] += g_owner[c] != nullptr;
+                if (g_owner[c]) g_owner[c]->st_owned++;
+            }
+            st.ready_sum += g_ready.size();
+            if (host_ns() - last_report < 5'000'000'000ull) continue;
+            last_report = host_ns();
+            char cores[160] = {};
+            int n = 0;
+            for (s32 c = 0; c < NumCores; c++)
+                n += snprintf(cores + n, sizeof cores - n, " %d:%.0f%%", c, 100.0 * st.owned[c] / st.samples);
+            char queued[400] = {};
+            int q = 0;
+            for (int p = 0; p < 64 && q < 380; p++)
+                if (st.queued_count[p])
+                    q += snprintf(queued + q, sizeof queued - q, " p%d:%llux%.0fus", p,
+                                  static_cast<unsigned long long>(st.queued_count[p] / 5),
+                                  st.queued_ns[p] / 1000.0 / st.queued_count[p]);
+            LOG("sched: cores busy%s, ready queue %.2f threads; per second queued (prio:count x mean wait)%s", cores,
+                static_cast<double>(st.ready_sum) / st.samples, queued);
+            char woke[400] = {};
+            int w = 0;
+            for (int p = 0; p < 64 && w < 380; p++)
+                if (st.woke_count[p])
+                    w += snprintf(woke + w, sizeof woke - w, " p%d:%llux%.0fus", p,
+                                  static_cast<unsigned long long>(st.woke_count[p] / 5),
+                                  st.woke_ns[p] / 1000.0 / st.woke_count[p]);
+            LOG("sched: wakeup latency per second (prio:count x mean)%s; <20us %llu <50us %llu <100us %llu <500us %llu more %llu",
+                woke, static_cast<unsigned long long>(st.woke_hist[0] / 5), static_cast<unsigned long long>(st.woke_hist[1] / 5),
+                static_cast<unsigned long long>(st.woke_hist[2] / 5), static_cast<unsigned long long>(st.woke_hist[3] / 5),
+                static_cast<unsigned long long>(st.woke_hist[4] / 5));
+            // The threads that queued longest: id, priority, ideal core, mask, entry, ms/s queued, core use.
+            std::vector<KThread*> top;
+            for (auto& [h, t] : g_threads_by_handle) if (t->st_queued_n || t->st_owned) top.push_back(t);
+            std::sort(top.begin(), top.end(), [](KThread* a, KThread* b) { return a->st_queued_ns > b->st_queued_ns; });
+            char per[1200] = {};
+            int pn = 0;
+            for (size_t i = 0; i < top.size() && i < 14 && pn < 1100; i++) {
+                KThread* t = top[i];
+                pn += snprintf(per + pn, sizeof per - pn, " [t%llu p%d c%d m%llx e%llx q%.0fms/%llu run%.0f%% wk%llu]",
+                               static_cast<unsigned long long>(t->id), t->priority, t->core,
+                               static_cast<unsigned long long>(t->affinity), static_cast<unsigned long long>(t->entry),
+                               t->st_queued_ns / 5e6, static_cast<unsigned long long>(t->st_queued_n / 5),
+                               100.0 * t->st_owned / st.samples, static_cast<unsigned long long>(t->st_woken / 5));
+            }
+            LOG("sched: threads per second%s", per);
+            for (auto& [h, t] : g_threads_by_handle) t->st_queued_ns = t->st_queued_n = t->st_owned = t->st_woken = 0;
+            st = {};
+        }
+    }).detach();
+}
+
 // Waits until the thread owns a core. With every core of its mask busy it queues, and the owner
 // with the lowest priority below its own is asked to yield.
 void sched_acquire(std::unique_lock<std::mutex>& lk, KThread* t) {
     if (!scheduling() || !t) return;
     if (take_free_core(t)) return;
+    const u64 queued_at = sched_stats() ? host_ns() : 0;
     enqueue(g_ready, t);
     KThread* victim = nullptr;
     const u64 mask = core_mask(t);
@@ -118,7 +226,18 @@ void sched_acquire(std::unique_lock<std::mutex>& lk, KThread* t) {
         if ((mask >> c & 1) && o && o->priority > t->priority && (!victim || o->priority > victim->priority)) victim = o;
     }
     if (victim) victim->ctx.halt = 1;
+    spin_until(lk, spin_ns(), [t] {
+        const s32 c = std::atomic_ref<s32>(t->sched_core).load(std::memory_order_acquire);
+        return c >= 0 && std::atomic_ref<KThread*>(g_owner[c]).load(std::memory_order_acquire) == t;
+    });
     t->cv.wait(lk, [&] { return owns_core(t); });
+    if (queued_at) {
+        const int p = std::clamp(t->priority, 0, 63);
+        g_sched_stats.queued_ns[p] += host_ns() - queued_at;
+        g_sched_stats.queued_count[p]++;
+        t->st_queued_ns += host_ns() - queued_at;
+        t->st_queued_n++;
+    }
 }
 
 // Gives the thread's core to the best queued thread that may run on it.
@@ -179,17 +298,45 @@ struct CoreReleased {
     }
 };
 
+}  // namespace
+
+// (defined outside the anonymous namespace: it is declared in kernel.h)
+HostWait::HostWait() : t(t_current) {
+    if (!t) return;
+    std::scoped_lock lk{g_lock};
+    sched_release(t);
+}
+HostWait::~HostWait() {
+    if (!t) return;
+    std::unique_lock lk{g_lock};
+    sched_acquire(lk, t);
+}
+
+namespace {
+
 // Sleep until woken or timed out (timeout < 0: forever). Returns false on timeout. The thread's
 // core goes to other threads meanwhile.
 bool block(std::unique_lock<std::mutex>& lk, KThread* t, s64 timeout_ns) {
     t->woken = false;
     sched_release(t);
     bool ok = true;
+    if (const s64 spin = timeout_ns < 0 ? spin_ns() : std::min(spin_ns(), timeout_ns); spin > 0) {
+        spin_until(lk, spin, [t] { return std::atomic_ref<bool>(t->woken).load(std::memory_order_acquire); });
+    }
     if (timeout_ns < 0) {
         t->cv.wait(lk, [&] { return t->woken; });
     } else {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
         ok = t->cv.wait_until(lk, deadline, [&] { return t->woken; });
+    }
+    if (sched_stats() && t->woken && t->wake_ns) {
+        const u64 d = host_ns() - t->wake_ns;
+        const int p = std::clamp(t->priority, 0, 63);
+        g_sched_stats.woke_ns[p] += d;
+        g_sched_stats.woke_count[p]++;
+        t->st_woken++;
+        g_sched_stats.woke_hist[d < 20000 ? 0 : d < 50000 ? 1 : d < 100000 ? 2 : d < 500000 ? 3 : 4]++;
+        t->wake_ns = 0;
     }
     sched_acquire(lk, t);
     return ok;
@@ -245,6 +392,10 @@ DWORD WINAPI host_thread_main(void* param) {
     t_current = t;
     Ctx* c = &t->ctx;
     c->rt = t;
+    // Experiment: HOST_FTZ=1 runs every guest thread with denormals flushed to zero (MXCSR FTZ + DAZ), as the game's
+    // FPCR.FZ asks for (the recompiled code only stores FPCR).
+    static const bool ftz = [] { const char* v = std::getenv("HOST_FTZ"); return v && v[0] == '1'; }();
+    if (ftz) _mm_setcsr(_mm_getcsr() | 0x8040u);
     {
         std::unique_lock lk{g_lock};
         sched_acquire(lk, t);
@@ -329,6 +480,7 @@ u64 alloc_tls() {
 static u64 g_exception_context = 0;
 
 void start_main_thread(u64 entry, u64 stack_top, u64 stack_size) {
+    if (sched_stats()) start_sched_sampler();
     g_exception_context = alloc_tls();  // the kernel keeps the user exception context in a TLS slot
     auto t = std::make_shared<KThread>();
     t->id = g_next_thread_id++;
@@ -383,7 +535,12 @@ static u32 svc_wait_sync(Ctx* c) {
     self->wait_kind = 1;
     self->signaled_by = nullptr;
     for (auto& o : objs) o->waiters.push_back(self);
+    const u64 wait_start = g_timeline_on ? host_ns() : 0;
     const bool ok = block(lk, self, timeout);
+    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+        TIMELINE("blocked sync %llu us n=%d h0=%s lr=%#llx", (host_ns() - wait_start) / 1000, count,
+                 objs.empty() ? "-" : objs[0]->type(), static_cast<unsigned long long>(c->x[30]));
+    }
     for (auto& o : objs) o->waiters.erase(std::remove(o->waiters.begin(), o->waiters.end(), self), o->waiters.end());
     self->wait_kind = 0;
     if (!ok) return KResult::TimedOut;
@@ -407,7 +564,12 @@ static u32 svc_arbitrate_lock(Ctx* c) {
     self->wait_kind = 4;
     self->wait_key = addr;
     enqueue(g_mutex[addr], self);
+    const u64 wait_start = g_timeline_on ? host_ns() : 0;
     block(lk, self, -1);
+    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+        TIMELINE("blocked mutex %llu us addr=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
+                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(c->x[30]));
+    }
     return self->wait_result;
 }
 
@@ -432,7 +594,12 @@ static u32 svc_wait_key(Ctx* c) {
     self->wait_kind = 2;
     self->wait_key = key;
     enqueue(g_condvar[key], self);
+    const u64 wait_start = g_timeline_on ? host_ns() : 0;
     const bool ok = block(lk, self, timeout == 0 ? 0 : timeout);
+    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+        TIMELINE("blocked condvar %llu us key=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
+                 static_cast<unsigned long long>(key), static_cast<unsigned long long>(c->x[30]));
+    }
     if (!ok) {
         // Timed out: still queued on the condition variable or on the mutex.
         if (self->wait_kind == 2) remove(g_condvar, key, self);
@@ -493,7 +660,13 @@ static u32 svc_wait_for_address(Ctx* c) {
     self->wait_kind = 3;
     self->wait_key = addr;
     enqueue(g_arbiter[addr], self);
-    if (!block(lk, self, timeout)) {
+    const u64 wait_start = g_timeline_on ? host_ns() : 0;
+    const bool ok = block(lk, self, timeout);
+    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+        TIMELINE("blocked address %llu us addr=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
+                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(c->x[30]));
+    }
+    if (!ok) {
         remove(g_arbiter, addr, self);
         self->wait_kind = 0;
         return KResult::TimedOut;
@@ -537,16 +710,33 @@ static u32 svc_signal_to_address(Ctx* c) {
     return ResultOk;
 }
 
+// Windows timers fire on the 0.5 ms timer tick at best, so a short sleep took ~25x as long as
+// asked: the game's job loops sleep 20 us between polls (main thread and workers ~100 times a
+// second each in races, each ~0.5 ms). Sleeps under 4 ms now wait on the clock for their last
+// HOST_SLEEP_SPIN_US (default 700 us; whole sleeps below that) after a timer for the rest; longer
+// ones (frame pacing threads, 15-16 ms) keep the timer alone. HOST_SLEEP_SPIN_US=0: timer only
+// (old). The caller has released the guest core.
 static void sleep_ns(s64 ns) {
     if (ns <= 0) {
         SwitchToThread();
         return;
     }
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER due;
-    due.QuadPart = -std::max<s64>(1, ns / 100);
-    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-    WaitForSingleObject(timer, INFINITE);
+    static const s64 spin = [] {
+        const char* v = std::getenv("HOST_SLEEP_SPIN_US");
+        return v ? std::strtoll(v, nullptr, 10) * 1000 : 700'000LL;
+    }();
+    const u64 deadline = host_ns() + static_cast<u64>(ns);
+    const bool tail = ns < 4'000'000;
+    if (!tail || ns > spin) {
+        thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -std::max<s64>(1, (tail ? ns - spin : ns) / 100);
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, INFINITE);
+    }
+    while (tail && host_ns() < deadline) {
+        for (int i = 0; i < 32; i++) _mm_pause();
+    }
 }
 
 static u64 get_info(u32 id, u32 handle, u64 sub, u32* result) {
@@ -731,6 +921,7 @@ void svc(Ctx* c, u32 imm) {
             break;
         }
         CoreReleased released{t_current};
+        TIMELINE("sleep %lld us lr=%#llx", static_cast<long long>(ns / 1000), static_cast<unsigned long long>(c->x[30]));
         sleep_ns(ns);
         break;
     }

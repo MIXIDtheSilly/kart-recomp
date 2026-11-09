@@ -51,6 +51,10 @@ constexpr u32 SessionClosed = MakeResult(1, 123);
 void log_line(const char* fmt, ...);
 [[noreturn]] void fatal(const char* fmt, ...);
 #define LOG(...) log_line(__VA_ARGS__)
+// HOST_TIMELINE=<file>: timestamped events for frame timelines (scratchpad timeline.py).
+extern bool g_timeline_on;
+void timeline(const char* fmt, ...);
+#define TIMELINE(...) do { if (g_timeline_on) timeline(__VA_ARGS__); } while (0)
 
 std::string describe_guest(u64 addr);  // "0x... (module+off)"
 std::string host_symbol(u64 rip);      // host function containing rip

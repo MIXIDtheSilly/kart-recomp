@@ -12,9 +12,11 @@ if not exist out\obj mkdir out\obj
 if not exist out\obj\nvcore mkdir out\obj\nvcore
 set CFLAGS=/nologo /c /O2 /Zi /MD /std:c++20 /EHsc /GR- /permissive- /utf-8 /Zc:preprocessor /Zc:inline /Zc:externConstexpr /Zc:throwingNew /volatile:iso /W3 /wd4100 /wd4324 /wd4201 /MP /D_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS @egl.rsp /I. /I%SDL3%\include /Foout\obj\ /Fdout\obj\vc.pdb
 cl %CFLAGS% *.cpp services\*.cpp ..\gen\aot_modules.cpp %EGL%\src\core\frontend\emu_window.cpp %EGL%\src\core\frontend\framebuffer_layout.cpp nv\*.cpp nv\devices\*.cpp || exit /b 1
+if not exist out\obj\nvn mkdir out\obj\nvn
+cl %CFLAGS% /Foout\obj\nvn\ nvn\*.cpp nvn\vk\*.cpp || exit /b 1
 rem nv\core has file names nv\devices uses too (nvmap.cpp).
 cl %CFLAGS% /Foout\obj\nvcore\ nv\core\*.cpp || exit /b 1
-link /nologo /DEBUG /OUT:out\kart.exe /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULTLIB:LIBCMT out\obj\*.obj out\obj\nvcore\*.obj ^
+link /nologo /DEBUG /OUT:out\kart.exe /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULTLIB:LIBCMT out\obj\*.obj out\obj\nvcore\*.obj out\obj\nvn\*.obj ^
   ..\build\rtld.lib ..\build\main.lib ..\build\subsdk0.lib ..\build\sdk.lib ^
   %EB%\src\video_core\video_core.lib %EB%\src\audio_core\audio_core.lib %EB%\_deps\cubeb-build\cubeb.lib %SDL3%\lib\libSDL3_static.lib %EB%\src\shader_recompiler\shader_recompiler.lib %EB%\src\video_core\gpu_logging\gpu_logging.lib ^
   %EB%\src\common\common.lib %EB%\externals\glad\glad.lib %EB%\externals\reshadefx.lib %EB%\externals\bc_decoder.lib ^

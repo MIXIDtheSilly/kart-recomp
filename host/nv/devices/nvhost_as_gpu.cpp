@@ -236,8 +236,79 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     nx2_device_ranges[{cpu_address, size}] = {device_address, heap, phys_hash};
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    Nx2NoteMapped(gpu_address, size);
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
+}
+
+// Removes [gpu_address, +size) from the live ranges (cutting partly covered ones) and, when `add`,
+// records it as live. Called with `mutex` held.
+static void Nx2LiveSet(std::map<u64, u64>& live, u64 gpu_address, u64 size, bool add) {
+    const u64 end = gpu_address + size;
+    auto it = live.lower_bound(gpu_address);
+    if (it != live.begin() && std::prev(it)->first + std::prev(it)->second > gpu_address) {
+        --it;
+    }
+    while (it != live.end() && it->first < end) {
+        const u64 start = it->first, stop = it->first + it->second;
+        it = live.erase(it);
+        if (start < gpu_address) {
+            live[start] = gpu_address - start;
+        }
+        if (stop > end) {
+            live[end] = stop - end;
+        }
+    }
+    if (add) {
+        live[gpu_address] = size;
+    }
+}
+
+void nvhost_as_gpu::Nx2NoteMapped(u64 gpu_address, u64 size) {
+    Nx2LiveSet(nx2_gmmu_live, gpu_address, size, true);
+}
+
+// The GPU thread may still be running command lists that use the range, so the unmap waits for
+// them. Maps are immediate: a region destroyed and created again at the same GPU address (title 1
+// does this at course loads) got its new mapping wiped when the old unmap ran later, and the GPU
+// then read and wrote nothing there (garbage state, "device 0" command fetches, hangs). The queued
+// unmap now skips whatever is mapped again by the time it runs. Called with `mutex` held.
+void nvhost_as_gpu::Nx2QueueUnmap(u64 gpu_address, u64 size) {
+    Nx2LiveSet(nx2_gmmu_live, gpu_address, size, false);
+    static const bool old_unmap = [] {
+        const char* v = std::getenv("HOST_STALE_UNMAP");
+        return v && v[0] == '1';
+    }();
+    if (old_unmap) {
+        system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+        return;
+    }
+    system.GPU().RunInOrder([this, gmmu = gmmu.get(), gpu_address, size] {
+        std::scoped_lock lock(mutex);
+        const u64 end = gpu_address + size;
+        u64 cursor = gpu_address, kept = 0;
+        auto it = nx2_gmmu_live.lower_bound(gpu_address);
+        if (it != nx2_gmmu_live.begin() && std::prev(it)->first + std::prev(it)->second > gpu_address) {
+            --it;
+        }
+        for (; it != nx2_gmmu_live.end() && it->first < end; ++it) {
+            const u64 lo = (std::max)(it->first, gpu_address);
+            const u64 hi = (std::min)(it->first + it->second, end);
+            if (lo > cursor) {
+                gmmu->Unmap(cursor, lo - cursor);
+            }
+            kept += hi - lo;
+            cursor = (std::max)(cursor, hi);
+        }
+        if (cursor < end) {
+            gmmu->Unmap(cursor, end - cursor);
+        }
+        static std::atomic<int> reported{0};
+        if (kept != 0 && reported++ < 32) {
+            LOG("nx2: GPU unmap %#llx+%#llx ran after %#llx bytes of it were mapped again; kept those", gpu_address,
+                size, kept);
+        }
+    });
 }
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
@@ -245,8 +316,7 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
     if (!gmmu) {
         return;
     }
-    // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    Nx2QueueUnmap(gpu_address, size);
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 
@@ -290,9 +360,8 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         const DAddr device_address = it->second.second;
         nx2_sparse_ranges.erase(it);
         // After the command lists that may still use it.
-        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
-                                 device_size] {
-            gmmu->Unmap(gpu_address, size);
+        Nx2QueueUnmap(gpu_address, size);
+        system.GPU().RunInOrder([&smmu, size, device_address, device_size] {
             smmu.Unmap(device_address, size);
             smmu.Free(device_address, device_size);
         });
@@ -306,6 +375,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     }
     nx2_sparse_ranges[gpu_address] = {size, device_address};
     gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    Nx2NoteMapped(gpu_address, size);
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
 }

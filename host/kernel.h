@@ -49,6 +49,8 @@ struct KThread : KObject {
     u64 mutex_addr = 0;   // mutex to re-acquire after a condition variable wakeup
     u32 mutex_tag = 0;
     int wait_kind = 0;    // 0 none, 1 sync objects, 2 cond var, 3 arbiter, 4 mutex
+    u64 wake_ns = 0;      // when it was woken (HOST_SCHED_STATS)
+    u64 st_queued_ns = 0, st_queued_n = 0, st_owned = 0, st_woken = 0;  // HOST_SCHED_STATS, per report
 };
 
 struct KReadableEvent : KObject {
@@ -117,5 +119,15 @@ void preempt(Ctx* c);
 
 // Logs every guest thread: its wait, and for running threads the host function it is in.
 void dump_threads();
+
+// Gives the calling guest thread's core to other threads while native code waits on something that
+// is not a kernel object (a GPU fence, a host condition variable). Does nothing on host threads.
+struct HostWait {
+    KThread* t;
+    HostWait();
+    ~HostWait();
+    HostWait(const HostWait&) = delete;
+    HostWait& operator=(const HostWait&) = delete;
+};
 
 }  // namespace kern

@@ -1,4 +1,5 @@
 // am (appletOE): the application's view of the applet manager.
+#include <cstdlib>
 #include <deque>
 
 #include "../ipc.h"
@@ -16,7 +17,7 @@ struct AppletState {
     std::deque<u32> messages;
     kern::ServiceEvent message_event;
     kern::ServiceEvent gpu_error_event, suspended_tick_event, launch_param_event;
-    bool docked = true;
+    bool docked = std::getenv("HOST_HANDHELD") == nullptr;   // HOST_HANDHELD=1: the game runs as undocked (lower resolution)
 
     void push(u32 msg) {
         std::scoped_lock lk{lock};

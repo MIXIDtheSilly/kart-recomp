@@ -234,6 +234,11 @@ private:
     // Switch 2: maps GPU-accessible process memory (CPU range) at a GPU address.
     void Nx2Map(u64 gpu_address, u64 cpu_address, u64 size);
     void Nx2Unmap(u64 gpu_address, u64 size);
+    // Host: GPU ranges mapped now (GPU address -> size). Maps take effect at once, unmaps wait for
+    // the GPU thread; a queued unmap leaves alone what was mapped again after it was queued.
+    std::map<u64, u64> nx2_gmmu_live;
+    void Nx2NoteMapped(u64 gpu_address, u64 size);
+    void Nx2QueueUnmap(u64 gpu_address, u64 size);
     NvCore::SessionId nx2_session{};
     struct Nx2DeviceRange {
         DAddr address;

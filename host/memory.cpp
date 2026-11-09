@@ -1,9 +1,12 @@
 #include "memory.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #include "common/host_memory.h"
 #include "core/device_memory.h"
+
+extern "C" __declspec(dllimport) unsigned long __stdcall DiscardVirtualMemory(void* address, size_t size);
 
 uintptr_t g_membase = 0;
 
@@ -88,8 +91,34 @@ void split_mapping(u64 addr) {
     g_mappings.emplace(addr, tail);
 }
 
+// Freed physical pages leave RAM: until the pool hands them out again only the backing view maps
+// them, and first fit often places the next allocation elsewhere, so they stayed resident unused.
+// Discarded section pages read zero again (scratchpad disc test), so they need no clearing when
+// reused either: clearing a reused 4 MiB sparse block made all of it resident for a 256 KiB write.
+// Returns false when they were kept (HOST_KEEP_FREED=1, or the discard failed): then they are
+// marked freed and cleared on reuse. HOST_KEEP_FREED=1 restores that.
+u64 g_discarded = 0;
+bool discard_run(u64 phys, u64 size) {
+    // Checked once on the pool's last page (the allocator hands it out last): written, discarded,
+    // then it must read zero.
+    static const bool keep = [] {
+        if (const char* v = std::getenv("HOST_KEEP_FREED"); v && v[0] == '1') return true;
+        u8* const page = g_host->BackingBasePointer() + g_phys_size - PageSize;
+        std::memset(page, 0xAB, PageSize);
+        bool zero = DiscardVirtualMemory(page, PageSize) == 0;
+        for (u64 i = 0; zero && i < PageSize; ++i) zero = page[i] == 0;
+        if (!zero) LOG("mem: discarded pages do not read zero; freed guest memory stays resident");
+        return !zero;
+    }();
+    if (keep || DiscardVirtualMemory(g_host->BackingBasePointer() + phys, size) != 0) return false;
+    const u64 before = g_discarded;
+    g_discarded += size;
+    if ((before >> 30) != (g_discarded >> 30)) LOG("mem: %llu MiB of freed guest memory returned to the system so far", g_discarded >> 20);
+    return true;
+}
+
 void free_run(u64 phys, u64 size) {
-    g_host->MarkBackingFreed(phys, size);
+    if (!discard_run(phys, size)) g_host->MarkBackingFreed(phys, size);
     auto next = g_phys_free.lower_bound(phys);
     if (next != g_phys_free.begin()) {
         auto prev = std::prev(next);
@@ -138,14 +167,27 @@ Core::DeviceMemory& device_memory() { return *g_device; }
 
 void init() {
     // The pool is committed up front (a pagefile-backed section) but only touched pages use RAM.
-    // 24 GiB: the game's memory (~10 GB) plus GPU-only regions (~3 GB) plus the sparse regions'
-    // blocks, which are backed as the GPU first writes them and kept (~250 MB more per course).
-    u64 gib = 24;
-    if (const char* v = std::getenv("HOST_PHYS_GIB")) gib = std::strtoull(v, nullptr, 0);
-    g_phys_size = gib << 30;
-    g_device = new Core::DeviceMemory();
+    // 24 GiB: the game's memory (8.2 GB at boot) plus GPU-only regions (~2.8 GB) plus the sparse
+    // regions' blocks, which are backed as the GPU first writes them and kept (~250 MB more per
+    // course): ~15 GB allocated after a race, ~2 GB of it resident. Machines whose RAM + page file
+    // can't take the commit (a 16 GB handheld) get the largest of 20, 16, 14, 12 GiB that fits;
+    // past the pool's last GiB the GPU's sparse and GPU-only memory goes without backing.
+    std::vector<u64> sizes{24, 20, 16, 14, 12};
+    if (const char* v = std::getenv("HOST_PHYS_GIB")) sizes = {std::strtoull(v, nullptr, 0)};
+    for (const u64 gib : sizes) {
+        g_phys_size = gib << 30;
+        g_device = new Core::DeviceMemory();
+        if (g_device->buffer.VirtualBasePointer()) break;
+        delete g_device;
+        g_device = nullptr;
+        LOG("guest memory pool: %llu GiB doesn't fit in RAM + page file", gib);
+    }
+    if (!g_device)
+        fatal("cannot reserve guest memory: even %llu GiB doesn't fit in RAM + page file. Free memory or "
+              "enlarge the page file (System > About > Advanced system settings > Performance > Virtual memory).",
+              sizes.back());
+    LOG("guest memory pool: %llu GiB", g_phys_size >> 30);
     g_host = &g_device->buffer;
-    if (!g_host->VirtualBasePointer()) fatal("cannot create the guest address space (fastmem arena)");
     g_membase = reinterpret_cast<uintptr_t>(g_host->VirtualBasePointer());
     g_phys_free.emplace(0, g_phys_size);
     g_blocks.emplace(0, Block{AddressSpaceSize, Free, None, 0});
@@ -185,6 +227,7 @@ u64 phys_free_bytes() {
 }
 
 u8* phys_ptr(u64 phys) { return g_host->BackingBasePointer() + phys; }
+u64 phys_pool_bytes() { return g_phys_size; }
 
 std::vector<RemapListener> g_remap_listeners;
 
@@ -244,6 +287,26 @@ std::vector<PhysRun> phys_runs(u64 addr, u64 size) {
         else out.push_back({phys, hi - lo});
     }
     return out;
+}
+
+// Guest pages mapping the same physical page as `addr` (itself included); `others` gets up to
+// four of the other guest addresses. A debug aid: the GPU's write tracking protects one guest
+// address per physical page, so stores through an alias are not seen.
+u32 alias_count(u64 addr, std::vector<u64>* others) {
+    std::scoped_lock lk{g_lock};
+    auto it = g_mappings.upper_bound(addr);
+    if (it == g_mappings.begin()) return 0;
+    --it;
+    if (addr >= it->first + it->second.size) return 0;
+    const u64 phys = (it->second.phys + (addr - it->first)) & ~(PageSize - 1);
+    u32 count = 0;
+    for (const auto& [va, m] : g_mappings) {
+        if (phys < m.phys || phys >= m.phys + m.size) continue;
+        ++count;
+        const u64 alias = va + (phys - m.phys);
+        if (others && alias != (addr & ~(PageSize - 1)) && others->size() < 4) others->push_back(alias);
+    }
+    return count;
 }
 
 u8* backing_ptr(u64 addr) {

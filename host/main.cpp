@@ -21,6 +21,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "video.h"
+#include "watch.h"
 #include "common/logging.h"
 #include "common/windows/timer_resolution.h"
 
@@ -54,12 +55,47 @@ void log_line(const char* fmt, ...) {
     va_end(ap);
 }
 
+// One line per event: microseconds since start, guest thread (0 = host thread), text.
+static FILE* g_timeline_file = [] {
+    const char* path = std::getenv("HOST_TIMELINE");
+    FILE* f = path ? std::fopen(path, "w") : nullptr;
+    if (f) std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+    return f;
+}();
+bool g_timeline_on = g_timeline_file != nullptr;
+static std::mutex g_timeline_lock;
+static u64 g_timeline_lines = 0;
+
+void timeline(const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const u64 us = static_cast<u64>(static_cast<double>(now.QuadPart - g_qpc_start.QuadPart) * 1e6 /
+                                    static_cast<double>(g_qpf.QuadPart));
+    const u64 tid = kern::current_thread() ? kern::current_thread()->id : 0;
+    std::scoped_lock lk{g_timeline_lock};
+    std::fprintf(g_timeline_file, "%llu %llu %s\n", us, tid, buf);
+    if (++g_timeline_lines % 4096 == 0) std::fflush(g_timeline_file);
+}
+
 void fatal(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vlog(fmt, ap);
     va_end(ap);
     if (auto* t = kern::current_thread()) dump_guest_stack(&t->ctx);
+    // Started from Explorer the console closes with the process: say why (not in hidden test runs).
+    if (!std::getenv("HOST_RENDER_HIDDEN")) {
+        char text[1024];
+        va_start(ap, fmt);
+        vsnprintf(text, sizeof text, fmt, ap);
+        va_end(ap);
+        MessageBoxA(nullptr, text, "Kart: fatal error", MB_OK | MB_ICONERROR);
+    }
     ExitProcess(1);
 }
 
@@ -220,6 +256,7 @@ LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     // The store redirected to backing memory (video::on_cpu_write_fault) has run.
     if (code == EXCEPTION_SINGLE_STEP && video::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (code == EXCEPTION_SINGLE_STEP && watch::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != 0xC0000409) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -228,6 +265,11 @@ LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     u64 fault = 0;
     if (code == EXCEPTION_ACCESS_VIOLATION) fault = ep->ExceptionRecord->ExceptionInformation[1];
     const u64 guest = fault - g_membase;
+    // A store into a watched guest buffer (HOST_WATCH_SSBO).
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[0] == 1 && guest < mem::AddressSpaceSize &&
+        watch::on_write_fault(guest, ep->ContextRecord)) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // A guest access to GPU-written memory the CPU has not read yet: download it, then retry.
     if (code == EXCEPTION_ACCESS_VIOLATION && guest < mem::AddressSpaceSize &&
         video::on_read_trap(guest, ep->ExceptionRecord->ExceptionInformation[0] == 1)) {
@@ -306,6 +348,12 @@ void dump_guest_stack(Ctx* c) {
 }
 
 void host_override(u64 addr, GuestFn fn) { g_overrides[addr] = fn; }
+
+GuestFn recompiled_fn(u64 addr) {
+    for (const auto& m : g_loaded)
+        if (addr - m.base < m.size) return lookup_fn(m.table, m.table_size, addr - m.base);
+    return nullptr;
+}
 
 u64 module_base(const char* name) {
     for (const auto& m : g_loaded)
@@ -387,6 +435,15 @@ int main(int argc, char** argv) {
     LOG("host timer resolution %lld us", static_cast<long long>(timer_resolution.count() / 1000));
     mem::init();
     video::init();
+
+    // HOST_FPS_MODE=dynamic (default) | 60 | 30 | game: the game's present interval (cpu.h
+    // g_mkw_frame_mode). Dynamic keeps the game clock at real time when frames run late.
+    {
+        const char* v = std::getenv("HOST_FPS_MODE");
+        const std::string mode = v ? v : "dynamic";
+        g_mkw_frame_mode = mode == "game" ? -1 : mode == "60" ? 1 : mode == "30" ? 2 : 0;
+        LOG("frame mode %s (%d)", mode.c_str(), g_mkw_frame_mode);
+    }
 
     u64 base = 0x803fd000;  // where the console's loader put rtld for this title
     for (size_t i = 0; i < g_aot_module_count; i++) {
