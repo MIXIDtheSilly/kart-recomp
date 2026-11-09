@@ -3,6 +3,8 @@
 // recording (milliseconds a frame). The vk_rp_* functions (replay_vk.cpp) are the renderer itself; replay_async.cpp
 // defines the rp_* entry points over them.
 #pragma once
+#include <vector>
+
 #include "../replay.h"
 
 namespace nvn {
@@ -42,6 +44,11 @@ uint64_t vk_rp_sub_commit();
 uint64_t vk_rp_last_fence();
 void vk_rp_finish();
 void vk_rp_drain();
+// A submission whose event waits may hold it back until the one that signals them comes (replay_vk.cpp). fence: the value rp_sub_commit gave it.
+void vk_rp_submit(u64 queue, std::vector<const uint8_t*> handles, u64 fence);
+bool vk_rp_holding();
+void vk_rp_force_held();
+void rp_force_held();   // queues vk_rp_force_held
 uint64_t vk_rp_present(const tex_t* t, double period_s, const int crop[4]);
 
 }  // namespace nvn

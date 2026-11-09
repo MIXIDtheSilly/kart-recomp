@@ -142,6 +142,12 @@ NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer* c, const NVNevent* e, N
     const ev_t* ev = (const ev_t*)e; volatile uint32_t* val = ev->val; uint32_t mm = m;
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
+// Waits between queues: the renderer runs a submission only as far as its events allow (replay_vk.cpp)
+NVN(nvnCommandBufferWaitEvent, void, NVNcommandBuffer* c, const NVNevent* e, NVNeventWaitMode m, uint32_t v) {
+    uint8_t* p = cmd_alloc(CB(c), 24); put_hdr(p, OP_WAIT_EVENT, 24);
+    const ev_t* ev = (const ev_t*)e; volatile uint32_t* val = ev->val; uint32_t mm = m;
+    memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
+}
 // A fence recorded in a command buffer: the renderer fences the sync with the submission that reaches this point (OP_FENCE_SYNC). Unreal Engine's NVN RHI fences its command buffers this way (Octopath Traveler 0); Pokemon Legends: Z-A fences once a frame this way and waits on it
 NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer* c, NVNsync* s, NVNsyncCondition cond, int flags) {
     (void)cond; (void)flags;

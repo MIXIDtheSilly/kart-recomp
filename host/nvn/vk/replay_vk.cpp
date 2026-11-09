@@ -11,6 +11,8 @@
 // submissions on the same queue).
 #include <condition_variable>
 #include <deque>
+#include <list>
+#include <unordered_map>
 #include <thread>
 
 #include "../nvn_int.h"
@@ -429,7 +431,6 @@ void fill(VkCommandBuffer cb, u64 dst, u64 n, uint32_t value) {
     g_cur->posts.push_back(std::move(p));
 }
 
-int g_depth = 0;
 constexpr int MaxDepth = 64;
 
 // ---------------------------------------------------------------- partial submissions
@@ -599,110 +600,132 @@ void vk_rp_sub_begin() {
 
 void vk_rp_exec_rest(const uint64_t*, int) {}
 
-void vk_rp_exec(const uint8_t* p) {
-    if (g_depth >= MaxDepth) {
+namespace {
+
+// The records of a recording in execution order, following JUMP and CALL.
+void collect(const uint8_t* p, std::vector<const uint8_t*>& out, int depth = 0) {
+    if (depth >= MaxDepth) {
         LOG("[RED] nvn: command stream calls nest deeper than %d; ignored", MaxDepth);
         return;
     }
-    struct Depth {
-        Depth() { g_depth++; }
-        ~Depth() { g_depth--; }
-    } depth_guard;
     for (;;) {
-        VkCommandBuffer cb = g_cur->cb;   // (each record: a partial flush changes it)
         op_hdr h;
         memcpy(&h, p, sizeof h);
         if (h.size < 8 || h.op >= OP_COUNT_ || (h.size & 7)) {
             LOG("[RED] nvn: corrupt command record at %p (op %u size %u): the recording is cut here", (const void*)p, h.op, h.size);
             return;
         }
-        const uint8_t* a = p + 8;
-        switch (h.op) {
-        case OP_END: return;
-        case OP_JUMP: {
+        if (h.op == OP_END) return;
+        if (h.op == OP_JUMP) {
             const uint8_t* t;
-            memcpy(&t, a, 8);
+            memcpy(&t, p + 8, 8);
             if (!t) { LOG("[RED] nvn: JUMP to null"); return; }
             p = t;
             continue;
         }
-        case OP_CALL: {
+        if (h.op == OP_CALL) {
             uint64_t t;
-            memcpy(&t, a, 8);
-            if (t) vk_rp_exec(static_cast<const uint8_t*>(hp(t)));
-            break;
-        }
-        case OP_SIGNAL_EVENT: {
-            volatile uint32_t* val;
-            uint32_t m, v;
-            memcpy(&val, a, 8), memcpy(&m, a + 8, 4), memcpy(&v, a + 12, 4);
-            dump_note("event write %p mode %u value %#x", (const void*)val, m, v);
-            if (val) {
-                const u32 nv = m == NVN_EVENT_SIGNAL_MODE_ADD ? draw_written_word(val) + v : v;
-                draw_note_write(val, &nv, 4);
-            }
-            rp_sub_event(val, m, v);
-            break;
-        }
-        case OP_REPORT_COUNTER: {
-            uint64_t t, ad;
-            memcpy(&t, a, 8), memcpy(&ad, a + 8, 8);
-            dump_note("counter report type %llu to %#llx", static_cast<unsigned long long>(t), static_cast<unsigned long long>(ad));
-            if (u8* h = gpu_ptr(ad, 16)) {
-                const uint64_t rec[2] = {0, 0};  // the value the completion writes (the timestamp half is not compared)
-                draw_note_write(h, rec, 8);
-            }
-            rp_sub_counter(ad, static_cast<uint32_t>(t));
-            break;
-        }
-        case OP_FENCE_SYNC: {
-            sync_t* s;
-            memcpy(&s, a, 8);
-            // (on the renderer thread the sync was fenced when the submission was queued: the game may have
-            // fenced it again since)
-            if (!async_replay()) {
-                s->fence = g_submitted.load() + 1;
-                s->fenced = 1;
-            }
-            break;
-        }
-        case OP_CLEAR_BUF: {
-            const auto* c = reinterpret_cast<const p_clear_buf*>(a);
-            fill(cb, c->addr, c->size, c->value);
-            break;
-        }
-        case OP_COPY_B2B: {
-            uint64_t s_, d, n;
-            memcpy(&s_, a, 8), memcpy(&d, a + 8, 8), memcpy(&n, a + 16, 8);
-            copy_b2b(cb, s_, d, n);
-            break;
-        }
-        case OP_UPDATE_UB: {
-            uint64_t d, n;
-            memcpy(&d, a, 8), memcpy(&n, a + 8, 8);
-            update(cb, a + 16, d, n);
-            break;
-        }
-        case OP_SET_RT: set_targets(cb, reinterpret_cast<const p_set_rt*>(a)); break;
-        case OP_COPY_STRIDE: copy_stride(reinterpret_cast<const p_copy_stride*>(a)); break;
-        case OP_COPY_B2T: copy_buffer_texture(cb, reinterpret_cast<const p_copy_b2t*>(a), true); break;
-        case OP_COPY_T2B: copy_buffer_texture(cb, reinterpret_cast<const p_copy_b2t*>(a), false); break;
-        case OP_COPY_T2T: copy_texture_texture(cb, reinterpret_cast<const p_copy_t2t*>(a)); break;
-        case OP_CLEAR_COLOR: clear_color(cb, reinterpret_cast<const p_clear_color*>(a)); break;
-        case OP_CLEAR_DS: clear_ds(cb, reinterpret_cast<const p_clear_ds*>(a)); break;
-        case OP_CLEAR_TEX: clear_tex(cb, reinterpret_cast<const p_clear_tex*>(a)); break;
-        case OP_BARRIER:
-            end_rendering(cb);
-            full_barrier(cb);
-            break;
-        case OP_DRAW:
-        case OP_DRAW_IDX:
-        case OP_DISPATCH:
-        case OP_DRAW_TEX: draw(cb, h.op, a, h.size, p + h.size); break;
-        default: draw_state(h.op, a, h.size); break;
+            memcpy(&t, p + 8, 8);
+            if (t) collect(static_cast<const uint8_t*>(hp(t)), out, depth + 1);
+        } else {
+            out.push_back(p);
         }
         p += h.size;
-        if (++g_since_flush >= flush_records()) flush_partial();
+    }
+}
+
+void exec_record(const uint8_t* p, const op_hdr& h) {
+    VkCommandBuffer cb = g_cur->cb;   // (each record: a partial flush changes it)
+    const uint8_t* a = p + 8;
+    switch (h.op) {
+    case OP_SIGNAL_EVENT: {
+        volatile uint32_t* val;
+        uint32_t m, v;
+        memcpy(&val, a, 8), memcpy(&m, a + 8, 4), memcpy(&v, a + 12, 4);
+        dump_note("event write %p mode %u value %#x", (const void*)val, m, v);
+        if (val) {
+            const u32 nv = m == NVN_EVENT_SIGNAL_MODE_ADD ? draw_written_word(val) + v : v;
+            draw_note_write(val, &nv, 4);
+        }
+        rp_sub_event(val, m, v);
+        break;
+    }
+    case OP_WAIT_EVENT: {
+        volatile uint32_t* val;
+        uint32_t m, v;
+        memcpy(&val, a, 8), memcpy(&m, a + 8, 4), memcpy(&v, a + 12, 4);
+        dump_note("event wait %p mode %u value %#x now %#x", (const void*)val, m, v, val ? draw_written_word(val) : 0);
+        break;
+    }
+    case OP_REPORT_COUNTER: {
+        uint64_t t, ad;
+        memcpy(&t, a, 8), memcpy(&ad, a + 8, 8);
+        dump_note("counter report type %llu to %#llx", static_cast<unsigned long long>(t), static_cast<unsigned long long>(ad));
+        if (u8* h = gpu_ptr(ad, 16)) {
+            const uint64_t rec[2] = {0, 0};  // the value the completion writes (the timestamp half is not compared)
+            draw_note_write(h, rec, 8);
+        }
+        rp_sub_counter(ad, static_cast<uint32_t>(t));
+        break;
+    }
+    case OP_FENCE_SYNC: {
+        sync_t* s;
+        memcpy(&s, a, 8);
+        // (on the renderer thread the sync was fenced when the submission was queued: the game may have
+        // fenced it again since)
+        if (!async_replay()) {
+            s->fence = g_submitted.load() + 1;
+            s->fenced = 1;
+        }
+        break;
+    }
+    case OP_CLEAR_BUF: {
+        const auto* c = reinterpret_cast<const p_clear_buf*>(a);
+        fill(cb, c->addr, c->size, c->value);
+        break;
+    }
+    case OP_COPY_B2B: {
+        uint64_t s_, d, n;
+        memcpy(&s_, a, 8), memcpy(&d, a + 8, 8), memcpy(&n, a + 16, 8);
+        copy_b2b(cb, s_, d, n);
+        break;
+    }
+    case OP_UPDATE_UB: {
+        uint64_t d, n;
+        memcpy(&d, a, 8), memcpy(&n, a + 8, 8);
+        update(cb, a + 16, d, n);
+        break;
+    }
+    case OP_SET_RT: set_targets(cb, reinterpret_cast<const p_set_rt*>(a)); break;
+    case OP_COPY_STRIDE: copy_stride(reinterpret_cast<const p_copy_stride*>(a)); break;
+    case OP_COPY_B2T: copy_buffer_texture(cb, reinterpret_cast<const p_copy_b2t*>(a), true); break;
+    case OP_COPY_T2B: copy_buffer_texture(cb, reinterpret_cast<const p_copy_b2t*>(a), false); break;
+    case OP_COPY_T2T: copy_texture_texture(cb, reinterpret_cast<const p_copy_t2t*>(a)); break;
+    case OP_CLEAR_COLOR: clear_color(cb, reinterpret_cast<const p_clear_color*>(a)); break;
+    case OP_CLEAR_DS: clear_ds(cb, reinterpret_cast<const p_clear_ds*>(a)); break;
+    case OP_CLEAR_TEX: clear_tex(cb, reinterpret_cast<const p_clear_tex*>(a)); break;
+    case OP_BARRIER:
+        end_rendering(cb);
+        full_barrier(cb);
+        break;
+    case OP_DRAW:
+    case OP_DRAW_IDX:
+    case OP_DISPATCH:
+    case OP_DRAW_TEX: draw(cb, h.op, a, h.size, p + h.size); break;
+    default: draw_state(h.op, a, h.size); break;
+    }
+    if (++g_since_flush >= flush_records()) flush_partial();
+}
+
+}  // namespace
+
+void vk_rp_exec(const uint8_t* p) {
+    std::vector<const uint8_t*> recs;
+    collect(p, recs);
+    for (const uint8_t* r : recs) {
+        op_hdr h;
+        memcpy(&h, r, sizeof h);
+        exec_record(r, h);
     }
 }
 
@@ -758,6 +781,163 @@ uint64_t vk_rp_sub_commit() {
     return value;
 }
 
+// ---------------------------------------------------------------- submissions in the order their events allow
+// The game's compute and graphics queues take turns through events, five rounds a frame: compute submits first and
+// waits for what graphics signals (GPU-side, nvnCommandBufferWaitEvent), graphics waits for what compute signals. One
+// Vulkan queue runs both, so a submission that cannot get past a wait is held until the submission that signals it
+// has come; then they run together in one Vulkan submission, each up to its next unmet wait. Replayed one after the
+// other, compute read what graphics had left from the previous frame and the culling let trees through for a frame.
+//
+// Held work is never waited for: a game wait on a held fence, HoldMs without a new step (replay_async.cpp) or too many
+// held submissions run it anyway, past the waits nothing will signal.
+namespace {
+
+constexpr size_t MaxHeld = 4;
+
+struct Stream {
+    u64 queue = 0;
+    int origin = 0;
+    u64 fence = 0;
+    std::vector<const uint8_t*> recs;
+    size_t at = 0;
+    RenderState r{};  // its render targets while another stream runs
+};
+std::list<Stream> g_streams;       // renderer thread; oldest first
+Stream* g_active = nullptr;
+std::atomic<u64> g_hold_first{0};  // the fence of the oldest held submission (0: none)
+
+bool wait_met(u32 now, uint32_t mode, uint32_t v) {
+    return mode == NVN_EVENT_WAIT_MODE_EQUAL ? now == v : static_cast<int32_t>(now - v) >= 0;
+}
+
+// Takes s from `at` to its end or its next unmet wait; on_rec for each record. True when it moved.
+template <class Now, class Rec> bool advance(const Stream& s, size_t& at, Now now, Rec on_rec) {
+    const size_t from = at;
+    for (; at < s.recs.size(); at++) {
+        const uint8_t* p = s.recs[at];
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.op == OP_WAIT_EVENT) {
+            volatile uint32_t* val;
+            uint32_t m, v;
+            memcpy(&val, p + 8, 8), memcpy(&m, p + 16, 4), memcpy(&v, p + 20, 4);
+            if (val && !wait_met(now(val), m, v)) break;
+        }
+        on_rec(p, h);
+    }
+    return at != from;
+}
+
+// A queue runs its submissions in order: only its oldest unfinished one may move.
+template <class At> bool blocked_by_older(const Stream& s, At at_of) {
+    for (const Stream& o : g_streams) {
+        if (&o == &s) return false;
+        if (o.queue == s.queue && at_of(o) < o.recs.size()) return true;
+    }
+    return false;
+}
+
+// Whether the streams can all reach their ends with the events they signal themselves. Runs nothing.
+bool feasible() {
+    std::unordered_map<const volatile uint32_t*, u32> vals;
+    std::unordered_map<const Stream*, size_t> ats;
+    for (const Stream& s : g_streams) ats[&s] = s.at;
+    const auto at_of = [&](const Stream& s) { return ats[&s]; };
+    const auto now = [&](volatile uint32_t* v) {
+        auto it = vals.find(v);
+        return it != vals.end() ? it->second : *v;
+    };
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (const Stream& s : g_streams) {
+            if (blocked_by_older(s, at_of)) continue;
+            moved |= advance(s, ats[&s], now, [&](const uint8_t* p, const op_hdr& h) {
+                if (h.op != OP_SIGNAL_EVENT) return;
+                volatile uint32_t* val;
+                uint32_t m, v;
+                memcpy(&val, p + 8, 8), memcpy(&m, p + 16, 4), memcpy(&v, p + 20, 4);
+                if (val) vals[val] = m == NVN_EVENT_SIGNAL_MODE_ADD ? now(val) + v : v;
+            });
+        }
+    }
+    for (const Stream& s : g_streams)
+        if (ats[&s] < s.recs.size()) return false;
+    return true;
+}
+
+void switch_to(Stream& s) {
+    if (g_active) {
+        end_rendering(g_cur->cb);
+        g_active->r = R;
+        flush_partial();
+    }
+    R = s.r;
+    g_queue_origin_ll.store(s.origin);
+    draw_queue_activate(s.queue);
+    draw_cb_changed();
+    g_active = &s;
+}
+
+void run_ready() {
+    const auto at_of = [](const Stream& s) { return s.at; };
+    const auto now = [](volatile uint32_t* v) { return draw_written_word(v); };
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (Stream& s : g_streams) {
+            if (blocked_by_older(s, at_of)) continue;
+            moved |= advance(s, s.at, now, [&](const uint8_t* p, const op_hdr& h) {
+                if (g_active != &s) switch_to(s);
+                exec_record(p, h);
+            });
+        }
+    }
+}
+
+void run_streams() {
+    static u64 forced = 0, log_at = 0;
+    vk_rp_sub_begin();
+    g_active = nullptr;
+    for (;;) {
+        run_ready();
+        // a wait nothing here signals: past it, as if it had been met
+        Stream* stuck = nullptr;
+        for (Stream& s : g_streams)
+            if (s.at < s.recs.size() && !blocked_by_older(s, [](const Stream& o) { return o.at; })) { stuck = &s; break; }
+        if (!stuck) break;
+        forced++;
+        stuck->at++;
+    }
+    if (const u64 now = host_ns(); forced && now - log_at > 10'000'000'000ull) {
+        LOG("nvk: event waits nothing signalled in time, passed anyway: %llu so far", static_cast<unsigned long long>(forced));
+        log_at = now;
+    }
+    const u64 last = g_streams.back().fence;
+    g_active = nullptr;
+    g_streams.clear();
+    g_hold_first.store(0);
+    R = RenderState{};
+    g_submitted.store(last - 1);   // held submissions' fence values are covered by this one
+    vk_rp_sub_commit();
+}
+
+}  // namespace
+
+void vk_rp_submit(u64 queue, std::vector<const uint8_t*> handles, u64 fence) {
+    Stream& s = g_streams.emplace_back();
+    s.queue = queue, s.origin = g_queue_origin_ll.load(), s.fence = fence;
+    for (const uint8_t* h : handles) collect(h, s.recs);
+    if (!feasible() && g_streams.size() < MaxHeld) {
+        if (!g_hold_first.load()) g_hold_first.store(g_streams.front().fence);
+        return;
+    }
+    run_streams();
+}
+
+bool vk_rp_holding() { return !g_streams.empty(); }
+void vk_rp_force_held() {
+    if (!g_streams.empty()) run_streams();
+}
+
 void rp_sub_copy(u64 src, u64 dst, u64 n) { copy_b2b(g_cur->cb, src, dst, n); }
 void rp_sub_update(const void* data, u64 dst, u64 n) { update(g_cur->cb, data, dst, n); }
 void rp_sub_fill(u64 dst, u64 n, uint32_t value) { fill(g_cur->cb, dst, n, value); }
@@ -777,6 +957,7 @@ uint64_t vk_rp_last_fence() { return g_submitted.load(); }
 bool rp_wait(uint64_t fence, uint64_t timeout_ns) {
     if (g_done.load(std::memory_order_acquire) >= fence) return true;
     if (!timeout_ns) return false;
+    if (const u64 h = g_hold_first.load(); h && fence >= h) rp_force_held();
     std::unique_lock lk{g_mu};
     auto ready = [&] { return g_done.load(std::memory_order_acquire) >= fence; };
     // The game's waits for the GPU: how many, how long in all (logged every 10 s)

@@ -34,8 +34,6 @@ NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
 NVN(nvnEventSignal, void, NVNevent* e, NVNeventSignalMode m, uint32_t v) { event_apply(((const ev_t*)e)->val, m, v); }
-// Waiting for an event on the GPU is not modelled: the renderer completes submissions in order and the events games wait for are signalled earlier in the same stream
-NVN(nvnCommandBufferWaitEvent, void, NVNcommandBuffer* c, const NVNevent* e, NVNeventWaitMode m, uint32_t v) { (void)c; (void)e; (void)m; (void)v; }
 // The storage set with SetStorage (EA SPORTS FC 27's Frostbite renderer reads it back)
 NVN_NOPROTO(nvnEventBuilderGetMemoryPool, NVNmemoryPool*, const NVNeventBuilder* b) { return (NVNmemoryPool*)((const ev_builder_t*)b)->pool; }
 NVN_NOPROTO(nvnEventBuilderGetMemoryOffset, int64_t, const NVNeventBuilder* b) { return ((const ev_builder_t*)b)->off; }

@@ -1741,6 +1741,8 @@ VkCommandBuffer draw_sub_commit(u64 value) {
     return pre;
 }
 
+void draw_cb_changed() { dyn_reset(); }
+
 void draw_queue_activate(u64 serial) {
     auto& p = g_states[serial];
     if (!p) p = std::make_unique<State>();

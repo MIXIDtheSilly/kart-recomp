@@ -1,7 +1,7 @@
 // Native NVN: queues and submission.
 //
 // A submission runs under g_sub_mu, one at a time: the renderer keeps one submission in progress and per-queue binding state. NVN orders work on different queues only
-// through syncs, so replaying two queues' submissions in lock order is one valid order (Fire Emblem: Three Houses initializes two queues and submits on both from two threads).
+// through syncs and events: submissions replay in lock order except where their event waits say otherwise (vk/replay_vk.cpp), which is one valid order (Fire Emblem: Three Houses initializes two queues and submits on both from two threads).
 #include "nvn_int.h"
 
 #include <optional>

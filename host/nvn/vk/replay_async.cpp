@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,7 @@ namespace nvn {
 namespace {
 
 constexpr int MaxQueued = 6;
+constexpr int HoldMs = 33;
 
 struct Step {
     std::function<void()> fn;
@@ -89,7 +91,16 @@ void renderer_loop() {
         Step s;
         {
             std::unique_lock lk{g_q_mu};
-            g_work.wait(lk, [] { return !g_q.empty(); });
+            // Held submissions (replay_vk.cpp) wait for the one that signals them, not for ever
+            if (vk_rp_holding()) {
+                if (!g_work.wait_for(lk, std::chrono::milliseconds(HoldMs), [] { return !g_q.empty(); })) {
+                    lk.unlock();
+                    vk_rp_force_held();
+                    continue;
+                }
+            } else {
+                g_work.wait(lk, [] { return !g_q.empty(); });
+            }
             s = std::move(g_q.front());
             g_q.pop_front();
         }
@@ -186,6 +197,7 @@ void fence_syncs(const uint8_t* p, u64 fence, int depth = 0) {
 
 // The submission being made (rp_sub_begin .. rp_sub_commit run under the submission lock).
 std::vector<const uint8_t*> g_handles;
+uint64_t g_sub_queue = 0;
 
 struct TexArg {
     bool has = false;
@@ -249,7 +261,10 @@ void rp_prog_forget(const prog_t* p) {
     post([pc = *p] { vk_rp_prog_forget(&pc); });
 }
 
-void rp_queue_activate(uint64_t serial) { post([serial] { vk_rp_queue_activate(serial); }); }
+void rp_queue_activate(uint64_t serial) {
+    g_sub_queue = serial;
+    post([serial] { vk_rp_queue_activate(serial); });
+}
 void rp_queue_forget(uint64_t serial) { post([serial] { vk_rp_queue_forget(serial); }); }
 void rp_prepare() {
     // (once: the renderer's own setup, on its thread)
@@ -275,6 +290,13 @@ uint64_t rp_sub_commit() {
     if (!async_replay()) return vk_rp_sub_commit();
     const u64 fence = g_issued.load() + 1;
     g_issued.store(fence);
+    // HOST_NVN_EVENT_ORDER=0: every submission as it comes, whatever its events say
+    static const bool ordered = getenv("HOST_NVN_EVENT_ORDER") == nullptr || atoi(getenv("HOST_NVN_EVENT_ORDER")) != 0;
+    if (ordered) {
+        post([handles = std::move(g_handles), fence, queue = g_sub_queue]() mutable { vk_rp_submit(queue, std::move(handles), fence); }, true);
+        g_handles.clear();
+        return fence;
+    }
     post(
         [handles = std::move(g_handles), fence] {
             vk_rp_sub_begin();
@@ -297,7 +319,15 @@ void rp_finish() {
     if (!async_replay()) return vk_rp_finish();
     rp_wait(g_issued.load(), UINT64_MAX);
 }
-void rp_drain() { call([] { vk_rp_drain(); }); }
+void rp_force_held() {
+    if (async_replay()) post([] { vk_rp_force_held(); });
+}
+void rp_drain() {
+    call([] {
+        vk_rp_force_held();
+        vk_rp_drain();
+    });
+}
 
 uint64_t rp_present(const tex_t* t, double period_s, const int crop[4]) {
     if (!async_replay()) return vk_rp_present(t, period_s, crop);
