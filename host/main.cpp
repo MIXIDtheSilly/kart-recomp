@@ -10,6 +10,7 @@
 #pragma comment(lib, "winmm.lib")
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -412,6 +413,8 @@ uint32_t crc32_64(uint32_t a, uint64_t v) { return crc32_bytes(a, v, 8); }
 
 HostConfig g_config;
 
+namespace nvk { int bake_textures(const std::filesystem::path& game, size_t check); }
+
 int main(int argc, char** argv) {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc_start);
@@ -424,6 +427,8 @@ int main(int argc, char** argv) {
     fs::create_directories(g_config.user_dir);
     g_log_file = _wfopen((g_config.user_dir / "host.log").c_str(), L"w");
     LOG("game %s", game.string().c_str());
+
+    if (argc > 2 && std::strcmp(argv[2], "--bake-textures") == 0) return nvk::bake_textures(game, argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0);
 
     AddVectoredExceptionHandler(0, crash_handler);
     // video_core logs through Eglantine's logger (user/log/eden_log.txt under the exe's folder).

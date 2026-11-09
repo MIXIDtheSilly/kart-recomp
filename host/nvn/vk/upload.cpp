@@ -11,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <span>
 #include <thread>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "hitch.h"
 #include "common/cityhash.h"
 #include "common/lz4_compression.h"
+#include "common/zstd_compression.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 
@@ -296,7 +298,7 @@ void cache_put(u64 key, std::shared_ptr<const Prepared> p) {
 
 // Prepared uploads on disk, by content key (content_key), so an ASTC texture is decoded once and not again in later runs:
 // work\nvn_texcache\<key>.bc (HOST_NVN_TEXCACHE=<dir>, or 0 for none), the staging data LZ4-packed. Files are added
-// up to HOST_NVN_TEXCACHE_MB (default 16384); delete the folder to start over.
+// up to HOST_NVN_TEXCACHE_MB (default 65536); delete the folder to start over.
 struct DiskHead {
     u32 magic, version;
     u64 key;
@@ -339,7 +341,7 @@ const std::string& disk_dir() {
 u64 disk_max() {
     static const u64 mb = [] {
         const char* e = getenv("HOST_NVN_TEXCACHE_MB");
-        return e ? std::strtoull(e, nullptr, 10) : 16384ull;
+        return e ? std::strtoull(e, nullptr, 10) : 65536ull;
     }();
     return mb << 20;
 }
@@ -374,6 +376,27 @@ bool disk_get(u64 key, Prepared& out) {
     return ok;
 }
 
+// One prepared upload into the folder; the bytes it takes there, 0 when it could not be written.
+u64 disk_write(u64 key, const Prepared& p) {
+    const std::vector<u8> packed = Common::Compression::CompressDataLZ4(p.staging.data(), p.staging.size());
+    if (packed.empty()) return 0;
+    const DiskHead h{DiskMagic, DiskVersion, key, static_cast<u32>(p.regions.size()), 0, p.staging.size(), packed.size()};
+    const std::string file = disk_file(key), tmp = file + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return 0;
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
+              std::fwrite(p.regions.data(), sizeof(VkBufferImageCopy), p.regions.size(), f) == p.regions.size() &&
+              std::fwrite(packed.data(), 1, packed.size(), f) == packed.size();
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, file, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        return 0;
+    }
+    return sizeof h + p.regions.size() * sizeof(VkBufferImageCopy) + packed.size();
+}
+
 void disk_writer() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
     for (;;) {
@@ -385,24 +408,10 @@ void disk_writer() {
             g_disk_q.pop_front();
         }
         const Prepared& p = *w.second;
-        const std::vector<u8> packed = Common::Compression::CompressDataLZ4(p.staging.data(), p.staging.size());
-        const DiskHead h{DiskMagic, DiskVersion, w.first, static_cast<u32>(p.regions.size()), 0, p.staging.size(), packed.size()};
-        const std::string file = disk_file(w.first), tmp = file + ".tmp";
-        bool ok = !packed.empty();
-        if (FILE* f = ok ? std::fopen(tmp.c_str(), "wb") : nullptr) {
-            ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
-                 std::fwrite(p.regions.data(), sizeof(VkBufferImageCopy), p.regions.size(), f) == p.regions.size() &&
-                 std::fwrite(packed.data(), 1, packed.size(), f) == packed.size();
-            ok = std::fclose(f) == 0 && ok;
-            std::error_code ec;
-            if (ok) std::filesystem::rename(tmp, file, ec);
-            if (!ok || ec) std::filesystem::remove(tmp, ec), ok = false;
-        } else {
-            ok = false;
-        }
+        const u64 bytes = disk_write(w.first, p);
         std::scoped_lock lk{g_disk_mu};
         g_disk_queued -= p.staging.size();
-        if (ok) g_disk_bytes += sizeof h + p.regions.size() * sizeof(VkBufferImageCopy) + packed.size(), g_n_disk_put++;
+        if (bytes) g_disk_bytes += bytes, g_n_disk_put++;
     }
 }
 
@@ -606,6 +615,146 @@ bool upload_async_poll(Image* img, VkCommandBuffer cb, bool wait) {
 void upload_async_cancel(Image* img) {
     if (img->pending) img->pending->cancel.store(true);
     img->pending.reset();
+}
+
+// ------------------------------------------------------------------ the decoded texture cache, made ahead of time
+
+namespace {
+
+struct BakeStats {
+    std::atomic<u64> files{0}, astc{0}, have{0}, made{0}, failed{0}, bytes{0};
+};
+
+template <typename T>
+bool read_at(const std::vector<u8>& b, u64 at, T& v) {
+    if (at > b.size() || b.size() - at < sizeof v) return false;
+    std::memcpy(&v, b.data() + at, sizeof v);
+    return true;
+}
+
+// The NVN format of a BNTX format when it is ASTC, else 0: BNTX and NVN list the block sizes in the same order.
+int astc_format_of(u32 bntx) {
+    const u32 type = bntx >> 8, sub = bntx & 0xff;
+    if (type < 0x2d || type > 0x3a || (sub != 1 && sub != 6)) return 0;
+    return (sub == 6 ? 0x87 : 0x79) + static_cast<int>(type - 0x2d);
+}
+
+// The texture target of a BRTI's image dimension, or -1 for one the game's ASTC textures do not use.
+int target_of(u32 dim) {
+    switch (dim) {
+    case 1: return NVN_TEXTURE_TARGET_2D;
+    case 3: return NVN_TEXTURE_TARGET_CUBEMAP;
+    case 5: return NVN_TEXTURE_TARGET_2D_ARRAY;
+    case 8: return NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    default: return -1;
+    }
+}
+
+// The ASTC textures of one .bntx.zs, each as the game would hand it to upload_async_start. write false: only counted.
+void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
+    std::vector<u8> packed;
+    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+        std::error_code ec;
+        packed.resize(std::filesystem::file_size(path, ec));
+        const bool ok = std::fread(packed.data(), 1, packed.size(), f) == packed.size();
+        std::fclose(f);
+        if (!ok) packed.clear();
+    }
+    const std::vector<u8> b = packed.empty() ? std::vector<u8>{} : Common::Compression::DecompressDataZSTD(packed);
+    st.files++;
+    u32 count = 0;
+    u64 infos = 0;
+    if (b.size() < 0x30 || std::memcmp(b.data(), "BNTX", 4) != 0 || !read_at(b, 0x24, count) || !read_at(b, 0x28, infos)) {
+        st.failed++;
+        return;
+    }
+    for (u32 i = 0; i < count; i++) {
+        u64 at = 0, mips_at = 0, first = 0;
+        u32 fmt = 0, w = 0, h = 0, arr = 0, layout = 0, dim = 0;
+        u16 mips = 0;
+        if (!read_at(b, infos + 8ull * i, at) || at + 0x78 > b.size() || std::memcmp(b.data() + at, "BRTI", 4) != 0) {
+            st.failed++;
+            continue;
+        }
+        read_at(b, at + 0x16, mips), read_at(b, at + 0x1c, fmt), read_at(b, at + 0x24, w), read_at(b, at + 0x28, h);
+        read_at(b, at + 0x30, arr), read_at(b, at + 0x34, layout), read_at(b, at + 0x5c, dim), read_at(b, at + 0x70, mips_at);
+        const int format = astc_format_of(fmt), target = target_of(dim);
+        if (!format || target < 0) continue;
+        st.astc++;
+        nvn_texdesc d{};
+        d.target = target, d.format = format, d.samples = 1;
+        d.width = w, d.height = h, d.depth = target == NVN_TEXTURE_TARGET_2D ? 1 : arr;
+        d.levels = mips, d.pkg_block_h = (layout & 0xff) + 1;
+        nvn_texlayout L;
+        nvn_tex_layout(&d, &L);
+        if (!L.size || !read_at(b, mips_at, first) || first > b.size() || b.size() - first < L.size) {
+            st.failed++;
+            continue;
+        }
+        const Geom g{VK_IMAGE_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, w, h, 1, std::max(L.layers, 1u), std::max<u32>(mips, 1)};
+        Untiled u;
+        if (!untile(g, d, b.data() + first, L.size, u)) {
+            st.failed++;
+            continue;
+        }
+        const u64 key = content_key(g, d, u);
+        std::error_code ec;
+        if (std::filesystem::exists(disk_file(key), ec)) {
+            st.have++;
+            continue;
+        }
+        if (!write) continue;
+        Prepared p;
+        convert(g, d, u, p);
+        const u64 bytes = disk_write(key, p);
+        if (bytes) st.made++, st.bytes += bytes;
+        else st.failed++;
+    }
+}
+
+}  // namespace
+
+int bake_textures(const std::filesystem::path& game, size_t check) {
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    nvn_gob_switch2 = 1;
+    const u32 half = std::max(std::thread::hardware_concurrency() / 2, 2u);
+    if (!getenv("EDEN_NX2_TRANSCODE_THREADS")) _putenv_s("EDEN_NX2_TRANSCODE_THREADS", std::to_string(half).c_str());
+    if (disk_dir().empty()) {
+        LOG("[RED] bake: the decoded texture cache is turned off (HOST_NVN_TEXCACHE=0)");
+        return 1;
+    }
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& f : std::filesystem::recursive_directory_iterator(game / "romfs", ec))
+        if (f.path().native().ends_with(L".bntx.zs")) files.push_back(f.path());
+    std::shuffle(files.begin(), files.end(), std::mt19937{1});   // even progress: the big textures are not all at the end
+    if (check) files.resize(std::min(check, files.size()));
+    LOG("bake: %zu texture files, %s", files.size(), check ? "counting only" : "decoding what the cache does not have");
+
+    BakeStats st;
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> threads;
+    for (u32 i = 0; i < std::max(half / 3, 2u); i++)
+        threads.emplace_back([&] {
+            for (size_t k; (k = next++) < files.size();) bake_file(files[k], !check, st);
+        });
+    const u64 t0 = host_ns();
+    u64 said = 0;
+    const auto report = [&](const char* what, u64 secs) {
+        LOG("bake: %s %llu of %zu files, %llu s: %llu ASTC textures, %llu already there, %llu decoded (%llu MB), %llu failed", what,
+            static_cast<unsigned long long>(st.files.load()), files.size(), static_cast<unsigned long long>(secs),
+            static_cast<unsigned long long>(st.astc.load()), static_cast<unsigned long long>(st.have.load()),
+            static_cast<unsigned long long>(st.made.load()), static_cast<unsigned long long>(st.bytes.load() >> 20),
+            static_cast<unsigned long long>(st.failed.load()));
+    };
+    while (st.files.load() < files.size()) {
+        Sleep(200);
+        const u64 secs = (host_ns() - t0) / 1'000'000'000;
+        if (secs >= said + 10) said = secs, report("at", secs);
+    }
+    for (std::thread& t : threads) t.join();
+    report("done:", (host_ns() - t0) / 1'000'000'000);
+    return 0;
 }
 
 }  // namespace nvk

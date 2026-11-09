@@ -1,6 +1,7 @@
 // Texture content from guest memory: the game's packaged (block-linear) or CPU-written texture storage,
 // untiled (and ASTC-decoded) into the texture's image.
 #pragma once
+#include <filesystem>
 #include "textures.h"
 
 namespace nvk {
@@ -19,5 +20,9 @@ bool upload_async_start(Image* img, const nvn::tex_t* t);
 bool upload_async_poll(Image* img, VkCommandBuffer cb, bool wait);
 // img's pending upload is not wanted any more (its storage changed again, or img goes).
 void upload_async_cancel(Image* img);
+
+// kart.exe <game> --bake-textures [n]: every ASTC texture of the game's .bntx.zs files decoded into the texture cache,
+// so none is decoded during play; n > 0: only counts which of n files' textures the cache has. The process's exit code.
+int bake_textures(const std::filesystem::path& game, size_t check);
 
 }  // namespace nvk
