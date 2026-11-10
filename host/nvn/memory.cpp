@@ -375,7 +375,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool* p, const NVNmemoryPoolBu
     const pool_builder_t* s = (const pool_builder_t*)b; pool_t* o = PL(p);
     o->magic = NVN_MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = (uint8_t*)s->mem; o->size = s->size; o->vp = nullptr; o->vmode = 0;
     if (!o->mem && (o->flags & 0x200)) vpool_reserve(o);   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
-    else if (o->mem) rp_pool_add(ga(o->mem), o->size);
+    else if (o->mem) rp_pool_add(ga(o->mem), o->size, o->flags);
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] nvn: MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, (unsigned long long)o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void*)p, (void*)o->mem, (unsigned long long)o->size, o->flags);
     return 1;
@@ -392,7 +392,10 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool* p) {
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool* p, ptrdiff_t off, size_t n) {
     const pool_t* o = CPL(p);
     if (!o->mem) return;
-    if (!(o->flags & 0x200)) flushed_add(ga(o->mem) + off, n);
+    if (!(o->flags & 0x200)) {
+        flushed_add(ga(o->mem) + off, n);
+        if (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) rp_pool_flushed(ga(o->mem) + off, n);
+    }
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool* p) { return (NVNbufferAddress)ga(CPL(p)->mem); }
 
@@ -401,7 +404,10 @@ NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool* p) { return 
 // NULL without CPU access (nvnBufferMap), and for a sparse virtual pool: its address range is not mapped for the CPU
 NVN(nvnMemoryPoolMap, void*, const NVNmemoryPool* p) { const pool_t* o = CPL(p); return (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || o->vmode == 2 ? nullptr : o->mem; }
 NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool* p) { return (size_t)CPL(p)->size; }
-NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool* p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool* p, ptrdiff_t off, size_t n) {
+    const pool_t* o = CPL(p);
+    if (o->mem && (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) && !(o->flags & 0x200)) rp_pool_invalidated(ga(o->mem) + off, n);
+}
 NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool* p, const char* s) { (void)p; (void)s; }
 
 // ---------- Descriptor pools ----------
@@ -498,8 +504,14 @@ NVN(nvnBufferMap, void*, const NVNbuffer* buf) { const buf_t* o = BF(buf); retur
 NVN(nvnBufferGetSize, size_t, const NVNbuffer* buf) { return (size_t)BF(buf)->size; }
 NVN(nvnBufferGetMemoryPool, NVNmemoryPool*, const NVNbuffer* buf) { return (NVNmemoryPool*)BF(buf)->pool; }
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer* buf) { return (ptrdiff_t)BF(buf)->off; }
-NVN(nvnBufferFlushMappedRange, void, const NVNbuffer* buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }        // unified memory: nothing to flush
-NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer* buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer* buf, ptrdiff_t off, size_t n) {
+    const buf_t* o = BF(buf);
+    if (o->pool->mem && (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) && !(o->pool->flags & 0x200)) rp_pool_flushed(ga(o->pool->mem) + o->off + off, n);
+}        // unified memory: nothing to flush
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer* buf, ptrdiff_t off, size_t n) {
+    const buf_t* o = BF(buf);
+    if (o->pool->mem && (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) && !(o->pool->flags & 0x200)) rp_pool_invalidated(ga(o->pool->mem) + o->off + off, n);
+}
 NVN(nvnBufferBuilderGetSize, size_t, const NVNbufferBuilder* b) { return (size_t)((const buf_builder_t*)b)->size; }
 NVN(nvnBufferBuilderGetMemoryOffset, ptrdiff_t, const NVNbufferBuilder* b) { return (ptrdiff_t)((const buf_builder_t*)b)->off; }
 // The storage set with SetStorage (EA SPORTS FC 27's Frostbite renderer reads it back from its builders before it initializes the objects). The pool getters return the

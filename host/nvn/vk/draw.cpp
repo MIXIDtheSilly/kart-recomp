@@ -128,6 +128,114 @@ Slice scratch(VkDeviceSize n, VkDeviceSize align = 256) {
     }
 }
 
+VkCommandBuffer pre_cb();
+
+// ---------------------------------------------------------------- constants kept in device memory
+// The blocks this renderer makes for a descriptor set (the driver's constants, the support block, a shader's own
+// constants, push constants) went to the arena, and every draw read them from system memory: about 6.5 KB a set, some
+// 2,000 sets a frame. Most are the same from frame to frame, so each distinct block stays in device memory under a
+// hash of what it is made from, copied there once (by the uploads' command buffer of the part that first uses it).
+// When the store is full it starts again empty at the next submission. Off by default (it did not lower the measured bus traffic or raise fps); HOST_NVN_KEEP_CONSTANTS=1: on.
+struct KeptBlock {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = VK_NULL_HANDLE;
+    VkDeviceSize used = 0;
+};
+struct KeptAt {
+    u32 block, off;
+};
+struct KeptCopy {
+    VkBuffer src, dst;
+    VkBufferCopy r;
+};
+constexpr VkDeviceSize KeptBlockSize = 16ull << 20;
+constexpr size_t KeptBlocks = 4;
+std::vector<KeptBlock> g_kept_blocks;
+size_t g_kept_cur = 0;
+std::unordered_map<u64, KeptAt> g_kept;
+std::vector<KeptCopy> g_kept_copies;   // not yet recorded
+bool g_kept_on = [] {
+    const char* e = getenv("HOST_NVN_KEEP_CONSTANTS");
+    return e && e[0] == '1';
+}();
+bool g_kept_full = false;
+u64 g_kept_hits = 0, g_kept_new = 0, g_kept_past = 0, g_kept_wipes = 0;
+
+// Room for n bytes in the store; false when it has none (until the next submission).
+bool kept_room(VkDeviceSize n, KeptAt& at) {
+    for (;;) {
+        if (g_kept_cur < g_kept_blocks.size()) {
+            KeptBlock& b = g_kept_blocks[g_kept_cur];
+            if (b.used + n <= KeptBlockSize) {
+                at = {static_cast<u32>(g_kept_cur), static_cast<u32>(b.used)};
+                b.used += n;
+                return true;
+            }
+            g_kept_cur++;
+            continue;
+        }
+        if (g_kept_blocks.size() == KeptBlocks) return false;
+        KeptBlock b;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = KeptBlockSize;
+        bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (vmaCreateBuffer(ctx().vma, &bi, &ai, &b.buf, &b.alloc, nullptr) != VK_SUCCESS) {
+            if (g_kept_blocks.empty()) g_kept_on = false;
+            return false;
+        }
+        g_kept_blocks.push_back(b);
+    }
+}
+
+// Records the copies of the new blocks (before the uploads' command buffer is closed).
+void kept_flush() {
+    if (g_kept_copies.empty()) return;
+    thread_local std::vector<VkBufferCopy> r;
+    const VkCommandBuffer cb = pre_cb();
+    for (size_t i = 0; i < g_kept_copies.size();) {
+        const KeptCopy& c = g_kept_copies[i];
+        r.clear();
+        for (; i < g_kept_copies.size() && g_kept_copies[i].src == c.src && g_kept_copies[i].dst == c.dst; i++) r.push_back(g_kept_copies[i].r);
+        vkCmdCopyBuffer(cb, c.src, c.dst, static_cast<u32>(r.size()), r.data());
+    }
+    g_kept_copies.clear();
+}
+
+void kept_sub_begin() {
+    if (!g_kept_full) return;
+    g_kept_full = false;
+    g_kept_wipes++;
+    g_kept.clear();
+    for (KeptBlock& b : g_kept_blocks) b.used = 0;
+    g_kept_cur = 0;
+}
+
+// A block of `size` bytes that fill(u8*) writes, the same whenever the `from_n` bytes at `from` and `kind` are.
+template <class F>
+VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDeviceSize size, F&& fill) {
+    u64 key = 0;
+    if (g_kept_on) {
+        key = Common::CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
+        if (const auto it = g_kept.find(key); it != g_kept.end()) {
+            g_kept_hits++;
+            return {g_kept_blocks[it->second.block].buf, it->second.off, size};
+        }
+    }
+    const Slice sl = scratch(size);
+    fill(sl.ptr);
+    KeptAt at;
+    if (!g_kept_on || g_kept_full || !kept_room((size + 255) & ~VkDeviceSize{255}, at)) {
+        if (g_kept_on) g_kept_full = true, g_kept_past++;
+        return {sl.buf, sl.off, size};
+    }
+    g_kept_new++;
+    g_kept.emplace(key, at);
+    g_kept_copies.push_back({sl.buf, g_kept_blocks[at.block].buf, {sl.off, at.off, size}});
+    return {g_kept_blocks[at.block].buf, at.off, size};
+}
+
 VkDescriptorPool new_pool() {
     const u32 sets = 4096;
     const VkDescriptorPoolSize sizes[] = {
@@ -667,11 +775,13 @@ VkImageViewType view_type_of(const Binding& b) {
 }
 
 // A buffer range of guest memory for a descriptor; null buffer (reads 0) when no pool holds it.
-VkDescriptorBufferInfo guest_buffer(u64 addr, u64 size, bool uniform) {
+VkDescriptorBufferInfo guest_buffer(u64 addr, u64 size, bool uniform, bool written = false) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     if (!addr || !size) return bi;
+    if (written) pool_gpu_write(addr, size);
     BufferRef r;
-    if (!pool_find(addr, 1, r)) return bi;
+    if (!pool_find(addr, 1, r, size)) return bi;
+    if (pool_stats_on()) pool_note(addr, size, uniform ? 2 : written ? 6 : 3);
     const VkPhysicalDeviceLimits& lim = ctx().props.limits;
     const u64 align = uniform ? lim.minUniformBufferOffsetAlignment : lim.minStorageBufferOffsetAlignment;
     u64 range = std::min<u64>(size, r.size);
@@ -1003,7 +1113,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     imgs.reserve(nimg);
     bufs.reserve(nbuf);
     writes.reserve(sh->bindings.size());
-    Slice c0{}, c2{};
+    VkDescriptorBufferInfo c0{}, c2{};
     bool have_c0 = false, have_c2 = false;
     for (const Binding& b : sh->bindings) {
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1016,14 +1126,15 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
             VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
             switch (b.kind) {
             case BKind::Support: {
-                Slice sl = scratch(SupportSize);
-                std::memset(sl.ptr, 0, SupportSize);
-                float* f = reinterpret_cast<float*>(sl.ptr);
-                // viewport_inverse at 0x90, viewport_size at 0xa0, frag_scale_count at 0xb0, render_scale from 0xc0
-                f[0x90 / 4] = 2.0f / da.vp_w, f[0x94 / 4] = 2.0f / da.vp_h, f[0x98 / 4] = 1.0f;
-                f[0xa0 / 4] = da.vp_w, f[0xa4 / 4] = da.vp_h, f[0xa8 / 4] = 1.0f;
-                for (u32 i = 0; i < 73; i++) f[(0xc0 + 16 * i) / 4] = 1.0f;
-                bi = {sl.buf, sl.off, SupportSize};
+                const float from[2] = {da.vp_w, da.vp_h};
+                bi = constants(1, from, sizeof from, SupportSize, [&](u8* p) {
+                    std::memset(p, 0, SupportSize);
+                    float* f = reinterpret_cast<float*>(p);
+                    // viewport_inverse at 0x90, viewport_size at 0xa0, frag_scale_count at 0xb0, render_scale from 0xc0
+                    f[0x90 / 4] = 2.0f / da.vp_w, f[0x94 / 4] = 2.0f / da.vp_h, f[0x98 / 4] = 1.0f;
+                    f[0xa0 / 4] = da.vp_w, f[0xa4 / 4] = da.vp_h, f[0xa8 / 4] = 1.0f;
+                    for (u32 i = 0; i < 73; i++) f[(0xc0 + 16 * i) / 4] = 1.0f;
+                });
                 break;
             }
             case BKind::Ubo:
@@ -1033,22 +1144,11 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                     watch::add(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size), watch::bound(s.ubo[st][b.reg].addr);
                 break;
             case BKind::C1:
-                if (!sh->c1.empty()) {
-                    Slice sl = scratch(sh->c1.size());
-                    std::memcpy(sl.ptr, sh->c1.data(), sh->c1.size());
-                    bi = {sl.buf, sl.off, sh->c1.size()};
-                }
+                if (!sh->c1.empty())
+                    bi = constants(2, sh->c1.data(), sh->c1.size(), sh->c1.size(), [&](u8* p) { std::memcpy(p, sh->c1.data(), sh->c1.size()); });
                 break;
             case BKind::Drv0:
                 if (!have_c0) {
-                    c0 = scratch(C0Size);
-                    std::memset(c0.ptr, 0, C0Size);
-                    auto put = [&](u32 off, u64 addr, u64 size) {
-                        std::memcpy(c0.ptr + off, &addr, 8);
-                        const u32 n = static_cast<u32>(std::min<u64>(size, UINT32_MAX));
-                        std::memcpy(c0.ptr + off + 8, &n, 4);
-                    };
-                    for (u32 i = 0; i < 16; i++) put(k_ssbo_base[st] + 0x10 * i, s.ssbo[st][i].addr, s.ssbo[st][i].size);
                     for (u32 i = 0; i < 16; i++)
                         if (s.ssbo[st][i].addr && !watch::wanted(sh->name, i)) watch::gpu_access(st == SH_CS ? "cs ssbo" : "gfx ssbo", sh->name, i, s.ssbo[st][i].addr, s.ssbo[st][i].size);
                     for (u32 i = 0; i < 16; i++)
@@ -1056,43 +1156,63 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                     if (dump_buffers())
                         for (u32 i = 0; i < 16; i++)
                             if (s.ssbo[st][i].addr) note_ubo(sh, i, s.ssbo[st][i].addr, s.ssbo[st][i].size, 's');
-                    if (st == SH_CS) {
-                        for (u32 i = 0; i < 16; i++) put(0x210 + 0x10 * i, s.ubo[st][i].addr, s.ubo[st][i].size);
-                        std::memcpy(c0.ptr + 4, da.dispatch, 12);
-                        std::memcpy(c0.ptr + 0x200, da.dispatch, 12);
-                    } else {
-                        std::memcpy(c0.ptr + 0x640, &da.base_vertex, 4);
-                        std::memcpy(c0.ptr + 0x644, &da.base_instance, 4);
-                        const float point = 64.0f;
-                        std::memcpy(c0.ptr + 0x610, &point, 4);
-                    }
+                    // (what the block is made from: the stage, its storage buffers, and the dispatch or the draw's bases)
+                    u8 from[4 + sizeof s.ssbo[0] + sizeof(BufB) * 16 + 16];
+                    size_t fn = 0;
+                    const auto add = [&](const void* p, size_t n) { std::memcpy(from + fn, p, n), fn += n; };
+                    add(&st, 4), add(s.ssbo[st], sizeof s.ssbo[st]);
+                    if (st == SH_CS) add(s.ubo[st], sizeof(BufB) * 16), add(da.dispatch, 12);
+                    else add(&da.base_vertex, 4), add(&da.base_instance, 4);
+                    c0 = constants(3, from, fn, C0Size, [&](u8* c) {
+                        std::memset(c, 0, C0Size);
+                        auto put = [&](u32 off, u64 addr, u64 size) {
+                            std::memcpy(c + off, &addr, 8);
+                            const u32 n = static_cast<u32>(std::min<u64>(size, UINT32_MAX));
+                            std::memcpy(c + off + 8, &n, 4);
+                        };
+                        for (u32 i = 0; i < 16; i++) put(k_ssbo_base[st] + 0x10 * i, s.ssbo[st][i].addr, s.ssbo[st][i].size);
+                        if (st == SH_CS) {
+                            for (u32 i = 0; i < 16; i++) put(0x210 + 0x10 * i, s.ubo[st][i].addr, s.ubo[st][i].size);
+                            std::memcpy(c + 4, da.dispatch, 12);
+                            std::memcpy(c + 0x200, da.dispatch, 12);
+                        } else {
+                            std::memcpy(c + 0x640, &da.base_vertex, 4);
+                            std::memcpy(c + 0x644, &da.base_instance, 4);
+                            const float point = 64.0f;
+                            std::memcpy(c + 0x610, &point, 4);
+                        }
+                    });
                     have_c0 = true;
                 }
-                bi = {c0.buf, c0.off, C0Size};
+                bi = c0;
                 break;
             case BKind::Drv2:
                 if (!have_c2) {
-                    c2 = scratch(C2Size);
-                    std::memset(c2.ptr, 0, C2Size);
-                    for (u32 i = 0; i < 32; i++) std::memcpy(c2.ptr + 0x20 + 8 * i, &s.tex[st][i], 4);
-                    for (u32 i = 0; i < 8; i++) std::memcpy(c2.ptr + 0x120 + 8 * i, &s.img[st][i], 4);
-                    for (u32 i = 0; i < 128; i++) std::memcpy(c2.ptr + 0x168 + 8 * i, &s.tex[st][128 + i], 4);
-                    for (u32 i = 0; i < 128; i++) {
-                        const u32 h = s.samp[st][i] << 20;
-                        std::memcpy(c2.ptr + 0x568 + 8 * i, &h, 4);
-                    }
+                    // (made from the stage's texture, image and sampler handles)
+                    u32 from[32 + 8 + 128 + 128];
+                    std::memcpy(from, s.tex[st], 32 * 4), std::memcpy(from + 32, s.img[st], 8 * 4);
+                    std::memcpy(from + 40, s.tex[st] + 128, 128 * 4), std::memcpy(from + 168, s.samp[st], 128 * 4);
+                    c2 = constants(4, from, sizeof from, C2Size, [&](u8* c) {
+                        std::memset(c, 0, C2Size);
+                        for (u32 i = 0; i < 32; i++) std::memcpy(c + 0x20 + 8 * i, &s.tex[st][i], 4);
+                        for (u32 i = 0; i < 8; i++) std::memcpy(c + 0x120 + 8 * i, &s.img[st][i], 4);
+                        for (u32 i = 0; i < 128; i++) std::memcpy(c + 0x168 + 8 * i, &s.tex[st][128 + i], 4);
+                        for (u32 i = 0; i < 128; i++) {
+                            const u32 h = s.samp[st][i] << 20;
+                            std::memcpy(c + 0x568 + 8 * i, &h, 4);
+                        }
+                    });
                     have_c2 = true;
                 }
-                bi = {c2.buf, c2.off, C2Size};
+                bi = c2;
                 break;
             case BKind::Push: {
-                Slice sl = scratch(NVN_PUSH_SIZE);
-                std::memcpy(sl.ptr, s.push[st == SH_CS ? 1 : 0], NVN_PUSH_SIZE);
-                bi = {sl.buf, sl.off, NVN_PUSH_SIZE};
+                const u8* push = s.push[st == SH_CS ? 1 : 0];
+                bi = constants(5, push, NVN_PUSH_SIZE, NVN_PUSH_SIZE, [&](u8* p) { std::memcpy(p, push, NVN_PUSH_SIZE); });
                 break;
             }
             case BKind::Ssbo:
-                if (b.reg < 16) bi = guest_buffer(s.ssbo[st][b.reg].addr, s.ssbo[st][b.reg].size, uniform);
+                if (b.reg < 16) bi = guest_buffer(s.ssbo[st][b.reg].addr, s.ssbo[st][b.reg].size, uniform, b.aux != 0);
                 break;
             case BKind::UboPtr:
                 if (b.reg < 18) bi = guest_buffer(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size, uniform);
@@ -1101,7 +1221,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                 if (b.reg < 18 && s.ubo[st][b.reg].addr) {
                     u64 rec[2] = {};
                     nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
-                    bi = guest_buffer(rec[0], static_cast<u32>(rec[1]), uniform);
+                    bi = guest_buffer(rec[0], static_cast<u32>(rec[1]), uniform, b.aux != 0);
                 }
                 break;
             default: break;
@@ -1340,7 +1460,7 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs) {
         if (s.vs[i].divisor > 1) ONCE_RED("vertex stream divisor %u: drawn with divisor 1", s.vs[i].divisor);
         binds[nb++] = b;
         BufferRef r;
-        if (s.vb[i].address && pool_find(s.vb[i].address, 1, r)) {
+        if (s.vb[i].address && pool_find(s.vb[i].address, 1, r, s.vb[i].size)) {
             bufs[i] = r.buffer, offs[i] = r.offset, sizes[i] = std::min<u64>(r.size, s.vb[i].size ? s.vb[i].size : r.size);
         } else {
             bufs[i] = VK_NULL_HANDLE, offs[i] = 0, sizes[i] = VK_WHOLE_SIZE;
@@ -1547,6 +1667,18 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
     const u64 ind_addr = d ? d->ind : di->ind;
     if (ind_addr && (g_skip_ind || !pool_find(ind_addr, di ? 20 : 16, ind))) { g_stats[ST_INDIRECT]++; return; }
     if (g_skip_draw) { g_stats[ST_DISABLED]++; return; }
+    if (pool_stats_on()) {
+        // (what the GPU fetches at most: the bound size stands in where the GPU decides the count)
+        const u64 n = di ? static_cast<u64>(di->count) : static_cast<u64>(d->count);
+        const u64 inst = std::max<u64>(1, di ? di->instances : d->instances);
+        for (int i = 0; i < 16; i++) {
+            if (!s.vb[i].address || !s.vs[i].stride) continue;
+            const u64 want = ind_addr ? s.vb[i].size : (s.vs[i].divisor ? inst : n) * s.vs[i].stride;
+            pool_note(s.vb[i].address, s.vb[i].size ? std::min<u64>(want, s.vb[i].size) : want, 0);
+        }
+        if (di) pool_note(di->ibuf, ind_addr ? 0 : n * (itype == VK_INDEX_TYPE_UINT32 ? 4 : 2), 1);
+        if (ind_addr) pool_note(ind_addr, di ? 20 : 16, 4);
+    }
 
     DrawArgs da;
     da.base_vertex = di ? di->base_vertex : (d ? d->first : 0);
@@ -1712,6 +1844,7 @@ void draw_sub_begin(u64 done) {
     draw_init();
     g_written.clear();
     g_set_gen++, g_set_kept = 0;
+    kept_sub_begin();
     g_view_cache.clear();
     dyn_reset();
     Device& c = ctx();
@@ -1747,6 +1880,7 @@ void draw_sub_begin(u64 done) {
 
 VkCommandBuffer draw_sub_flush() {
     dyn_reset();
+    kept_flush();
     if (!A->pre_open) return VK_NULL_HANDLE;
     full_barrier(A->pre);
     vkEndCommandBuffer(A->pre);
@@ -1767,6 +1901,7 @@ VkCommandBuffer draw_sub_flush() {
 
 VkCommandBuffer draw_sub_commit(u64 value) {
     A->value = value;
+    kept_flush();
     VkCommandBuffer pre = VK_NULL_HANDLE;
     if (A->pre_open) {
         full_barrier(A->pre);
@@ -2051,8 +2186,13 @@ void draw_log_stats() {
         line.c_str(), static_cast<unsigned long long>(g_set_made), static_cast<unsigned long long>(g_set_hits),
         static_cast<unsigned long long>(g_reg_changes), static_cast<unsigned long long>(g_reg_same),
         static_cast<unsigned long long>(epoch - last_epoch));
+    if (g_kept_on)
+        LOG("nvk: constant blocks: %llu found in device memory, %llu new, %llu left in system memory (store full); %zu kept, %zu MB; store emptied %llu times",
+            static_cast<unsigned long long>(g_kept_hits), static_cast<unsigned long long>(g_kept_new), static_cast<unsigned long long>(g_kept_past),
+            g_kept.size(), g_kept_blocks.size() * static_cast<size_t>(KeptBlockSize >> 20), static_cast<unsigned long long>(g_kept_wipes));
     last_epoch = epoch;
     g_set_made = g_set_hits = g_reg_changes = g_reg_same = 0;
+    g_kept_hits = g_kept_new = g_kept_past = 0;
 }
 
 }  // namespace nvk

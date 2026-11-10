@@ -183,6 +183,8 @@ bool store_linear_target(VkCommandBuffer cb, const Target& t) {
     const u64 pitch = static_cast<u64>(img->width) * bpb, stride = img->desc.stride ? img->desc.stride : pitch;
     const u64 bytes = stride * (img->height - 1) + pitch;
     BufferRef br;
+    pool_gpu_write(img->mem, bytes);
+    if (pool_stats_on()) pool_note(img->mem, bytes, 5);
     if (stride % bpb || !host_readable(img->mem, bytes) || !pool_find(img->mem, bytes, br) || br.offset % 4 || br.offset % bpb) {
         ONCE_RED("linear render target %ux%u format %#x at %#llx cannot be stored back to its pool", img->width, img->height, img->nvn_format,
                  static_cast<unsigned long long>(img->mem));
@@ -194,6 +196,10 @@ bool store_linear_target(VkCommandBuffer cb, const Target& t) {
     bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     bic.imageExtent = {img->width, img->height, 1};
     vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, br.buffer, 1, &bic);
+    if (pool_gpu_owned(img->mem, bytes)) {
+        full_barrier(cb);
+        pool_write_through(cb, img->mem, bytes);
+    }
     return true;
 }
 
@@ -367,7 +373,10 @@ void copy_b2b(VkCommandBuffer cb, u64 src, u64 dst, u64 n) {
     watch::gpu_access("copy to", nullptr, 0, dst, n);
     if (!n) return;
     BufferRef s, d;
+    pool_gpu_write(dst, n);
+    if (pool_stats_on()) pool_note(dst, n, 5);
     const bool gpu = pool_find(src, n, s) && pool_find(dst, n, d);
+    if (!gpu) pool_gpu_write(dst, n, true);
     dump_note("copy buffer %#llx -> %#llx +%#llx%s", static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst),
               static_cast<unsigned long long>(n), gpu ? "" : " (on the CPU after the submission)");
     if (gpu) {
@@ -389,7 +398,10 @@ void update(VkCommandBuffer cb, const void* data, u64 dst, u64 n) {
     watch::gpu_access("update", nullptr, 0, dst, n);
     if (!n) return;
     BufferRef d;
+    pool_gpu_write(dst, n);
+    if (pool_stats_on()) pool_note(dst, n, 5);
     const bool gpu = !(dst & 3) && !(n & 3) && pool_find(dst, n, d);
+    if (!gpu) pool_gpu_write(dst, n, true);
     dump_note("update buffer %#llx +%#llx%s", static_cast<unsigned long long>(dst), static_cast<unsigned long long>(n),
               gpu ? "" : " (on the CPU after the submission)");
     if (gpu) {
@@ -414,7 +426,10 @@ void fill(VkCommandBuffer cb, u64 dst, u64 n, uint32_t value) {
     watch::gpu_access("fill", nullptr, 0, dst, n);
     if (!n) return;
     BufferRef d;
+    pool_gpu_write(dst, n);
+    if (pool_stats_on()) pool_note(dst, n, 5);
     const bool gpu = !(dst & 3) && !(n & 3) && pool_find(dst, n, d);
+    if (!gpu) pool_gpu_write(dst, n, true);
     dump_note("fill buffer %#llx +%#llx with %#x%s", static_cast<unsigned long long>(dst), static_cast<unsigned long long>(n), value,
               gpu ? "" : " (on the CPU after the submission)");
     if (gpu) {
@@ -491,6 +506,7 @@ void flush_partial() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cur->cb, &bi);
     full_barrier(g_cur->cb);
+    pool_part_begin(false);
 }
 
 }  // namespace
@@ -529,9 +545,12 @@ void vk_rp_set_depth_zero(int on) {
 void vk_rp_set_queue_origin_lower_left(int on) { g_queue_origin_ll.store(on != 0); }
 
 // ---------------------------------------------------------------- memory pools
-void vk_rp_pool_add(u64 gpu, u64 size) {
+void vk_rp_pool_flushed(u64 gpu, u64 size) { pool_flushed(gpu, size); }
+void vk_rp_pool_invalidated(u64 gpu, u64 size) { pool_invalidated(gpu, size); }
+bool vk_rp_pool_gpu_owned(u64 gpu, u64 size) { return pool_gpu_owned(gpu, size); }
+void vk_rp_pool_add(u64 gpu, u64 size, u32 flags) {
     init();
-    pool_add(gpu, size);
+    pool_add(gpu, size, flags);
 }
 void vk_rp_pool_del(u64 gpu) { pool_del(gpu); }
 void vk_rp_alias_drop_pool(const pool_t*) {}
@@ -595,6 +614,8 @@ void vk_rp_sub_begin() {
     g_since_flush = 0;
     draw_sub_begin(g_done.load());
     sparse_tick(draw_pre_cb);
+    image_evict_cold();
+    pool_part_begin(true);
     dump_sub_begin();
 }
 
@@ -950,6 +971,7 @@ void rp_sub_event(volatile uint32_t* val, uint32_t mode, uint32_t v) {
     g_cur->posts.push_back(std::move(p));
 }
 void rp_sub_counter(u64 addr, uint32_t type) {
+    pool_gpu_write(addr, 16, true);
     Post p{Post::Counter};
     p.addr = addr, p.type = type;
     g_cur->posts.push_back(std::move(p));

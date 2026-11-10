@@ -43,7 +43,9 @@ void rp_set_depth_zero(int) {}
 void rp_set_queue_origin_lower_left(int) {}
 
 // ---------------------------------------------------------------- memory pools
-void rp_pool_add(u64, u64) {}
+void rp_pool_add(u64, u64, u32) {}
+void rp_pool_flushed(u64, u64) {}
+void rp_pool_invalidated(u64, u64) {}
 void rp_pool_del(u64) {}
 void rp_alias_drop_pool(const pool_t*) {}
 void rp_vpool_create(u64, u64) {}

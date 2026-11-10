@@ -185,6 +185,7 @@ void create_device(Device& c) {
         return true;
     };
     c.feat.host_import = opt(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    const bool memory_budget = opt(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     opt(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     c.feat.mesh_shader = opt(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     c.feat.eds3 = opt(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
@@ -297,6 +298,7 @@ void create_device(Device& c) {
     vf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
     VmaAllocatorCreateInfo ai{};
     ai.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (memory_budget) ai.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;   // (without it VMA guesses 80% of the heap)
     ai.physicalDevice = c.phys;
     ai.device = c.dev;
     ai.instance = c.instance;

@@ -219,7 +219,13 @@ void rp_set_origin_lower_left(int on) { post([on] { vk_rp_set_origin_lower_left(
 void rp_set_depth_zero(int on) { post([on] { vk_rp_set_depth_zero(on); }); }
 void rp_set_queue_origin_lower_left(int on) { post([on] { vk_rp_set_queue_origin_lower_left(on); }); }
 
-void rp_pool_add(u64 gpu, u64 size) { post([gpu, size] { vk_rp_pool_add(gpu, size); }); }
+void rp_pool_add(u64 gpu, u64 size, u32 flags) { post([gpu, size, flags] { vk_rp_pool_add(gpu, size, flags); }); }
+void rp_pool_flushed(u64 gpu, u64 size) { post([gpu, size] { vk_rp_pool_flushed(gpu, size); }); }
+void rp_pool_invalidated(u64 gpu, u64 size) {
+    // (only the GPU's copy has what the game is about to read: back when it is in system memory again)
+    if (vk_rp_pool_gpu_owned(gpu, size)) call([gpu, size] { vk_rp_pool_invalidated(gpu, size); });
+    else post([gpu, size] { vk_rp_pool_invalidated(gpu, size); });
+}
 void rp_pool_del(u64 gpu) { post([gpu] { vk_rp_pool_del(gpu); }); }
 void rp_alias_drop_pool(const pool_t* pool) { post([pool] { vk_rp_alias_drop_pool(pool); }); }
 void rp_vpool_create(u64 base, u64 size) { post([base, size] { vk_rp_vpool_create(base, size); }); }

@@ -3,12 +3,15 @@
 #include "sparse.h"
 #include "upload.h"
 #include "hitch.h"
+#include "replay_async.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
 #include <mutex>
+#include <unordered_set>
+#include <vector>
 
 #include "../abi.h"
 
@@ -360,6 +363,60 @@ void image_release(u64 serial) {
         }
     }
     destroy(img);
+}
+
+void image_evict_cold() {
+    static const u64 after_frames = [] {
+        const char* e = getenv("HOST_NVN_EVICT_IMAGES_S");
+        return (e ? std::strtoull(e, nullptr, 10) : 30ull) * 60;
+    }();
+    if (!after_frames || !nvn::async_replay()) return;   // (replaying on the game's threads, another may be using any image)
+    static u64 at = 0;
+    const u64 now = host_ns();
+    if (now - at < 5'000'000'000ull) return;
+    at = now;
+    const u64 frame = nvn::g_frame.load();
+    if (frame <= after_frames) return;
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(ctx().vma, b);
+    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+    vmaGetMemoryProperties(ctx().vma, &mp);
+    // (free space in the allocator's blocks counts as free: what is released stays in them, and the next allocation takes it)
+    u64 used = 0, budget = 0, spare = 0;
+    for (u32 h = 0; h < mp->memoryHeapCount; h++)
+        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            used += b[h].usage, budget += b[h].budget, spare += b[h].statistics.blockBytes - b[h].statistics.allocationBytes;
+    used -= std::min(used, spare);
+    if (used * 10 < budget * 9) return;
+    const u64 want = std::min(used - budget * 85 / 100, u64{512} << 20);
+
+    // Only what guest storage still holds: what the GPU made exists nowhere else
+    std::scoped_lock lk{g_lock};
+    std::vector<Image*> cold;
+    for (auto& [serial, img] : g_images)
+        if (!img->sparse && !img->gpu_written && !img->parked && img->has_content && !img->pending && img->last_use + after_frames < frame &&
+            !(img->desc.flags & NVN_TEXTURE_FLAGS_SPARSE))
+            cold.push_back(img);
+    std::sort(cold.begin(), cold.end(), [](const Image* x, const Image* y) { return x->last_use != y->last_use ? x->last_use < y->last_use : x < y; });
+    cold.erase(std::unique(cold.begin(), cold.end()), cold.end());
+    std::unordered_set<Image*> gone;
+    u64 freed = 0;
+    for (Image* img : cold) {
+        if (freed >= want) break;
+        freed += alloc_size(img->alloc);
+        gone.insert(img);
+    }
+    if (gone.empty()) return;
+    for (auto it = g_images.begin(); it != g_images.end();)
+        it = gone.count(it->second) ? g_images.erase(it) : std::next(it);
+    for (Image* img : gone) {
+        if (img->shape)
+            if (auto it = g_shared.find(img->shape); it != g_shared.end() && it->second == img) g_shared.erase(it);
+        destroy(img);
+    }
+    bind_epoch_bump();
+    LOG("nvk: device memory short (%llu of %llu MB): %zu textures not used for %llu s released, %llu MB", static_cast<unsigned long long>(used >> 20),
+        static_cast<unsigned long long>(budget >> 20), gone.size(), static_cast<unsigned long long>(after_frames / 60), static_cast<unsigned long long>(freed >> 20));
 }
 
 void image_pool_gone(u64 lo, u64 hi) {

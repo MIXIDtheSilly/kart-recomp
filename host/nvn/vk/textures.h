@@ -45,6 +45,9 @@ struct Image {
 Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb);
 Image* image_find(u64 serial);
 void image_release(u64 serial);
+// Once a submission (after it began, renderer thread): when device memory is short, the textures not used for
+// HOST_NVN_EVICT_IMAGES_S seconds (default 30, 0 = never) go; their next use makes them again from guest storage.
+void image_evict_cold();
 // A memory pool [lo, hi) is gone: parked images over it go.
 void image_pool_gone(u64 lo, u64 hi);
 

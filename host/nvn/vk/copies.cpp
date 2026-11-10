@@ -290,13 +290,20 @@ void copy_buffer_texture(VkCommandBuffer cb, const nvn::p_copy_b2t* c, bool to_t
     }
     bic.bufferRowLength = static_cast<u32>(row / bpb) * bw;
     bic.bufferImageHeight = static_cast<u32>(slice / row) * bh;
-    if (!to_texture) watch::gpu_access("texture to buffer", nullptr, 0, c->src, bytes);
+    if (!to_texture) watch::gpu_access("texture to buffer", nullptr, 0, c->src, bytes), pool_gpu_write(c->src, bytes);
     BufferRef br;
     const bool direct = nvn::host_readable(c->src, bytes) && pool_find(c->src, bytes, br) && br.offset % 4 == 0 && br.offset % bpb == 0;
     if (direct) {
         bic.bufferOffset = br.offset;
         if (to_texture) vkCmdCopyBufferToImage(cb, br.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
-        else vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, br.buffer, 1, &bic);
+        else {
+            vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, br.buffer, 1, &bic);
+            // (the game reads such copies back; where it does not ask first, they must be in system memory all the same)
+            if (pool_gpu_owned(c->src, bytes)) {
+                full_barrier(cb);
+                pool_write_through(cb, c->src, bytes);
+            }
+        }
     } else if (to_texture) {
         VkBuffer buf;
         void* ptr;

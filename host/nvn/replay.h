@@ -53,7 +53,9 @@ void rp_set_queue_origin_lower_left(int on);
 // A memory pool (storage in guest memory, `gpu` = its guest address) exists / is gone. A sparse virtual pool does
 // not call this; it reports through rp_vpool_*. Pools may be added and removed on any thread while submissions run.
 // A removed range must not be touched by the renderer afterwards (the game frees the memory).
-void rp_pool_add(u64 gpu, u64 size);
+void rp_pool_add(u64 gpu, u64 size, u32 flags);
+void rp_pool_invalidated(u64 gpu, u64 size);   // the CPU is about to read what the GPU wrote in [gpu, gpu + size) (InvalidateMappedRange of CPU-cached memory)
+void rp_pool_flushed(u64 gpu, u64 size);   // the CPU published [gpu, gpu + size) (FlushMappedRange of CPU-cached memory)
 void rp_pool_del(u64 gpu);
 // A pool object is being finalized: forget every texture / descriptor the renderer derived from that object
 // (storage-sharing tables keyed by the pool). Called before rp_pool_del and before the object's magic is cleared.

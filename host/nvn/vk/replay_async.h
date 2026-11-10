@@ -16,7 +16,10 @@ bool async_replay();
 void vk_rp_set_origin_lower_left(int on);
 void vk_rp_set_depth_zero(int on);
 void vk_rp_set_queue_origin_lower_left(int on);
-void vk_rp_pool_add(u64 gpu, u64 size);
+void vk_rp_pool_add(u64 gpu, u64 size, u32 flags);
+void vk_rp_pool_flushed(u64 gpu, u64 size);
+void vk_rp_pool_invalidated(u64 gpu, u64 size);
+bool vk_rp_pool_gpu_owned(u64 gpu, u64 size);   // (any thread)
 void vk_rp_pool_del(u64 gpu);
 void vk_rp_alias_drop_pool(const pool_t* pool);
 void vk_rp_vpool_create(u64 base, u64 size);
