@@ -55,7 +55,15 @@ void image_pool_gone(u64 lo, u64 hi);
 // the CPU, pools made or gone, sparse tiles remapped): draw.cpp keeps descriptor sets made under one value. (Texture and
 // sampler handles have a generation each, draw.cpp.)
 inline std::atomic<u64> g_bind_epoch{0};
-inline void bind_epoch_bump() { g_bind_epoch.fetch_add(1, std::memory_order_relaxed); }
+// Changes only when something a descriptor may hold goes or is replaced (pools, their device copies, images), not for
+// content (`objects` false: textures written by the CPU, sparse tiles remapped): descriptor sets kept across
+// submissions resolve their buffers and views again before use (draw.cpp keep_find), but a freed handle may come back
+// as another object. (Every bump is a full rebuild of the kept sets: ~3,000 a frame.)
+inline std::atomic<u64> g_bind_objects{0};
+inline void bind_epoch_bump(bool objects = true) {
+    g_bind_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (objects) g_bind_objects.fetch_add(1, std::memory_order_relaxed);
+}
 
 // A view of img as NVN view v (null = the whole texture as created). `attachment`: a single level for
 // rendering (all of v's layers). `want`: the view type a shader declares (sampled and storage views), when

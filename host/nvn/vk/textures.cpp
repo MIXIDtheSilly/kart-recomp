@@ -57,15 +57,16 @@ u64 shape_key(const nvn::tex_t* t) {
 
 void destroy(Image* img) {
     upload_async_cancel(img);
-    bytes_of_kind(img) -= alloc_size(img->alloc);
-    // The last submissions using it may still run.
-    defer([img] {
+    const u64 bytes = alloc_size(img->alloc);
+    bytes_of_kind(img) -= bytes;
+    // The last submissions using it may still run, and kept descriptor sets may hold its views.
+    defer_past_kept([img] {
         Device& c = ctx();
         for (auto& [k, v] : img->views)
             if (v) vkDestroyImageView(c.dev, v, nullptr);
         vmaDestroyImage(c.vma, img->image, img->alloc);
         delete img;
-    });
+    }, bytes);
 }
 
 // Parked images past their time go (caller holds g_lock).

@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <atomic>
@@ -100,16 +101,18 @@ struct Slice {
     u8* ptr;
 };
 
-Slice scratch(VkDeviceSize n, VkDeviceSize align = 256) {
+// n bytes from the chunks (more are made as needed): the submission's arena (scratch), or a generation of kept
+// descriptor sets.
+Slice scratch_in(std::vector<Chunk>& chunks, size_t& cur, VkDeviceSize n, VkDeviceSize align = 256) {
     for (;;) {
-        if (A->cur < A->chunks.size()) {
-            Chunk& c = A->chunks[A->cur];
+        if (cur < chunks.size()) {
+            Chunk& c = chunks[cur];
             const VkDeviceSize at = (c.used + align - 1) & ~(align - 1);
             if (at + n <= c.size) {
                 c.used = at + n;
                 return {c.buf, at, c.ptr + at};
             }
-            A->cur++;
+            cur++;
             continue;
         }
         Chunk c;
@@ -124,11 +127,42 @@ Slice scratch(VkDeviceSize n, VkDeviceSize align = 256) {
         VmaAllocationInfo info;
         check(vmaCreateBuffer(ctx().vma, &bi, &ai, &c.buf, &c.alloc, &info), "arena chunk");
         c.ptr = static_cast<u8*>(info.pMappedData);
-        A->chunks.push_back(c);
+        chunks.push_back(c);
     }
 }
 
+Slice scratch(VkDeviceSize n, VkDeviceSize align = 256) { return scratch_in(A->chunks, A->cur, n, align); }
+
 VkCommandBuffer pre_cb();
+
+// ---------------------------------------------------------------- descriptor sets kept across submissions
+// The cache of descriptor sets by key (stage_key) starts empty at each of the ~2.4 submissions a frame, and 92% of the
+// sets made were the same as one made in an earlier submission (HOST_NVN_SET_MISS_STATS): building them (allocating,
+// filling the constant blocks, vkUpdateDescriptorSets) was most of bind_stage, itself ~45% of the renderer thread. So
+// sets are built in a generation, with its own descriptor pools and memory for their constant blocks, and found again
+// under their key in later submissions (keep_find). A full generation is retired: reset once the last submission that
+// may use it is done. HOST_NVN_NO_SET_KEEP=1: off.
+struct SetGen {
+    std::vector<VkDescriptorPool> pools;
+    size_t pool_cur = 0;
+    std::vector<Chunk> chunks;
+    size_t cur = 0;
+    u64 sets = 0;
+    u64 last_value = 0;   // the last submission that may use its sets
+    std::vector<std::function<void()>> grave;   // images and views destroyed while it was current (defer_past_kept)
+    std::unordered_map<u64, VkDescriptorBufferInfo> consts;   // its constant blocks by what they are made from
+    u64 const_hits = 0;
+};
+// (a race fills 32K sets in ~0.7 s, and each new generation starts by making a frame's ~3,000 sets again; the shared
+// constant blocks take ~40 MB for 27K sets)
+constexpr u64 GenSets = 1 << 17;
+constexpr size_t GenChunks = 32;   // of ChunkSize
+SetGen* g_gen = nullptr;
+std::vector<SetGen*> g_gen_retiring;   // retired in the submission being recorded
+std::deque<SetGen*> g_gen_retired;
+std::vector<SetGen*> g_gen_free;
+SetGen* g_const_gen = nullptr;   // where constants() puts its blocks while a kept set is built (else the arena)
+bool g_set_volatile = false;     // the set being built holds a copy of guest data as it is now (not kept)
 
 // ---------------------------------------------------------------- constants kept in device memory
 // The blocks this renderer makes for a descriptor set (the driver's constants, the support block, a shader's own
@@ -216,6 +250,19 @@ void kept_sub_begin() {
 template <class F>
 VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDeviceSize size, F&& fill) {
     u64 key = 0;
+    if (g_const_gen) {
+        // (a generation's sets share their blocks: most are the same for many sets, the handle and support blocks)
+        key = Common::CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
+        if (const auto it = g_const_gen->consts.find(key); it != g_const_gen->consts.end()) {
+            g_const_gen->const_hits++;
+            return it->second;
+        }
+        const Slice sl = scratch_in(g_const_gen->chunks, g_const_gen->cur, size);
+        fill(sl.ptr);
+        const VkDescriptorBufferInfo r{sl.buf, sl.off, size};
+        g_const_gen->consts.emplace(key, r);
+        return r;
+    }
     if (g_kept_on) {
         key = Common::CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
         if (const auto it = g_kept.find(key); it != g_kept.end()) {
@@ -253,20 +300,21 @@ VkDescriptorPool new_pool() {
     return p;
 }
 
-VkDescriptorSet alloc_set(VkDescriptorSetLayout layout) {
+VkDescriptorSet alloc_set_in(std::vector<VkDescriptorPool>& pools, size_t& cur, VkDescriptorSetLayout layout) {
     for (;;) {
-        if (A->pool_cur == A->pools.size()) A->pools.push_back(new_pool());
+        if (cur == pools.size()) pools.push_back(new_pool());
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = A->pools[A->pool_cur];
+        ai.descriptorPool = pools[cur];
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &layout;
         VkDescriptorSet s;
         const VkResult r = vkAllocateDescriptorSets(ctx().dev, &ai, &s);
         if (r == VK_SUCCESS) return s;
         if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) vk_fail(r, "vkAllocateDescriptorSets");
-        A->pool_cur++;
+        cur++;
     }
 }
+VkDescriptorSet alloc_set(VkDescriptorSetLayout layout) { return alloc_set_in(A->pools, A->pool_cur, layout); }
 
 VkCommandBuffer pre_cb() {
     if (!A->pre_open) {
@@ -789,6 +837,7 @@ VkDescriptorBufferInfo guest_buffer(u64 addr, u64 size, bool uniform, bool writt
     if (r.offset % align) {
         if (uniform) {
             // Unaligned uniform data: a copy of the guest bytes as they are now.
+            g_set_volatile = true;
             Slice s = scratch(range, align);
             nvn::gpu_read(addr, s.ptr, range);
             return {s.buf, s.off, range};
@@ -988,6 +1037,133 @@ void set_keep(u64 key, VkDescriptorSet set) {
     g_set_cache[i] = {key, g_set_gen, set};
 }
 
+// What binding b of stage st resolves to in guest memory and textures, into out: a guest buffer range (3 values) or a
+// texture view (1); 0 values for the bindings made only from what stage_key holds (constant blocks, default sampler).
+// bind_stage fills the set from it; a kept set is used again only while it is the same (keep_find).
+u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3]) {
+    VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+    const bool uniform = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    if (uniform || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+        switch (b.kind) {
+        case BKind::Ubo:
+        case BKind::UboPtr:
+            if (b.reg < 18) bi = guest_buffer(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size, uniform);
+            break;
+        case BKind::Ssbo:
+            if (b.reg < 16) bi = guest_buffer(s.ssbo[st][b.reg].addr, s.ssbo[st][b.reg].size, uniform, b.aux != 0);
+            break;
+        case BKind::SsboUbo:
+            if (b.reg < 18 && s.ubo[st][b.reg].addr) {
+                u64 rec[2] = {};
+                nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
+                bi = guest_buffer(rec[0], static_cast<u32>(rec[1]), uniform, b.aux != 0);
+            }
+            break;
+        default: return 0;
+        }
+        out[0] = reinterpret_cast<u64>(bi.buffer), out[1] = bi.offset, out[2] = bi.range;
+        return 3;
+    }
+    if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+        b.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+        VkImageView v = VK_NULL_HANDLE;
+        if (b.kind == BKind::Tex && b.reg < 256) {
+            if (const u32 h = s.tex[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), false);
+        } else if (b.kind == BKind::Img && b.reg < 8) {
+            if (const u32 h = s.img[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), true);
+        } else {
+            return 0;
+        }
+        out[0] = reinterpret_cast<u64>(v);
+        return 1;
+    }
+    return 0;
+}
+
+struct KeptSet {
+    VkDescriptorSet set;
+    u32 at, n;   // what its bindings resolved to (resolve), in g_keep_res
+};
+std::unordered_map<u64, KeptSet> g_keep_sets;   // of g_gen
+std::vector<u64> g_keep_res;
+u64 g_keep_hits = 0, g_keep_stale = 0, g_keep_gens = 0;
+
+bool set_keep_on() {
+    static const bool on = !getenv("HOST_NVN_NO_SET_KEEP") && !getenv("HOST_WATCH_SSBO") && !g_kept_on;
+    return on;
+}
+
+// Images and views destroyed while g_gen is current: freed (deferred) once it is retired and done (any thread).
+std::mutex g_grave_mu;
+std::vector<std::function<void()>> g_grave;
+u64 g_grave_bytes = 0;
+constexpr u64 GraveBytes = 512ull << 20;   // more retires g_gen early (draw_sub_begin)
+
+// g_gen's sets are no longer found; it is reset once the last submission that may use them is done (draw_sub_begin).
+void retire_gen() {
+    if (!g_gen) return;
+    {
+        std::scoped_lock lk{g_grave_mu};
+        for (auto& fn : g_grave) g_gen->grave.push_back(std::move(fn));
+        g_grave.clear();
+        g_grave_bytes = 0;
+    }
+    g_gen_retiring.push_back(g_gen);
+    g_gen = nullptr;
+    g_keep_sets.clear();
+    g_keep_res.clear();
+}
+
+// The generation new kept sets go to (a full one is retired first).
+SetGen* set_gen() {
+    if (g_gen && g_gen->sets < GenSets && g_gen->chunks.size() <= GenChunks) return g_gen;
+    retire_gen();
+    if (g_gen_free.empty()) g_gen_free.push_back(new SetGen);
+    g_gen = g_gen_free.back();
+    g_gen_free.pop_back();
+    g_keep_gens++;
+    return g_gen;
+}
+
+// The kept set of stage sh under key, when its guest buffers and views resolve as they did (resolving them again also
+// does what this submission needs done for them: refreshing a pool's device copy, noting GPU writes, uploads).
+VkDescriptorSet keep_find(const State& s, const Shader* sh, u64 key) {
+    const auto it = g_keep_sets.find(key);
+    if (it == g_keep_sets.end()) return VK_NULL_HANDLE;
+    const u64* was = g_keep_res.data() + it->second.at;
+    u32 i = 0;
+    bool same = true;
+    for (const Binding& b : sh->bindings) {
+        u64 r[3];
+        const u32 n = resolve(s, sh->stage, b, r);
+        if (i + n > it->second.n || !std::equal(r, r + n, was + i)) {
+            same = false;
+            break;
+        }
+        i += n;
+    }
+    if (!same || i != it->second.n) {
+        g_keep_stale++;
+        return VK_NULL_HANDLE;
+    }
+    g_keep_hits++;
+    return it->second.set;
+}
+
+// HOST_NVN_SET_MISS_STATS=1: on each descriptor set made, which parts of its key differ from the stage's previous key
+// (logged with the draw stats), to see what keeps the sets from being reused.
+enum KeyGroup { KG_HEAD, KG_VIEWPORT, KG_UBO, KG_DRV0_SSBO, KG_DRV0_DRAW, KG_DRV2, KG_PUSH, KG_SSBO, KG_TEX, KG_N };
+const char* const k_key_group_names[KG_N] = {"shader/epoch", "viewport", "ubo", "ssbo table", "base vertex/instance or dispatch",
+                                             "handle table", "push", "ssbo", "textures"};
+bool set_miss_stats_on() {
+    static const bool on = getenv("HOST_NVN_SET_MISS_STATS") != nullptr;
+    return on;
+}
+u64 g_key_groups[KG_N];   // of the last stage_key
+u64 g_miss_group[KG_N], g_miss_first, g_miss_earlier_sub, g_subs;
+std::unordered_map<const Shader*, std::array<u64, KG_N>> g_miss_last;
+std::unordered_map<u64, u64> g_miss_seen;   // key -> g_set_gen it was made in
+
 // What stage sh's descriptor set is made from in state s; 0 = not to be cached.
 u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
     static const bool off = getenv("HOST_NVN_NO_SET_CACHE") != nullptr;
@@ -995,32 +1171,42 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
     const u32 st = sh->stage;
     thread_local std::vector<u8> k(1 << 14);
     size_t used = 0;
-    auto put = [&used](const void* p, size_t n) {
+    const bool groups = set_miss_stats_on();
+    int grp = KG_HEAD;
+    if (groups)
+        for (u64& g : g_key_groups) g = 0;
+    auto put = [&used, &grp, groups](const void* p, size_t n) {
         if (used + n > k.size()) k.resize(std::max(k.size() * 2, used + n));
         std::memcpy(k.data() + used, p, n);
         used += n;
+        if (groups) g_key_groups[grp] = g_key_groups[grp] * 0x100000001b3ull ^ Common::CityHash64(static_cast<const char*>(p), n);
     };
-    const u64 head[2] = {reinterpret_cast<u64>(sh), g_bind_epoch.load(std::memory_order_relaxed)};
+    // (g_bind_objects: what the kept sets need; bind_stage adds g_bind_epoch for the submission's cache)
+    const u64 head[2] = {reinterpret_cast<u64>(sh), g_bind_objects.load(std::memory_order_relaxed)};
     put(head, sizeof head);
     std::optional<TabLock> tab;   // from the first texture binding on
     for (const Binding& b : sh->bindings) {
         switch (b.kind) {
-        case BKind::Support: put(&da.vp_w, 4), put(&da.vp_h, 4); break;
+        case BKind::Support: grp = KG_VIEWPORT, put(&da.vp_w, 4), put(&da.vp_h, 4); break;
         case BKind::Ubo:
         case BKind::UboPtr:
+            grp = KG_UBO;
             if (b.reg < 18) put(&s.ubo[st][b.reg], sizeof(BufB));
             break;
         case BKind::Drv0:
-            put(s.ssbo[st], sizeof s.ssbo[st]);
+            grp = KG_DRV0_SSBO, put(s.ssbo[st], sizeof s.ssbo[st]);
+            grp = KG_DRV0_DRAW;
             if (st == SH_CS) put(s.ubo[st], sizeof(BufB) * 16), put(da.dispatch, 12);
             else put(&da.base_vertex, 4), put(&da.base_instance, 4);
             break;
-        case BKind::Drv2: put(s.tex[st], sizeof s.tex[st]), put(s.img[st], sizeof s.img[st]), put(s.samp[st], sizeof s.samp[st]); break;
-        case BKind::Push: put(s.push[st == SH_CS ? 1 : 0], NVN_PUSH_SIZE); break;
+        case BKind::Drv2: grp = KG_DRV2, put(s.tex[st], sizeof s.tex[st]), put(s.img[st], sizeof s.img[st]), put(s.samp[st], sizeof s.samp[st]); break;
+        case BKind::Push: grp = KG_PUSH, put(s.push[st == SH_CS ? 1 : 0], NVN_PUSH_SIZE); break;
         case BKind::Ssbo:
+            grp = KG_SSBO;
             if (b.reg < 16) put(&s.ssbo[st][b.reg], sizeof(BufB));
             break;
         case BKind::SsboUbo:
+            grp = KG_SSBO;
             if (b.reg < 18 && s.ubo[st][b.reg].addr) {
                 u64 rec[2] = {};
                 nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
@@ -1029,6 +1215,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
             break;
         case BKind::Tex:
         case BKind::Img: {
+            grp = KG_TEX;
             // the handle, and the registrations of its texture and sampler it resolves to
             if (b.kind == BKind::Tex ? b.reg >= 256 : b.reg >= 8) break;
             const u32 h = b.kind == BKind::Tex ? s.tex[st][b.reg] : s.img[st][b.reg];
@@ -1091,16 +1278,45 @@ void note_ubo(const Shader* sh, u32 reg, u64 addr, u64 size, char kind = 'c') {
 bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da) {
     State& s = state();
     const u32 st = sh->stage;
-    const u64 key = stage_key(s, sh, da);
-    if (key && !(dump_active() && !dump_brief()))   // (a dump notes every binding of every draw)
-        if (const VkDescriptorSet kept = set_find(key)) {
+    const u64 key = stage_key(s, sh, da);   // (for the kept sets)
+    // for the submission's cache, whose sets are used without resolving their bindings again
+    u64 sub_key = key ? key ^ (g_bind_epoch.load(std::memory_order_relaxed) + 1) * 0x9E3779B97F4A7C15ull : 0;
+    if (key && !sub_key) sub_key = 1;
+    const bool keep = key && set_keep_on();
+    if (key && !(dump_active() && !dump_brief())) {   // (a dump notes every binding of every draw)
+        if (const VkDescriptorSet kept = set_find(sub_key)) {
             g_set_hits++;
             vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
             return true;
         }
+        if (keep)
+            if (const VkDescriptorSet kept = keep_find(s, sh, key)) {
+                set_keep(sub_key, kept);
+                vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
+                return true;
+            }
+    }
     g_set_made++;
+    if (key && set_miss_stats_on()) {
+        auto [it, first] = g_miss_last.try_emplace(sh);
+        if (first) g_miss_first++;
+        else
+            for (int i = 0; i < KG_N; i++) g_miss_group[i] += it->second[i] != g_key_groups[i];
+        std::copy(std::begin(g_key_groups), std::end(g_key_groups), it->second.begin());
+        if (g_miss_seen.size() > (1u << 22)) g_miss_seen.clear();
+        if (auto [at, added] = g_miss_seen.try_emplace(key, g_set_gen); !added) {
+            if (at->second != g_set_gen) g_miss_earlier_sub++;
+            at->second = g_set_gen;
+        }
+    }
     g_used_placeholder = false;
-    VkDescriptorSet set = alloc_set(sh->layout);
+    g_set_volatile = false;
+    SetGen* const gen = keep ? set_gen() : nullptr;
+    VkDescriptorSet set = gen ? alloc_set_in(gen->pools, gen->pool_cur, sh->layout) : alloc_set(sh->layout);
+    if (gen) gen->sets++;
+    g_const_gen = gen;
+    const size_t res_at = g_keep_res.size();
+    u64 res[3];
     size_t nimg = 0, nbuf = 0;
     for (const Binding& b : sh->bindings) (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? nbuf : nimg) += b.count;
     // (kept between calls: three heap allocations a stage were 4% of the submitting thread)
@@ -1138,7 +1354,13 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                 break;
             }
             case BKind::Ubo:
-                if (b.reg < 18) bi = guest_buffer(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size, uniform);
+            case BKind::UboPtr:
+            case BKind::Ssbo:
+            case BKind::SsboUbo:
+                resolve(s, st, b, res);
+                g_keep_res.insert(g_keep_res.end(), res, res + 3);
+                bi = {reinterpret_cast<VkBuffer>(res[0]), res[1], res[2]};
+                if (b.kind != BKind::Ubo) break;
                 if (b.reg < 18 && dump_buffers()) note_ubo(sh, b.reg, s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size);
                 if (b.reg < 18 && s.ubo[st][b.reg].addr && watch::wanted(sh->name, 100 + b.reg))   // (uniform slot n is watch slot 100 + n)
                     watch::add(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size), watch::bound(s.ubo[st][b.reg].addr);
@@ -1211,19 +1433,6 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                 bi = constants(5, push, NVN_PUSH_SIZE, NVN_PUSH_SIZE, [&](u8* p) { std::memcpy(p, push, NVN_PUSH_SIZE); });
                 break;
             }
-            case BKind::Ssbo:
-                if (b.reg < 16) bi = guest_buffer(s.ssbo[st][b.reg].addr, s.ssbo[st][b.reg].size, uniform, b.aux != 0);
-                break;
-            case BKind::UboPtr:
-                if (b.reg < 18) bi = guest_buffer(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size, uniform);
-                break;
-            case BKind::SsboUbo:
-                if (b.reg < 18 && s.ubo[st][b.reg].addr) {
-                    u64 rec[2] = {};
-                    nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
-                    bi = guest_buffer(rec[0], static_cast<u32>(rec[1]), uniform, b.aux != 0);
-                }
-                break;
             default: break;
             }
             for (u32 i = 0; i < b.count; i++) bufs.push_back(bi);
@@ -1235,8 +1444,10 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
             if (b.kind == BKind::Tex && b.reg < 256) {
                 const u32 h = s.tex[st][b.reg];
                 const u32 tid = h & 0xfffff, sid = h >> 20;
+                resolve(s, st, b, res);
+                g_keep_res.push_back(res[0]);
                 if (h) {
-                    ii.imageView = texture_view(tid, want, false);
+                    ii.imageView = reinterpret_cast<VkImageView>(res[0]);
                     ii.sampler = sampler_for(sid);
                 }
                 if (dump_active() || dump_tracing()) {
@@ -1257,8 +1468,9 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                               e.valid && !im ? " NO IMAGE" : "", fh, (void*)ii.imageView);
                 }
             } else if (b.kind == BKind::Img && b.reg < 8) {
-                const u32 h = s.img[st][b.reg];
-                if (h) ii.imageView = texture_view(h & 0xfffff, want, true);
+                resolve(s, st, b, res);
+                g_keep_res.push_back(res[0]);
+                ii.imageView = reinterpret_cast<VkImageView>(res[0]);
             }
             if (b.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ii.sampler = VK_NULL_HANDLE;
             for (u32 i = 0; i < b.count; i++) imgs.push_back(ii);
@@ -1280,7 +1492,12 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     }
     if (!writes.empty()) vkUpdateDescriptorSets(ctx().dev, static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &set, 0, nullptr);
-    if (key && !g_used_placeholder) set_keep(key, set);
+    g_const_gen = nullptr;
+    if (key && !g_used_placeholder) set_keep(sub_key, set);
+    if (gen && !g_used_placeholder && !g_set_volatile)
+        g_keep_sets[key] = {set, static_cast<u32>(res_at), static_cast<u32>(g_keep_res.size() - res_at)};
+    else
+        g_keep_res.resize(res_at);
     return true;
 }
 
@@ -1843,7 +2060,7 @@ u32 draw_written_word(volatile void* host) {
 void draw_sub_begin(u64 done) {
     draw_init();
     g_written.clear();
-    g_set_gen++, g_set_kept = 0;
+    g_set_gen++, g_set_kept = 0, g_subs++;
     kept_sub_begin();
     g_view_cache.clear();
     dyn_reset();
@@ -1860,6 +2077,32 @@ void draw_sub_begin(u64 done) {
         a->pre = a->pre_first;
         a->pre_more_used = 0;
         g_arena_free.push_back(a);
+    }
+    while (!g_gen_retired.empty() && g_gen_retired.front()->last_value <= done) {
+        SetGen* g = g_gen_retired.front();
+        g_gen_retired.pop_front();
+        for (Chunk& ch : g->chunks) ch.used = 0;
+        g->cur = 0;
+        for (VkDescriptorPool p : g->pools) vkResetDescriptorPool(c.dev, p, 0);
+        g->pool_cur = 0;
+        g->sets = 0;
+        g->consts.clear();
+        g->const_hits = 0;
+        for (auto& fn : g->grave) defer(std::move(fn));
+        g->grave.clear();
+        g_gen_free.push_back(g);
+    }
+    {
+        // Destroyed while no generation was current: no kept set may hold them. Many waiting: the current one goes.
+        std::unique_lock lk{g_grave_mu};
+        if (!g_gen) {
+            for (auto& fn : g_grave) defer(std::move(fn));
+            g_grave.clear();
+            g_grave_bytes = 0;
+        } else if (g_grave_bytes > GraveBytes) {
+            lk.unlock();
+            retire_gen();
+        }
     }
     if (g_arena_free.empty()) {
         Arena* a = new Arena;
@@ -1901,6 +2144,9 @@ VkCommandBuffer draw_sub_flush() {
 
 VkCommandBuffer draw_sub_commit(u64 value) {
     A->value = value;
+    if (g_gen) g_gen->last_value = value;
+    for (SetGen* g : g_gen_retiring) g->last_value = value, g_gen_retired.push_back(g);
+    g_gen_retiring.clear();
     kept_flush();
     VkCommandBuffer pre = VK_NULL_HANDLE;
     if (A->pre_open) {
@@ -2152,11 +2398,18 @@ void draw_prog_forget(const prog_t* p) {
 }
 
 void draw_tex_cpu_written(const tex_t* t) {
-    bind_epoch_bump();
+    bind_epoch_bump(false);   // (content: kept descriptor sets stay)
     if (Image* img = image_find(t->serial)) img->uploaded = false;
 }
 
 VkCommandBuffer draw_pre_cb() { return pre_cb(); }
+
+void defer_past_kept(std::function<void()> fn, u64 bytes) {
+    if (!set_keep_on()) return defer(std::move(fn));
+    std::scoped_lock lk{g_grave_mu};
+    g_grave.push_back(std::move(fn));
+    g_grave_bytes += bytes;
+}
 
 void draw_ensure_content(Image* img, const tex_t* t) { ensure_content(img, t, true); }
 
@@ -2190,6 +2443,23 @@ void draw_log_stats() {
         LOG("nvk: constant blocks: %llu found in device memory, %llu new, %llu left in system memory (store full); %zu kept, %zu MB; store emptied %llu times",
             static_cast<unsigned long long>(g_kept_hits), static_cast<unsigned long long>(g_kept_new), static_cast<unsigned long long>(g_kept_past),
             g_kept.size(), g_kept_blocks.size() * static_cast<size_t>(KeptBlockSize >> 20), static_cast<unsigned long long>(g_kept_wipes));
+    if (set_keep_on())
+        LOG("nvk: kept descriptor sets: %llu found again, %llu out of date; %zu kept; generations %llu (%zu retired); this one: %llu sets, "
+            "%zu constant blocks (%llu shared) in %zu MB",
+            static_cast<unsigned long long>(g_keep_hits), static_cast<unsigned long long>(g_keep_stale), g_keep_sets.size(),
+            static_cast<unsigned long long>(g_keep_gens), g_gen_retired.size(), static_cast<unsigned long long>(g_gen ? g_gen->sets : 0),
+            g_gen ? g_gen->consts.size() : 0, static_cast<unsigned long long>(g_gen ? g_gen->const_hits : 0),
+            g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0);
+    g_keep_hits = g_keep_stale = 0;
+    if (set_miss_stats_on()) {
+        std::string m;
+        for (int i = 0; i < KG_N; i++)
+            if (g_miss_group[i]) m += std::string(", ") + k_key_group_names[i] + " " + std::to_string(g_miss_group[i]);
+        LOG("nvk: sets made: %llu submissions; %llu made again from an earlier submission; key differs from the stage's last in%s",
+            static_cast<unsigned long long>(g_subs), static_cast<unsigned long long>(g_miss_earlier_sub), m.c_str());
+        for (u64& v : g_miss_group) v = 0;
+        g_miss_earlier_sub = g_subs = 0;
+    }
     last_epoch = epoch;
     g_set_made = g_set_hits = g_reg_changes = g_reg_same = 0;
     g_kept_hits = g_kept_new = g_kept_past = 0;

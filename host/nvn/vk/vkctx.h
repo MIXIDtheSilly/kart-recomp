@@ -73,6 +73,9 @@ void release_import(Imported& im);
 // Runs fn (on the completion thread) once the GPU has finished everything submitted so far: for objects
 // the game released that a submission in flight may still use (replay_vk.cpp).
 void defer(std::function<void()> fn);
+// defer, for images and views (`bytes` of memory): also not before the descriptor sets kept across submissions that may
+// hold them are gone (draw.cpp, keep_find), so a view's handle is never reused while one may still be found.
+void defer_past_kept(std::function<void()> fn, u64 bytes);
 
 // ------------------------------------------------------------------ one-off work
 

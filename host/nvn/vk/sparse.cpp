@@ -238,7 +238,7 @@ void restore(SparseImage* s, VkCommandBuffer pre) {
         mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(pre, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
-    bind_epoch_bump();
+    bind_epoch_bump(false);   // (content: kept descriptor sets stay)
     LOG("nvk: sparse image %llu: %llu MB moved back from host memory (%llu ms)", static_cast<unsigned long long>(s->img->serial),
         static_cast<unsigned long long>(ev.bytes >> 20), static_cast<unsigned long long>((host_ns() - t0) / 1'000'000));
     evict_drop(s);
@@ -512,7 +512,8 @@ void sparse_image_release(Image* img) {
         g_opaque.erase(img->image);
     }
     log_stats(s, " released");
-    defer([s, img] {
+    const u64 bytes = s->size;
+    defer_past_kept([s, img] {
         Device& c = ctx();
         for (auto& [k, v] : img->views)
             if (v) vkDestroyImageView(c.dev, v, nullptr);
@@ -523,7 +524,7 @@ void sparse_image_release(Image* img) {
         if (s->ev) vmaDestroyBuffer(c.vma, s->ev->buf, s->ev->alloc);
         delete img;
         delete s;
-    });
+    }, bytes);
 }
 
 u64 sparse_bytes() { return g_bytes.load(); }
@@ -561,7 +562,7 @@ void sparse_tick(VkCommandBuffer (*pre)()) {
                 s->bound--;
             }
             s->ev->unbound = true;
-            bind_epoch_bump();
+            bind_epoch_bump(false);   // (content: kept descriptor sets stay)
             LOG("nvk: sparse image %llu not used for %llu s: %llu MB moved out to host memory", static_cast<unsigned long long>(s->img->serial),
                 static_cast<unsigned long long>(after_frames / 60), static_cast<unsigned long long>(s->ev->bytes >> 20));
         }
@@ -592,7 +593,7 @@ u64 sparse_image_bytes(const Image* img) {
 }
 
 void sparse_note_map(u64 gpu, u64 size) {
-    bind_epoch_bump();
+    bind_epoch_bump(false);   // (content: kept descriptor sets stay)
     std::scoped_lock lk{g_mu};
     if (g_list.empty()) return;  // a new image looks at the page table itself
     g_dirty.emplace_back(gpu, size);
