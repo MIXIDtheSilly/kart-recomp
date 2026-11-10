@@ -56,7 +56,16 @@ void remove(std::unordered_map<u64, WaitList>& map, u64 key, KThread* t) {
 }
 
 bool sched_stats();
+// HOST_TIMELINE_MIN_US=<us>: the shortest guest wait the timeline records (default 100). At 0 it also records who woke whom.
+u64 timeline_min_ns() {
+    static const u64 ns = [] {
+        const char* v = std::getenv("HOST_TIMELINE_MIN_US");
+        return v ? std::strtoull(v, nullptr, 10) * 1000 : 100000ull;
+    }();
+    return ns;
+}
 void wake(KThread* t, u32 result) {
+    if (g_timeline_on && timeline_min_ns() == 0) TIMELINE("wake t%llu", static_cast<unsigned long long>(t->id));
     if (sched_stats()) t->wake_ns = host_ns();
     t->woken = true;
     t->wait_result = result;
@@ -206,6 +215,17 @@ void start_sched_sampler() {
                                100.0 * t->st_owned / st.samples, static_cast<unsigned long long>(t->st_woken / 5));
             }
             LOG("sched: threads per second%s", per);
+            // The threads that held a core longest.
+            std::sort(top.begin(), top.end(), [](KThread* a, KThread* b) { return a->st_owned > b->st_owned; });
+            pn = 0, per[0] = 0;
+            for (size_t i = 0; i < top.size() && i < 16 && pn < 1100; i++) {
+                KThread* t = top[i];
+                pn += snprintf(per + pn, sizeof per - pn, " [t%llu p%d m%llx e%llx run%.0f%% wk%llu q%.0fms]",
+                               static_cast<unsigned long long>(t->id), t->priority, static_cast<unsigned long long>(t->affinity),
+                               static_cast<unsigned long long>(t->entry), 100.0 * t->st_owned / st.samples,
+                               static_cast<unsigned long long>(t->st_woken / 5), t->st_queued_ns / 5e6);
+            }
+            LOG("sched: busiest threads%s", per);
             for (auto& [h, t] : g_threads_by_handle) t->st_queued_ns = t->st_queued_n = t->st_owned = t->st_woken = 0;
             st = {};
         }
@@ -537,7 +557,7 @@ static u32 svc_wait_sync(Ctx* c) {
     for (auto& o : objs) o->waiters.push_back(self);
     const u64 wait_start = g_timeline_on ? host_ns() : 0;
     const bool ok = block(lk, self, timeout);
-    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+    if (g_timeline_on && host_ns() - wait_start >= timeline_min_ns()) {
         TIMELINE("blocked sync %llu us n=%d h0=%s lr=%#llx", (host_ns() - wait_start) / 1000, count,
                  objs.empty() ? "-" : objs[0]->type(), static_cast<unsigned long long>(c->x[30]));
     }
@@ -566,7 +586,7 @@ static u32 svc_arbitrate_lock(Ctx* c) {
     enqueue(g_mutex[addr], self);
     const u64 wait_start = g_timeline_on ? host_ns() : 0;
     block(lk, self, -1);
-    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+    if (g_timeline_on && host_ns() - wait_start >= timeline_min_ns()) {
         TIMELINE("blocked mutex %llu us addr=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
                  static_cast<unsigned long long>(addr), static_cast<unsigned long long>(c->x[30]));
     }
@@ -596,7 +616,7 @@ static u32 svc_wait_key(Ctx* c) {
     enqueue(g_condvar[key], self);
     const u64 wait_start = g_timeline_on ? host_ns() : 0;
     const bool ok = block(lk, self, timeout == 0 ? 0 : timeout);
-    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+    if (g_timeline_on && host_ns() - wait_start >= timeline_min_ns()) {
         TIMELINE("blocked condvar %llu us key=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
                  static_cast<unsigned long long>(key), static_cast<unsigned long long>(c->x[30]));
     }
@@ -662,7 +682,7 @@ static u32 svc_wait_for_address(Ctx* c) {
     enqueue(g_arbiter[addr], self);
     const u64 wait_start = g_timeline_on ? host_ns() : 0;
     const bool ok = block(lk, self, timeout);
-    if (g_timeline_on && host_ns() - wait_start >= 100000) {
+    if (g_timeline_on && host_ns() - wait_start >= timeline_min_ns()) {
         TIMELINE("blocked address %llu us addr=%#llx lr=%#llx", (host_ns() - wait_start) / 1000,
                  static_cast<unsigned long long>(addr), static_cast<unsigned long long>(c->x[30]));
     }

@@ -77,6 +77,12 @@ void timeline(const char* fmt, ...) {
     QueryPerformanceCounter(&now);
     const u64 us = static_cast<u64>(static_cast<double>(now.QuadPart - g_qpc_start.QuadPart) * 1e6 /
                                     static_cast<double>(g_qpf.QuadPart));
+    // HOST_TIMELINE_FROM_S=<s>: nothing is recorded before that time.
+    static const u64 from_us = [] {
+        const char* v = std::getenv("HOST_TIMELINE_FROM_S");
+        return v ? std::strtoull(v, nullptr, 10) * 1000000 : 0ull;
+    }();
+    if (us < from_us) return;
     const u64 tid = kern::current_thread() ? kern::current_thread()->id : 0;
     std::scoped_lock lk{g_timeline_lock};
     std::fprintf(g_timeline_file, "%llu %llu %s\n", us, tid, buf);
