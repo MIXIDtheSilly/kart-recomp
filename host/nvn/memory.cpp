@@ -78,6 +78,8 @@ struct vpte { u64 phys; u64 gen; };   // phys: guest address of the physical pag
 struct vpool {
     pool_t* pool; u64 base, size, top;   // base: reserved guest address range (size bytes, rounded up to 2 MB); top: highest mapped end so far (logged per 128 MB)
     std::vector<vpte*> pt;
+    std::unordered_map<u64, u64> rev;    // physical page -> the virtual page (offset) that mapped it last (see vpool_map)
+    u64 stale_dropped = 0;               // virtual pages whose physical page was mapped again elsewhere (stats)
 };
 namespace {
 std::map<u64, vpool*> g_vps;   // base -> pool, under g_vp_mu
@@ -161,8 +163,38 @@ bool vpool_map(vpool* v, const map_req& r) {   // caller holds g_vp_mu; -> false
         if (!ph->mem || r.poff < 0 || (uint64_t)r.poff + r.size > ph->size) { LOG("[RED] nvn: virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void*)v->pool, (const void*)ph, (unsigned long long)ph->size, (void*)ph->mem, (unsigned long long)r.poff, (unsigned long long)r.size); return false; }
         phys = ga(ph->mem) + (u64)r.poff;
     }
+    // Which virtual page mapped each physical page last (sparse_stale). Mario Kart World's terrain caches recycle a
+    // physical page by mapping it at another tile without unmapping the tile that had it; the page table keeps the old
+    // tile as an alias, as the console's does (other pools alias on purpose: render targets sharing memory), and the
+    // old tiles are told to the renderer, which drops such tiles from its sampled-only sparse images (sparse.cpp).
+    std::vector<u64> stale;
+    const u64 lo = (u64)r.voff, hi = lo + r.size;
+    for (u64 o = 0; o < r.size; o += 0x1000) {
+        const u64 vp = lo + o;
+        if (const vpte* e = vpt_get(v, vp); e && e->phys) {   // this page's previous physical page is no longer here
+            auto it = v->rev.find(e->phys);
+            if (it != v->rev.end() && it->second == vp) v->rev.erase(it);
+        }
+        if (!phys) continue;
+        auto [it, fresh] = v->rev.try_emplace(phys + o, vp);
+        if (fresh) continue;
+        const u64 old = it->second;
+        it->second = vp;
+        if (old >= lo && old < hi) continue;   // remapped by this same request
+        if (const vpte* e = vpt_get(v, old); e && e->phys == phys + o) stale.push_back(old);
+    }
     vpt_set(v, (u64)r.voff, r.size, phys);
     rp_vpool_map(v->base, (u64)r.voff, r.size, phys);
+    if (!stale.empty()) {
+        std::sort(stale.begin(), stale.end());
+        for (size_t i = 0; i < stale.size();) {
+            size_t j = i + 1;
+            while (j < stale.size() && stale[j] == stale[j - 1] + 0x1000) j++;
+            rp_vpool_map(v->base, stale[i], (j - i) * 0x1000, vpt_get(v, stale[i])->phys);   // (unchanged: the renderer looks again)
+            i = j;
+        }
+        v->stale_dropped += stale.size();
+    }
     const u64 end = (u64)r.voff + r.size;
     if (end >> 27 > v->top >> 27) LOG("nvn: virtual pool %p: mapped up to %#llx", (const void*)v->pool, (unsigned long long)end);
     if (end > v->top) v->top = end;
@@ -244,6 +276,46 @@ bool sparse_changed_since(const pool_t* pool, u64 gpu, u64 n, uint64_t gen) {
         if (e->gen > gen) return true;
     }
     return false;
+}
+
+bool sparse_stale(const pool_t* pool, u64 gpu, u64 n) {   // [gpu, gpu+n) has mapped pages, and each one's physical page was mapped again elsewhere since
+    std::scoped_lock lk{g_vp_mu};
+    vpool* v = pool ? pool->vp : nullptr;
+    if (!v || gpu < v->base || gpu >= v->base + v->size) return false;
+    bool any = false;
+    const u64 end = gpu - v->base + n;
+    for (u64 o = (gpu - v->base) & ~0xFFFull; o < end && o < v->pool->size; o += 0x1000) {
+        const vpte* e = vpt_get(v, o);
+        if (!e || !e->phys) continue;
+        const auto it = v->rev.find(e->phys);
+        if (it != v->rev.end() && it->second == o) return false;   // this page holds its physical page's latest mapping
+        any = true;
+    }
+    return any;
+}
+
+// HOST_NVN_ALIAS_STATS=1 (renderer tick, every 30 s): per sparse pool, mapped memory against the distinct physical memory behind it.
+// "stale" = virtual pages whose physical page is also mapped at another virtual page by a newer request (remapped without an unmap).
+void sparse_alias_report() {
+    std::scoped_lock lk{g_vp_mu};
+    for (auto& [b, v] : g_vps) {
+        if (v->pool->vmode != 2) continue;
+        std::unordered_map<u64, std::pair<u64, u32>> newest;   // physical page -> newest generation mapping it, virtual pages mapping it
+        u64 mapped = 0;
+        for (const vpte* l : v->pt)
+            if (l) for (int i = 0; i < VPT_LEAF; i++)
+                if (l[i].phys) { mapped++; auto& g = newest[l[i].phys]; if (l[i].gen > g.first) g.first = l[i].gen; g.second++; }
+        if (!mapped) continue;
+        u64 stale = 0;
+        u32 most = 0;
+        for (const auto& [p, g] : newest) most = std::max(most, g.second);
+        for (const vpte* l : v->pt)
+            if (l) for (int i = 0; i < VPT_LEAF; i++)
+                if (l[i].phys && newest[l[i].phys].first != l[i].gen) stale++;
+        LOG("nvn: sparse pool %p (%#llx bytes): %llu MB mapped, %llu MB distinct physical, %llu MB stale aliases (most aliased page: %u virtual pages); %llu MB remapped so far",
+            (const void*)v->pool, (unsigned long long)v->pool->size, (unsigned long long)(mapped >> 8),
+            (unsigned long long)(newest.size() >> 8), (unsigned long long)(stale >> 8), most, (unsigned long long)(v->stale_dropped >> 8));
+    }
 }
 
 uint8_t* gpu_ptr(u64 addr, u64 n) {

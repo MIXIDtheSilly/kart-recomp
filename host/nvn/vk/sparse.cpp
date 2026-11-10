@@ -545,6 +545,8 @@ void sparse_tick(VkCommandBuffer (*pre)()) {
         if (now - at >= 5'000'000'000ull) at = now;
         list = g_list;
     }
+    static const bool alias_stats = getenv("HOST_NVN_ALIAS_STATS") != nullptr;
+    if (static u64 alias_at = 0; alias_stats && host_ns() - alias_at >= 30'000'000'000ull) alias_at = host_ns(), nvn::sparse_alias_report();
     // Copies done: the tiles go
     for (SparseImage* s : list)
         if (s->ev && !s->ev->unbound && s->ev->copied->load()) {
@@ -632,7 +634,12 @@ void sparse_image_use(Image* img, VkCommandBuffer pre) {
             tile.dirty = false;
             const TileAt at = tile_at(s, i);
             auto src = std::make_shared<std::vector<u8>>(Tile64);
-            if (nvn::sparse_copy(s->pool, src->data(), s->gpu + at.off, Tile64) == Tile64) {  // unmapped
+            // A stale alias (its physical pages mapped again at another tile since, the terrain caches' way of recycling
+            // them) goes as an unmapped tile: the game no longer samples it, and kept it took a tile of memory each, without
+            // end (+1 GB in 2 minutes of racing, then device lost). HOST_NVN_KEEP_ALIASES=1 keeps them.
+            static const bool keep_aliases = getenv("HOST_NVN_KEEP_ALIASES") != nullptr;
+            if (nvn::sparse_copy(s->pool, src->data(), s->gpu + at.off, Tile64) == Tile64 ||
+                (!keep_aliases && nvn::sparse_stale(s->pool, s->gpu + at.off, Tile64))) {  // unmapped
                 if (tile.mem) {
                     unbind_region(s, at.level, at.layer, at.o, at.e);
                     const VmaAllocation a = tile.mem;

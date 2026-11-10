@@ -190,6 +190,8 @@ uint64_t sparse_copy(const pool_t* pool, void* dst, u64 gpu, u64 n);   // bytes 
 bool sparse_mapped(const pool_t* pool, u64 gpu, u64 n);              // every page of the range has memory behind it
 // The physical memory (guest address) behind [gpu, gpu+n) when it is one contiguous run, else 0.
 u64 sparse_phys(const pool_t* pool, u64 gpu, u64 n);
+void sparse_alias_report();   // HOST_NVN_ALIAS_STATS=1: mapped vs distinct physical memory per sparse pool
+bool sparse_stale(const pool_t* pool, u64 gpu, u64 n);   // mapped, but every mapped page's physical page was mapped again at another page since (a stale alias)
 // A mapping in the range is newer than `gen` (gen == UINT64_MAX: do not look).
 bool sparse_changed_since(const pool_t* pool, u64 gpu, u64 n, uint64_t gen);
 // Whether the CPU flushed (nvnMemoryPoolFlushMappedRange) any of [addr, addr+n) of a pool: until a texture's first GPU
