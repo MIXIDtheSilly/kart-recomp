@@ -474,6 +474,14 @@ KEEP_C = {"excl_store", "excl_load_pair", "excl_store_pair", "guest_yield"}   # 
 NORETURN = {"guest_trap", "guest_unresolved_jump"}
 WRITE_RE = re.compile(r"\bX_(\d+)\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)")
 RETURN_RE = re.compile(r"\breturn;")
+# LIFT_VREGCACHE=1: the NEON registers too (V_<n>, V128 locals). Stores through guest pointers may alias the Ctx to
+# the compiler, so every c->v[n] was reloaded after each guest store; ~half the hot functions' instructions were moves.
+# Vector helpers take V128 values, never c; the one that writes through a reference is setl.
+VREGCACHE = os.environ.get("LIFT_VREGCACHE", "0") == "1"
+VREG_RE = re.compile(r"c->v\[(\d+)\]")
+VWRITE_RE = re.compile(r"\bV_(\d+)(?:\.(?:lo|hi|b|h|w|f|d)(?:\[[^\]]*\])?)?\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)")
+VSETL_RE = re.compile(r"\bsetl<[^<>()]*>\(V_(\d+),")
+VBIT0 = 40   # V register n's bit in the dirty sets: 1 << (VBIT0 + n)
 
 
 def rewrite_line(text):
@@ -482,6 +490,8 @@ def rewrite_line(text):
     continue, and whether every way through it leaves the function."""
     text = FLAG_HELPERS_RE.sub(lambda m: f"{m.group(1)}{m.group(2) or ''}(&F{m.group(3)}", text)
     text = REG_RE.sub(r"X_\1", text)
+    if VREGCACHE:
+        text = VREG_RE.sub(r"V_\1", text)
     text = text.replace("c->sp", "SP_")
     text = FLAG_RE.sub(r"F.\1", text)
     text = re.sub(r"\b(ld|st)<([^<>()]*)>\(", lambda m: f"{m.group(1)}m<{m.group(2)}>(M_, ", text)
@@ -537,6 +547,8 @@ def written_bits(text):
     bits = 0
     for n in WRITE_RE.findall(text):
         bits |= 1 << int(n)
+    for n in VWRITE_RE.findall(text) + VSETL_RE.findall(text):
+        bits |= 1 << (VBIT0 + int(n))
     if re.search(r"\bSP_\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", text):
         bits |= SP_BIT
     if "&F" in text or re.search(r"\bF\.(n|z|cf|vf)\s*=(?!=)", text) or re.search(r"\bF\s*=(?!=)", text):
@@ -572,7 +584,8 @@ def regcache(units, entries):
     regs = sorted({int(n) for n in re.findall(r"\bX_(\d+)\b", text_all)})
     sp_used = "SP_" in text_all
     flags_used = "F." in text_all or "&F" in text_all or "F = " in text_all
-    rl = [f"X_{n} = c->x[{n}];" for n in regs]
+    vregs = sorted({int(n) for n in re.findall(r"\bV_(\d+)\b", text_all)})
+    rl = [f"X_{n} = c->x[{n}];" for n in regs] + [f"V_{n} = c->v[{n}];" for n in vregs]
     if sp_used:
         rl.append("SP_ = c->sp;")
     if flags_used:
@@ -581,6 +594,7 @@ def regcache(units, entries):
 
     def write_back(bits):
         wb = [f"c->x[{n}] = X_{n};" for n in range(32) if bits >> n & 1]
+        wb += [f"c->v[{n}] = V_{n};" for n in range(32) if bits >> (VBIT0 + n) & 1]
         if bits & SP_BIT:
             wb.append("c->sp = SP_;")
         if bits & FLAGS_BIT:
@@ -604,6 +618,8 @@ def regcache(units, entries):
         decls.append("const uint64_t MB_ = MB;")
     if regs:
         decls.append("uint64_t " + ", ".join(f"X_{n} = c->x[{n}]" for n in regs) + ";")
+    if vregs:
+        decls.append("V128 " + ", ".join(f"V_{n} = c->v[{n}]" for n in vregs) + ";")
     if sp_used:
         decls.append("uint64_t SP_ = c->sp;")
     if flags_used:

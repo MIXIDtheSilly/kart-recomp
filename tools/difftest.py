@@ -8,6 +8,7 @@ natively and compares registers, flags and every changed 8-byte word of memory.
 """
 import argparse
 import collections
+import os
 import random
 import struct
 import subprocess
@@ -173,7 +174,9 @@ def build_harness(work, gen_files):
     exe = work / "test_harness.exe"
     srcs = " ".join(f'"{p}"' for p in [ROOT / "runtime" / "test_harness.cpp", *gen_files])
     bat = work / "build.bat"
-    bat.write_text(f'@call "{VCVARS}" >nul\r\ncl /nologo /O2 /std:c++20 /EHa /MP /bigobj /w /I"{ROOT / "runtime"}" '
+    # DIFFTEST_CC replaces the compiler, e.g. "clang-cl.exe -ffp-contract=off" (clang-cl ignores /MP).
+    cc = os.environ.get("DIFFTEST_CC", "cl")
+    bat.write_text(f'@call "{VCVARS}" >nul\r\n{cc} /nologo /O2 /std:c++20 /EHa /MP /bigobj /w /I"{ROOT / "runtime"}" '
                    f'/Fo"{work}\\\\" /Fe"{exe}" {srcs}\r\n')
     r = subprocess.run(["cmd", "/c", str(bat)], capture_output=True, text=True, cwd=work)
     if r.returncode != 0:

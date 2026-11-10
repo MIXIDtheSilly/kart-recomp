@@ -415,6 +415,12 @@ HostConfig g_config;
 
 namespace nvk { int bake_textures(const std::filesystem::path& game, size_t check); }
 
+// Clang PGO (tools/build_lib.py BUILD_PGO=gen): instrumented modules link clang's profile runtime
+// (clang_rt.profile); in every other build this resolves to the no-op below.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" int kart_pgo_nop(void) { return 0; }
+#pragma comment(linker, "/alternatename:__llvm_profile_write_file=kart_pgo_nop")
+
 int main(int argc, char** argv) {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc_start);
@@ -475,6 +481,15 @@ int main(int argc, char** argv) {
         std::thread([secs] {
             std::this_thread::sleep_for(std::chrono::seconds{secs});
             kern::dump_threads();
+        }).detach();
+    }
+    // KART_PGO_DUMP=<s>: write the PGO profile (LLVM_PROFILE_FILE, default default.profraw) after that many
+    // seconds. The runtime only writes it at a clean exit, and benchmark runs end by killing the process.
+    if (const char* v = std::getenv("KART_PGO_DUMP")) {
+        const int secs = std::atoi(v);
+        std::thread([secs] {
+            std::this_thread::sleep_for(std::chrono::seconds{secs});
+            LOG("PGO profile written (%d)", __llvm_profile_write_file());
         }).detach();
     }
     video::run_window_loop();

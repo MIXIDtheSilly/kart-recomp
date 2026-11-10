@@ -16,7 +16,8 @@ if not exist out\obj\nvn mkdir out\obj\nvn
 cl %CFLAGS% /Foout\obj\nvn\ nvn\*.cpp nvn\vk\*.cpp || exit /b 1
 rem nv\core has file names nv\devices uses too (nvmap.cpp).
 cl %CFLAGS% /Foout\obj\nvcore\ nv\core\*.cpp || exit /b 1
-link /nologo /DEBUG /OUT:out\kart.exe /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULTLIB:LIBCMT out\obj\*.obj out\obj\nvcore\*.obj out\obj\nvn\*.obj ^
+rem /INCREMENTAL:NO: incremental linking pads data sections, which breaks clang PGO profile writing (BUILD_PGO=gen).
+link /nologo /DEBUG /INCREMENTAL:NO /OUT:out\kart.exe /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULTLIB:LIBCMT out\obj\*.obj out\obj\nvcore\*.obj out\obj\nvn\*.obj ^
   ..\build\rtld.lib ..\build\main.lib ..\build\subsdk0.lib ..\build\sdk.lib ^
   %EB%\src\video_core\video_core.lib %EB%\src\audio_core\audio_core.lib %EB%\_deps\cubeb-build\cubeb.lib %SDL3%\lib\libSDL3_static.lib %EB%\src\shader_recompiler\shader_recompiler.lib %EB%\src\video_core\gpu_logging\gpu_logging.lib ^
   %EB%\src\common\common.lib %EB%\externals\glad\glad.lib %EB%\externals\reshadefx.lib %EB%\externals\bc_decoder.lib ^
@@ -29,4 +30,4 @@ link /nologo /DEBUG /OUT:out\kart.exe /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULT
   %CPM%\ffmpeg\9.0.2-1790726865-946fcce07b-windows-amd64\lib\swscale.lib %CPM%\ffmpeg\9.0.2-1790726865-946fcce07b-windows-amd64\lib\avcodec.lib ^
   %CPM%\ffmpeg\9.0.2-1790726865-946fcce07b-windows-amd64\lib\swresample.lib %CPM%\ffmpeg\9.0.2-1790726865-946fcce07b-windows-amd64\lib\avfilter.lib ^
   %CPM%\ffmpeg\9.0.2-1790726865-946fcce07b-windows-amd64\lib\avutil.lib ^
-  user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib bcrypt.lib ntdll.lib ws2_32.lib uuid.lib version.lib setupapi.lib dbghelp.lib imm32.lib cfgmgr32.lib avrt.lib ksuser.lib || exit /b 1
+  user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib bcrypt.lib ntdll.lib ws2_32.lib uuid.lib version.lib setupapi.lib dbghelp.lib imm32.lib cfgmgr32.lib avrt.lib ksuser.lib %KART_LINK_EXTRA% || exit /b 1
