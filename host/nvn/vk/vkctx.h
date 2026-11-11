@@ -51,6 +51,7 @@ Device& ctx();
 void init();
 // The draw a checkpoint marker stands for (draw.cpp).
 std::string checkpoint_desc(u64 marker);
+std::string checkpoint_between(u64 lo, u64 hi);
 
 // ------------------------------------------------------------------ guest memory as GPU buffers
 

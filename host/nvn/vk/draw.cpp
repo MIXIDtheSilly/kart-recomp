@@ -1367,6 +1367,22 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage, Image** img
         g_used_placeholder = true;
         return placeholder_view(want);
     }
+    // Bisecting the free-roam device loss (11-11): the faulting draws all sample a GPU-made 64x64 cube and a 960x540 depth
+    // texture. HOST_NVN_TEST_BLANK=cube | depth | both: those sampled views become the placeholder.
+    static const int blank = [] {
+        const char* v = getenv("HOST_NVN_TEST_BLANK");
+        if (!v) return 0;
+        const int b = (std::strstr(v, "cube") || std::strstr(v, "both") ? 1 : 0) | (std::strstr(v, "depth") || std::strstr(v, "both") ? 2 : 0) |
+                      (std::strstr(v, "gpu") ? 4 : 0) | (std::strstr(v, "all") ? 8 : 0);
+        LOG("nvk: [WARNING] HOST_NVN_TEST_BLANK=%s: those sampled textures are blank", v);
+        return b;
+    }();
+    if (blank && !storage &&
+        (((blank & 1) && (want == VK_IMAGE_VIEW_TYPE_CUBE || want == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) ||
+         ((blank & 2) && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) || ((blank & 4) && img->gpu_written) || (blank & 8))) {
+        g_used_placeholder = true;
+        return placeholder_view(want);
+    }
     const VkImageView v = view_of(img, e.has_v ? &e.v : nullptr, false, want);
     if (!dump_active() && !dump_tracing()) {
         static const bool sticky_on = [] {
@@ -1488,7 +1504,12 @@ u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nul
         VkImageView v = VK_NULL_HANDLE;
         Image* img = nullptr;
         bool sticky = true;
-        if (b.kind == BKind::Tex && b.reg < 256) {
+        // HOST_NVN_TEST_BLANK=vs (bisecting the 11-11 device loss): textures vertex shaders sample are the placeholder
+        static const bool blank_vs = getenv("HOST_NVN_TEST_BLANK") && std::strstr(getenv("HOST_NVN_TEST_BLANK"), "vs");
+        if (blank_vs && b.kind == BKind::Tex && st == SH_VS) {
+            g_used_placeholder = true;
+            v = placeholder_view(view_type_of(b));
+        } else if (b.kind == BKind::Tex && b.reg < 256) {
             if (const u32 h = s.tex[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), false, &img, &sticky);
         } else if (b.kind == BKind::Img && b.reg < 8) {
             if (const u32 h = s.img[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), true, &img, &sticky);
@@ -3482,6 +3503,31 @@ std::string checkpoint_desc(u64 marker) {
              static_cast<unsigned long long>(m.b), static_cast<unsigned long long>(m.c), static_cast<unsigned long long>(m.sub),
              static_cast<unsigned long long>(g_mark_n - marker));
     return b;
+}
+
+// The draws and dispatches of the markers in (lo, hi]: the ones in flight at a device loss (the last finished to the last
+// started), each shader combination once with how many markers it had, in order of first appearance.
+std::string checkpoint_between(u64 lo, u64 hi) {
+    if (g_marks.empty() || hi <= lo || hi > g_mark_n) return "?";
+    lo = std::max(lo, g_mark_n > MarkN ? g_mark_n - MarkN : 0);
+    std::vector<std::pair<const Mark*, u32>> seen;
+    for (u64 k = lo + 1; k <= hi; k++) {
+        const Mark& m = g_marks[(k - 1) % MarkN];
+        auto it = std::find_if(seen.begin(), seen.end(), [&](const auto& s) {
+            return s.first->a == m.a && s.first->b == m.b && s.first->c == m.c && s.first->kind == m.kind;
+        });
+        if (it == seen.end()) seen.push_back({&m, 1});
+        else it->second++;
+    }
+    static const char* kinds[] = {"vs/ps", "ts/ms/ps", "cs"};
+    std::string out = std::to_string(hi - lo) + " markers:";
+    for (const auto& [m, n] : seen) {
+        char b[128];
+        snprintf(b, sizeof b, " %s %016llx %016llx %016llx x%u;", kinds[m->kind % 3], static_cast<unsigned long long>(m->a),
+                 static_cast<unsigned long long>(m->b), static_cast<unsigned long long>(m->c), n);
+        out += b;
+    }
+    return out;
 }
 
 void draw_counts(u64* stage_binds, u64* sets_made, u64* generations) {

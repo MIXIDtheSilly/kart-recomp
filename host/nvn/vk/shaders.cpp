@@ -410,6 +410,17 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     check(vkCreateDescriptorSetLayout(c.dev, &li, nullptr, &sh->layout), "vkCreateDescriptorSetLayout");
     // HOST_NVN_SKIP_SHADERS=<key>,<key>...: draws with these shaders are skipped (to find one the GPU faults on)
     if (const char* e = getenv("HOST_NVN_SKIP_SHADERS"); e && std::strstr(e, sh->name)) sh->unsupported = "skipped (HOST_NVN_SKIP_SHADERS)";
+    // Shaders the GPU faults on: the free-roam device loss ("instruction pointer invalid", 11-08 and 11-11) came, in every
+    // crash with HOST_NVN_CHECKPOINTS=1, with vs 7bc86687f83f86ab + ps 443a31bcc678184a the oldest unfinished draw (a small
+    // instanced object, 18 indices, drawn into a 960x540 target). Skipping it was the only change that got past the crash
+    // spot; a fresh pipeline cache, a spirv-opt rewrite, no pipeline destruction, and blank cube / depth inputs did not, and
+    // blank vertex-stage textures only delayed it (80 s -> 17 min): data dependent. A sibling vs (a7f9fb429f44f663, same
+    // draw state) works. Skipped until the cause is found; HOST_NVN_KNOWN_BAD=0 draws it.
+    static const bool skip_bad = !getenv("HOST_NVN_KNOWN_BAD") || atoi(getenv("HOST_NVN_KNOWN_BAD")) != 0;
+    if (skip_bad && !sh->unsupported && std::strcmp(sh->name, "7bc86687f83f86ab") == 0) {
+        sh->unsupported = "skipped (the GPU faults on it: HOST_NVN_KNOWN_BAD=0 draws it)";
+        LOG("nvk: shader %s skipped: the GPU faults on it (HOST_NVN_KNOWN_BAD=0 draws it)", sh->name);
+    }
     return sh;
 }
 

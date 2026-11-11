@@ -77,8 +77,14 @@ void vk_fail(VkResult r, const char* what) {
         vkGetQueueCheckpointDataNV(c.queue, &n, nullptr);
         std::vector<VkCheckpointDataNV> cp(n, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
         vkGetQueueCheckpointDataNV(c.queue, &n, cp.data());
-        for (const auto& d : cp)
-            LOG("[RED] vulkan: checkpoint at stage %#x: %s", d.stage, checkpoint_desc(reinterpret_cast<uintptr_t>(d.pCheckpointMarker)).c_str());
+        u64 lo = ~0ull, hi = 0;
+        for (const auto& d : cp) {
+            const u64 m = reinterpret_cast<uintptr_t>(d.pCheckpointMarker);
+            LOG("[RED] vulkan: checkpoint at stage %#x: %s", d.stage, checkpoint_desc(m).c_str());
+            lo = std::min(lo, m), hi = std::max(hi, m);
+        }
+        // The fault is in one of the draws between the last one finished and the last one started
+        if (cp.size() >= 2 && hi > lo) LOG("[RED] vulkan: in flight at the fault: %s", checkpoint_between(lo, hi).c_str());
     }
     if (r == VK_ERROR_DEVICE_LOST) dump_trace_print();
     fatal("vulkan: %s failed (VkResult %d)", what, static_cast<int>(r));
