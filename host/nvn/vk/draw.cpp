@@ -248,6 +248,8 @@ struct SetGen {
 constexpr u64 GenSets = 1 << 17;
 constexpr size_t GenChunks = 32;   // of ChunkSize
 SetGen* g_gen = nullptr;
+SetGen* g_gen_prev = nullptr;          // the one before, still found (gen2_on)
+u32 g_move_left = 0;                   // its sets still to be made again in g_gen in this submission
 std::vector<SetGen*> g_gen_retiring;   // retired in the submission being recorded
 std::deque<SetGen*> g_gen_retired;
 std::vector<SetGen*> g_gen_free;
@@ -1329,7 +1331,7 @@ u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nul
     return 0;
 }
 
-u64 g_keep_hits = 0, g_keep_stale = 0, g_keep_gens = 0, g_keep_touched = 0;
+u64 g_keep_hits = 0, g_keep_stale = 0, g_keep_gens = 0, g_keep_touched = 0, g_keep_prev_hits = 0, g_keep_moved = 0;
 
 bool set_keep_on() {
     static const bool on = !getenv("HOST_NVN_NO_SET_KEEP") && !getenv("HOST_WATCH_SSBO") && !g_kept_on;
@@ -1344,6 +1346,24 @@ bool touch_on() {
     }();
     return on;
 }
+// Two live generations (g_gen_prev): HOST_NVN_FAST_GEN=1 on (off by default: in races it was no faster, the turnovers it
+// smooths being rare once only reused sets are kept, keep_second_time). HOST_NVN_GEN_MOVE=n: sets moved to g_gen a
+// submission (128).
+bool gen2_on() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST_GEN");
+        return fast_base() && e && *e == '1';
+    }();
+    return on;
+}
+u32 gen_move() {
+    static const u32 n = [] {
+        const char* e = getenv("HOST_NVN_GEN_MOVE");
+        return e ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 128u;
+    }();
+    return n;
+}
+
 // Images and views destroyed while g_gen is current: freed (deferred) once it is retired and done (any thread).
 std::mutex g_grave_mu;
 std::vector<std::function<void()>> g_grave;
@@ -1368,23 +1388,82 @@ void retire_one(SetGen*& g) {
     g = nullptr;
 }
 
-// g_gen retires, with the graves so far.
+// Every generation retires (many graves waiting).
 void retire_gen() {
     if (!g_gen) return;
     graves_to_gen();
+    retire_one(g_gen_prev);
     retire_one(g_gen);
     view_cache_clear();   // (its sticky views' images may be freed once this generation is done)
 }
 
-// The generation new kept sets go to (a full one is retired first).
+// The generation new kept sets go to. A full one is retired; with two live generations it stays as g_gen_prev instead,
+// its sets found and used until it is full again, and the previous one retires. A turnover made the next frames' 3,000
+// sets again at once (submissions of 7-10 ms instead of 4-5); now they move over a few at a time (bind_stage).
+// (Lifetimes: what is destroyed while a generation is current may be in its sets and in older ones, and is freed with
+// it; the older ones retire first. The view cache is cleared at every turnover: no newer set takes a view whose image is
+// in an older generation's grave.)
 SetGen* set_gen() {
     if (g_gen && g_gen->sets < GenSets && g_gen->chunks.size() <= GenChunks) return g_gen;
-    retire_gen();
+    if (g_gen && gen2_on()) {
+        graves_to_gen();
+        retire_one(g_gen_prev);
+        g_gen_prev = g_gen;
+        g_gen = nullptr;
+        view_cache_clear();
+    } else {
+        retire_gen();
+    }
     if (g_gen_free.empty()) g_gen_free.push_back(new SetGen);
     g_gen = g_gen_free.back();
     g_gen_free.pop_back();
     g_keep_gens++;
     return g_gen;
+}
+
+// Keys made once and not kept yet (keep_second_time), with the submission (g_set_gen) that made them: open addressing,
+// emptied when half full.
+struct SeenTable {
+    struct Slot {
+        u64 key = 0, sub = 0;
+        u32 stamp = 0;
+    };
+    static constexpr size_t N = 1 << 18;
+    std::vector<Slot> slots;
+    u32 stamp = 1;
+    size_t used = 0;
+    // The submission that first made key, after noting this one as that if none did.
+    u64 note(u64 key, u64 sub) {
+        if (slots.empty()) slots.resize(N);
+        size_t i = key & (N - 1);
+        for (; slots[i].stamp == stamp; i = (i + 1) & (N - 1))
+            if (slots[i].key == key) return slots[i].sub;
+        if (used >= N / 2) {
+            used = 0;
+            if (++stamp == 0) std::fill(slots.begin(), slots.end(), Slot{}), stamp = 1;
+            i = key & (N - 1);
+        }
+        slots[i] = {key, sub, stamp};
+        used++;
+        return sub;
+    }
+} g_seen;
+u64 g_seen_once = 0;
+
+// Whether a set made under key goes to the kept generation: only once some earlier submission made it too. A race makes
+// ~400 sets a submission that no later one uses again (the per-frame uniform blocks' addresses are new each frame): kept,
+// they filled a generation every ~2.5 s, and each new one began by making a frame's ~3,000 sets again (submissions of
+// 7-10 ms). Made in the submission's arena the first time, the reused ones are made once more, and generations last.
+// HOST_NVN_FAST_KEEP2=0: every set is kept.
+bool keep_second_time(u64 key) {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST_KEEP2");
+        return fast_base() && !(e && *e == '0');
+    }();
+    if (!on) return true;
+    if (g_seen.note(key, g_set_gen) != g_set_gen) return true;
+    g_seen_once++;
+    return false;
 }
 
 // Resolves sh's bindings and compares them with what set k resolved to; true when the same. Collects its touch list into
@@ -1673,7 +1752,12 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
             return true;
         }
         if (keep) {
-            const VkDescriptorSet kept = g_gen ? keep_find(*g_gen, s, sh, key, &fixed) : VK_NULL_HANDLE;
+            VkDescriptorSet kept = g_gen ? keep_find(*g_gen, s, sh, key, &fixed) : VK_NULL_HANDLE;
+            // (one of the previous generation: used as it is, or made again in g_gen while this submission may move more)
+            if (!kept && g_gen_prev && (kept = keep_find(*g_gen_prev, s, sh, key, &fixed))) {
+                g_keep_prev_hits++;
+                if (g_move_left) g_move_left--, g_keep_moved++, kept = VK_NULL_HANDLE;
+            }
             if (kept) {
                 set_keep(sub_key, kept, fixed);
                 vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
@@ -1698,7 +1782,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     g_used_placeholder = false;
     g_set_volatile = false;
     bool made_fixed = true;
-    SetGen* const gen = keep ? set_gen() : nullptr;
+    SetGen* const gen = keep && keep_second_time(key) ? set_gen() : nullptr;
     VkDescriptorSet set = gen ? alloc_set_in(gen->pools, gen->pool_cur, sh->layout) : alloc_set(sh->layout);
     if (gen) gen->sets++;
     g_const_gen = gen;
@@ -2825,6 +2909,7 @@ void draw_sub_begin(u64 done) {
     kept_sub_begin();
     g_view_sub++;
     if (!set_keep_on()) view_cache_clear();
+    g_move_left = gen_move();
     dyn_reset();
     Device& c = ctx();
     while (!g_arena_busy.empty() && g_arena_busy.front()->value <= done) {
@@ -2908,6 +2993,7 @@ VkCommandBuffer draw_sub_flush() {
 VkCommandBuffer draw_sub_commit(u64 value) {
     A->value = value;
     if (g_gen) g_gen->last_value = value;
+    if (g_gen_prev) g_gen_prev->last_value = value;
     for (SetGen* g : g_gen_retiring) g->last_value = value, g_gen_retired.push_back(g);
     g_gen_retiring.clear();
     kept_flush();
@@ -3257,8 +3343,12 @@ void draw_log_stats() {
             g_gen ? g_gen->consts.size() : 0, static_cast<unsigned long long>(g_gen ? g_gen->const_hits : 0),
             g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0, static_cast<unsigned long long>(g_view_sticky_hits));
     if (set_keep_on() && fast_base())
-        LOG("nvk: kept descriptor sets: %llu found by their touch list", static_cast<unsigned long long>(g_keep_touched));
-    g_keep_hits = g_keep_stale = g_view_sticky_hits = g_keep_touched = 0;
+        LOG("nvk: kept descriptor sets: %llu found by their touch list; previous generation: %llu found, %llu of them made again in the current one; "
+            "%llu made for the first time (not kept)",
+            static_cast<unsigned long long>(g_keep_touched), static_cast<unsigned long long>(g_keep_prev_hits), static_cast<unsigned long long>(g_keep_moved),
+            static_cast<unsigned long long>(g_seen_once));
+    g_seen_once = 0;
+    g_keep_hits = g_keep_stale = g_view_sticky_hits = g_keep_touched = g_keep_prev_hits = g_keep_moved = 0;
     if (fast_base()) {
         static u64 last_sparse = 0, last_clears = 0, last_b[4] = {};
         u64 b[4];
