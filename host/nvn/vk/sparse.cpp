@@ -14,6 +14,7 @@
 #include "../abi.h"
 #include "../nvn_tex.h"
 #include "../replay.h"
+#include "draw.h"
 #include "hitch.h"
 #include "vkq.h"
 #include "video_core/textures/astc.h"
@@ -594,7 +595,7 @@ u64 sparse_image_bytes(const Image* img) {
 }
 
 void sparse_note_map(u64 gpu, u64 size) {
-    bind_epoch_bump(false);   // (content: kept descriptor sets stay)
+    draw_sparse_changed();
     std::scoped_lock lk{g_mu};
     if (g_list.empty()) return;  // a new image looks at the page table itself
     g_dirty.emplace_back(gpu, size);

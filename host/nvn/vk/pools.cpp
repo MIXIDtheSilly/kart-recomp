@@ -62,6 +62,19 @@ struct Pool {
 std::shared_mutex g_lock;
 std::map<u64, Pool> g_pools;  // by guest start; pools may overlap (aliases of the same storage)
 std::atomic<u64> g_pools_gen{1};  // steps at every change of g_pools
+std::atomic<u64> g_bumps[4];      // bind_epoch_bump by cause: copy made, copy dropped, pool added, pool gone (statistics)
+
+// A change of what an address resolves to steps g_bind_objects (the kept descriptor sets' keys: every one is made again,
+// ~3,000) only when a Vulkan object goes, whose handle could come back as another one: an own import or a device copy.
+// Otherwise (a pool over a shared import window, a copy made) the kept sets stay, and keep_find sees which resolve
+// otherwise now. Pools come and go 10-15 times a second in a race. HOST_NVN_FAST=0: always.
+bool objects_only_when_freed() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
 std::mutex g_window_lock;
 std::unordered_map<u64, Imported> g_windows;  // by k
 
@@ -164,7 +177,8 @@ bool mirror_alloc(u64 addr, Pool& p, u64 max_size) {
     if (g_mirrors++ % 256 == 0)
         LOG("nvk: pools with a copy in device memory: %llu, %llu MB", static_cast<unsigned long long>(g_mirrors), static_cast<unsigned long long>(g_mirror_bytes >> 20));
     g_pools_gen.fetch_add(1, std::memory_order_release);
-    bind_epoch_bump();
+    bind_epoch_bump(!objects_only_when_freed());   // (nothing goes: the import stays)
+    g_bumps[0]++;
     return true;
 }
 
@@ -224,6 +238,7 @@ void mirror_drop(u64 addr, Pool& p) {
     p.owned = p.refresh = false;
     g_pools_gen.fetch_add(1, std::memory_order_release);
     bind_epoch_bump();
+    g_bumps[1]++;
 }
 
 // The copy of an own pool written out to system memory, but for the ranges in keep, and the pool back on its import.
@@ -409,7 +424,8 @@ void pool_part_begin(bool submission) {
 }
 
 void pool_add(u64 addr, u64 size, u32 flags) {
-    bind_epoch_bump();
+    bind_epoch_bump(!objects_only_when_freed());
+    g_bumps[2]++;
     Pool p;
     p.size = size;
     p.flags = flags;
@@ -440,14 +456,15 @@ void pool_add(u64 addr, u64 size, u32 flags) {
     std::unique_lock lk{g_lock};
     if (auto it = g_pools.find(addr); it != g_pools.end()) {
         if (it->second.mirror) mirror_drop(addr, it->second);
-        if (it->second.own) release_import(it->second.im);
+        if (it->second.own) release_import(it->second.im), bind_epoch_bump();
     }
     g_pools[addr] = p;
     g_pools_gen.fetch_add(1, std::memory_order_release);
 }
 
 void pool_del(u64 addr) {
-    bind_epoch_bump();
+    bind_epoch_bump(!objects_only_when_freed());
+    g_bumps[3]++;
     std::unique_lock lk{g_lock};
     auto it = g_pools.find(addr);
     if (it == g_pools.end()) return;
@@ -456,6 +473,7 @@ void pool_del(u64 addr) {
     if (it->second.own) {
         Imported im = it->second.im;
         defer([im]() mutable { release_import(im); });
+        bind_epoch_bump();
     }
     g_pools.erase(it);
     g_pools_gen.fetch_add(1, std::memory_order_release);
@@ -522,6 +540,10 @@ void pool_note(u64 addr, u64 bytes, int kind) {
 }
 
 u64 pool_gen() { return g_pools_gen.load(std::memory_order_acquire); }
+
+void pool_bumps(u64 out[4]) {
+    for (int i = 0; i < 4; i++) out[i] = g_bumps[i].load(std::memory_order_relaxed);
+}
 
 bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
     // Every buffer of every draw comes through here: what was found last for this address's page, per thread. An entry

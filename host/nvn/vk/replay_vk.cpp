@@ -9,6 +9,7 @@
 // Every image is in VK_IMAGE_LAYOUT_GENERAL. Ordering inside a submission is kept with full memory
 // barriers between passes, transfers and dispatches; each submission starts with one (presents and other
 // submissions on the same queue).
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <list>
@@ -631,8 +632,9 @@ void vk_rp_exec_rest(const uint64_t*, int) {}
 
 namespace {
 
-// The records of a recording in execution order, following JUMP and CALL.
-void collect(const uint8_t* p, std::vector<const uint8_t*>& out, int depth = 0) {
+// The records of a recording in execution order, following JUMP and CALL; ev (if not null) gets the indices in out of its
+// event waits and signals.
+void collect(const uint8_t* p, std::vector<const uint8_t*>& out, int depth = 0, std::vector<u32>* ev = nullptr) {
     if (depth >= MaxDepth) {
         LOG("[RED] nvn: command stream calls nest deeper than %d; ignored", MaxDepth);
         return;
@@ -655,8 +657,9 @@ void collect(const uint8_t* p, std::vector<const uint8_t*>& out, int depth = 0) 
         if (h.op == OP_CALL) {
             uint64_t t;
             memcpy(&t, p + 8, 8);
-            if (t) collect(static_cast<const uint8_t*>(hp(t)), out, depth + 1);
+            if (t) collect(static_cast<const uint8_t*>(hp(t)), out, depth + 1, ev);
         } else {
+            if (ev && (h.op == OP_WAIT_EVENT || h.op == OP_SIGNAL_EVENT)) ev->push_back(static_cast<u32>(out.size()));
             out.push_back(p);
         }
         p += h.size;
@@ -839,9 +842,19 @@ struct Stream {
     int origin = 0;
     u64 fence = 0;
     std::vector<const uint8_t*> recs;
+    std::vector<u32> ev;   // indices of its event waits and signals in recs
     size_t at = 0;
     RenderState r{};  // its render targets while another stream runs
 };
+
+// feasible() looks only at the event records (Stream::ev) instead of walking every record: HOST_NVN_FAST=0 off.
+bool events_only() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
 std::list<Stream> g_streams;       // renderer thread; oldest first
 Stream* g_active = nullptr;
 std::atomic<u64> g_hold_first{0};  // the fence of the oldest held submission (0: none)
@@ -877,6 +890,30 @@ template <class At> bool blocked_by_older(const Stream& s, At at_of) {
     return false;
 }
 
+// advance() for feasible(): only the event records, from `at` (on_signal for each signal); at ends at the first unmet wait or
+// at the stream's end, as advance() would.
+template <class Now, class Sig> bool advance_events(const Stream& s, size_t& at, Now now, Sig on_signal) {
+    const size_t from = at;
+    for (auto it = std::lower_bound(s.ev.begin(), s.ev.end(), static_cast<u32>(at)); it != s.ev.end(); ++it) {
+        const uint8_t* p = s.recs[*it];
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.op == OP_WAIT_EVENT) {
+            volatile uint32_t* val;
+            uint32_t m, v;
+            memcpy(&val, p + 8, 8), memcpy(&m, p + 16, 4), memcpy(&v, p + 20, 4);
+            if (val && !wait_met(now(val), m, v)) {
+                at = *it;
+                return at != from;
+            }
+        } else {
+            on_signal(p, h);
+        }
+    }
+    at = s.recs.size();
+    return at != from;
+}
+
 // Whether the streams can all reach their ends with the events they signal themselves. Runs nothing.
 bool feasible() {
     std::unordered_map<const volatile uint32_t*, u32> vals;
@@ -891,13 +928,14 @@ bool feasible() {
         moved = false;
         for (const Stream& s : g_streams) {
             if (blocked_by_older(s, at_of)) continue;
-            moved |= advance(s, ats[&s], now, [&](const uint8_t* p, const op_hdr& h) {
+            const auto signal = [&](const uint8_t* p, const op_hdr& h) {
                 if (h.op != OP_SIGNAL_EVENT) return;
                 volatile uint32_t* val;
                 uint32_t m, v;
                 memcpy(&val, p + 8, 8), memcpy(&m, p + 16, 4), memcpy(&v, p + 20, 4);
                 if (val) vals[val] = m == NVN_EVENT_SIGNAL_MODE_ADD ? now(val) + v : v;
-            });
+            };
+            moved |= events_only() ? advance_events(s, ats[&s], now, signal) : advance(s, ats[&s], now, signal);
         }
     }
     for (const Stream& s : g_streams)
@@ -967,7 +1005,7 @@ void vk_rp_submit(u64 queue, std::vector<const uint8_t*> handles, u64 fence) {
     s.queue = queue, s.origin = g_queue_origin_ll.load(), s.fence = fence;
     static size_t typical = 0;
     s.recs.reserve(typical);
-    for (const uint8_t* h : handles) collect(h, s.recs);
+    for (const uint8_t* h : handles) collect(h, s.recs, 0, &s.ev);
     typical = std::max(typical, s.recs.size());
     if (!feasible() && g_streams.size() < MaxHeld) {
         if (!g_hold_first.load()) g_hold_first.store(g_streams.front().fence);

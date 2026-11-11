@@ -37,5 +37,7 @@ void pool_note(u64 addr, u64 bytes, int kind);
 bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use = 0);
 // Steps whenever what pool_find gives for some address may change (pools made or gone, device copies made or dropped).
 u64 pool_gen();
+// bind_epoch_bump calls so far by cause: device copy made, dropped, pool added, gone (statistics).
+void pool_bumps(u64 out[4]);
 
 }  // namespace nvk

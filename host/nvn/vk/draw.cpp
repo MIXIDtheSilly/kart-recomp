@@ -143,7 +143,96 @@ VkCommandBuffer pre_cb();
 // sets are built in a generation, with its own descriptor pools and memory for their constant blocks, and found again
 // under their key in later submissions (keep_find). A full generation is retired: reset once the last submission that
 // may use it is done. HOST_NVN_NO_SET_KEEP=1: off.
+
+// A kept set: what its bindings resolved to (resolve) in its generation's res, and its touch list there: what resolving
+// them did besides (keep_find), valid while g_bind_epoch and the view cache are as when it was last found the same.
+struct KeptSet {
+    static constexpr u32 NoTouch = ~0u;
+    VkDescriptorSet set;
+    u32 at, n;
+    u32 touch_at = 0, touch_n = NoTouch;
+    u64 ok_epoch = 0, ok_views = 0;
+};
+struct Touch {   // a guest buffer (img null: refreshing its pool's copy, noting a GPU write) or an image whose last use is stamped
+    u64 addr = 0, size = 0;
+    Image* img = nullptr;
+    bool written = false;
+};
+// A generation's kept sets by key (stage_key; never 0): open addressing, emptied by stepping `stamp` (an unordered_map's
+// lookup missed the cache twice, for each of the ~2,400 kept sets a frame finds again).
+struct KeepTable {
+    struct Slot {
+        u64 key = 0;
+        u32 stamp = 0, idx = 0;
+    };
+    static constexpr size_t N = 1 << 18;   // (twice GenSets)
+    std::vector<Slot> slots;
+    std::vector<KeptSet> sets;
+    u32 stamp = 1;
+    KeptSet* find(u64 key) {
+        if (slots.empty()) return nullptr;
+        for (size_t i = key & (N - 1);; i = (i + 1) & (N - 1)) {
+            const Slot& e = slots[i];
+            if (e.stamp != stamp) return nullptr;
+            if (e.key == key) return &sets[e.idx];
+        }
+    }
+    void put(u64 key, const KeptSet& k) {
+        if (slots.empty()) slots.resize(N);
+        size_t i = key & (N - 1);
+        for (; slots[i].stamp == stamp; i = (i + 1) & (N - 1))
+            if (slots[i].key == key) {
+                sets[slots[i].idx] = k;
+                return;
+            }
+        if (sets.size() >= N / 2) return;   // (full: not kept)
+        slots[i] = {key, stamp, static_cast<u32>(sets.size())};
+        sets.push_back(k);
+    }
+    void clear() {
+        sets.clear();
+        if (++stamp == 0) std::fill(slots.begin(), slots.end(), Slot{}), stamp = 1;
+    }
+    size_t size() const { return sets.size(); }
+};
+// A generation's constant blocks by what they are made from (constants): open addressing as KeepTable; full, a block is
+// not shared.
+struct ConstTable {
+    struct Slot {
+        u64 key = 0;
+        u32 stamp = 0;
+        VkDescriptorBufferInfo info{};
+    };
+    static constexpr size_t N = 1 << 17;
+    std::vector<Slot> slots;
+    u32 stamp = 1;
+    size_t used = 0;
+    const VkDescriptorBufferInfo* find(u64 key) const {
+        if (slots.empty()) return nullptr;
+        for (size_t i = key & (N - 1);; i = (i + 1) & (N - 1)) {
+            const Slot& e = slots[i];
+            if (e.stamp != stamp) return nullptr;
+            if (e.key == key) return &e.info;
+        }
+    }
+    void put(u64 key, const VkDescriptorBufferInfo& info) {
+        if (used >= N / 2) return;
+        if (slots.empty()) slots.resize(N);
+        size_t i = key & (N - 1);
+        while (slots[i].stamp == stamp) i = (i + 1) & (N - 1);
+        slots[i] = {key, stamp, info};
+        used++;
+    }
+    void clear() {
+        used = 0;
+        if (++stamp == 0) std::fill(slots.begin(), slots.end(), Slot{}), stamp = 1;
+    }
+    size_t size() const { return used; }
+};
 struct SetGen {
+    KeepTable keep;   // its sets by key (stage_key)
+    std::vector<u64> res;
+    std::vector<Touch> touch;
     std::vector<VkDescriptorPool> pools;
     size_t pool_cur = 0;
     std::vector<Chunk> chunks;
@@ -151,7 +240,7 @@ struct SetGen {
     u64 sets = 0;
     u64 last_value = 0;   // the last submission that may use its sets
     std::vector<std::function<void()>> grave;   // images and views destroyed while it was current (defer_past_kept)
-    std::unordered_map<u64, VkDescriptorBufferInfo> consts;   // its constant blocks by what they are made from
+    ConstTable consts;   // its constant blocks by what they are made from
     u64 const_hits = 0;
 };
 // (a race fills 32K sets in ~0.7 s, and each new generation starts by making a frame's ~3,000 sets again; the shared
@@ -247,21 +336,22 @@ void kept_sub_begin() {
     g_kept_cur = 0;
 }
 
-// A block of `size` bytes that fill(u8*) writes, the same whenever the `from_n` bytes at `from` and `kind` are.
+// A block of `size` bytes that fill(u8*) writes, the same whenever the `from_n` bytes at `from` and `kind` are. pre (if
+// not 0): a hash standing for those bytes, already made (the fast path's table hashes).
 template <class F>
-VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDeviceSize size, F&& fill) {
+VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDeviceSize size, F&& fill, u64 pre = 0) {
     u64 key = 0;
     if (g_const_gen) {
         // (a generation's sets share their blocks: most are the same for many sets, the handle and support blocks)
-        key = Common::CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
-        if (const auto it = g_const_gen->consts.find(key); it != g_const_gen->consts.end()) {
+        key = (pre ? pre : Common::CityHash64(static_cast<const char*>(from), from_n)) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
+        if (const VkDescriptorBufferInfo* hit = g_const_gen->consts.find(key)) {
             g_const_gen->const_hits++;
-            return it->second;
+            return *hit;
         }
         const Slice sl = scratch_in(g_const_gen->chunks, g_const_gen->cur, size);
         fill(sl.ptr);
         const VkDescriptorBufferInfo r{sl.buf, sl.off, size};
-        g_const_gen->consts.emplace(key, r);
+        g_const_gen->consts.put(key, r);
         return r;
     }
     if (g_kept_on) {
@@ -337,6 +427,10 @@ struct TexEntry {
 };
 std::mutex g_tab_mu;
 std::vector<TexEntry> g_tex;
+// Per texture handle its TexEntry::gen | valid << 63, packed (stage_key and texture_view read only this: a TexEntry is
+// ~250 bytes, and looking a handle up there missed the cache for every texture binding).
+std::vector<u64> g_tex_gen;
+constexpr u64 TexValid = 1ull << 63;
 std::vector<std::pair<bool, samp_par>> g_samp;
 
 std::unordered_map<std::string, VkSampler> g_samplers;
@@ -425,13 +519,26 @@ struct State {
     u64 v_dyn;          // all set_dynamic reads (blend .. vp_sw)
     u64 v_vtx;          // va, vs, vb (set_vertex_input)
     u64 v_st[SH_N];     // a stage's ubo, ssbo, tex, samp and img tables (stage_key)
+    u64 v_ubo[SH_N], v_ssbo[SH_N], v_tex[SH_N];   // the same per table (tex: tex, samp and img)
+    u64 v_ubo_slot[SH_N][18], v_tex_slot[SH_N][256], v_img_slot[SH_N][8];   // and per slot (deps_version)
     u64 v_push[2];      // push constants (graphics, compute)
+    // Hashes of the large tables stage_key covers whole, made again only when they change (stage_digests).
+    struct Digests {
+        u64 tex_v = 0, tex = 0, ssbo_v = 0, ssbo = 0, ubo_v = 0, ubo = 0;
+    };
+    mutable Digests dig[SH_N];
+    mutable u64 push_dig_v[2] = {}, push_dig[2] = {};
     State() {
         for (int i = 0; i < 8; i++)
             blend[i] = nvn::blend_st{static_cast<u64>(i), NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE,
                                      NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
         v_dyn = ++g_ver, v_vtx = ++g_ver;
-        for (u64& v : v_st) v = ++g_ver;
+        for (int i = 0; i < SH_N; i++) {
+            v_st[i] = v_ubo[i] = v_ssbo[i] = v_tex[i] = ++g_ver;
+            std::fill(std::begin(v_ubo_slot[i]), std::end(v_ubo_slot[i]), v_st[i]);
+            std::fill(std::begin(v_tex_slot[i]), std::end(v_tex_slot[i]), v_st[i]);
+            std::fill(std::begin(v_img_slot[i]), std::end(v_img_slot[i]), v_st[i]);
+        }
         for (u64& v : v_push) v = ++g_ver;
     }
 };
@@ -472,11 +579,26 @@ struct Prog {
 std::mutex g_prog_mu;                   // programs are released on game threads
 std::unordered_map<u64, Prog> g_progs;  // by prog_t::serial
 
+// The programs bound last, by serial, without the lock and map (3.6% of the renderer thread, a BindProgram record per
+// draw or two). Only with the renderer on its own thread, where releases arrive on that thread too.
+struct ProgHit {
+    u64 serial = 0;
+    Prog p;
+};
+std::array<ProgHit, 2048> g_prog_hits;
+ProgHit& prog_hit(u64 serial) { return g_prog_hits[(serial * 0x9E3779B97F4A7C15ull) >> 53]; }
+
 Prog prog_of(const prog_t* p) {
+    const bool hits = nvn::async_replay() && p->serial;
+    if (hits)
+        if (const ProgHit& h = prog_hit(p->serial); h.serial == p->serial) return h.p;
     {
         std::scoped_lock lk{g_prog_mu};
         auto it = g_progs.find(p->serial);
-        if (it != g_progs.end()) return it->second;
+        if (it != g_progs.end()) {
+            if (hits) prog_hit(p->serial) = {p->serial, it->second};
+            return it->second;
+        }
     }
     Prog r;
     for (u32 i = 0; i < p->nstage && i < 6; i++) {
@@ -494,6 +616,7 @@ Prog prog_of(const prog_t* p) {
     }
     std::scoped_lock lk{g_prog_mu};
     g_progs[p->serial] = r;
+    if (hits) prog_hit(p->serial) = {p->serial, r};
     return r;
 }
 
@@ -966,27 +1089,83 @@ bool ensure_content(Image* img, const tex_t* t, bool wait) {
 // ensure_content would do is nothing) stays for later submissions too ("sticky"): its image is freed only past the
 // generation (defer_past_kept), and the cache is cleared when one retires (retire_gen). A CPU write to the texture bumps
 // g_bind_epoch, so it is uploaded again. HOST_NVN_VIEW_STICKY=0: views for one submission only.
+// Steps when virtual pool pages are mapped again (draw_sparse_changed): what sparse images show may differ. Before the fast
+// path that stepped g_bind_epoch, some 600 times a second while the terrain streams in, and every step made every set and
+// view be resolved again.
+std::atomic<u64> g_sparse_epoch{0};
 struct ViewHit {
-    u64 gen = 0, epoch = 0, sub = 0;
+    u64 gen = 0, epoch = 0, sub = 0, sparse = 0;
     VkImageView view = VK_NULL_HANDLE;
     Image* img = nullptr;
     bool sticky = false;
 };
-std::unordered_map<u64, ViewHit> g_view_cache;   // (renderer thread)
+// (renderer thread) Open addressing by ck, emptied by stepping `stamp`; at half full it starts again empty.
+struct ViewCache {
+    struct Slot {
+        u64 ck = 0;
+        u32 stamp = 0;
+        ViewHit h;
+    };
+    static constexpr size_t N = 1 << 16;
+    std::vector<Slot> slots = std::vector<Slot>(N);
+    u32 stamp = 1;
+    size_t used = 0;
+    ViewHit* find(u64 ck) {
+        for (size_t i = (ck * 0x9E3779B97F4A7C15ull) >> 48;; i = (i + 1) & (N - 1)) {
+            Slot& e = slots[i];
+            if (e.stamp != stamp) return nullptr;
+            if (e.ck == ck) return &e.h;
+        }
+    }
+    void clear() {
+        used = 0;
+        if (++stamp == 0) std::fill(slots.begin(), slots.end(), Slot{}), stamp = 1;
+    }
+    void put(u64 ck, const ViewHit& h);
+} g_view_cache;
+u64 g_view_clears = 0;
+void view_cache_clear() {
+    g_view_cache.clear();
+    g_view_clears++;
+}
+void ViewCache::put(u64 ck, const ViewHit& h) {
+    size_t i = (ck * 0x9E3779B97F4A7C15ull) >> 48;
+    for (; slots[i].stamp == stamp; i = (i + 1) & (N - 1))
+        if (slots[i].ck == ck) {
+            slots[i].h = h;
+            return;
+        }
+    if (used >= N / 2) {   // (full: emptied; a cache, but the kept sets' touch lists depend on it: view_cache_clear)
+        view_cache_clear();
+        i = (ck * 0x9E3779B97F4A7C15ull) >> 48;
+    }
+    slots[i] = {ck, stamp, h};
+    used++;
+}
 u64 g_view_sub = 0;   // submissions begun (draw_sub_begin)
 u64 g_view_sticky_hits = 0;
 bool set_keep_on();
 
-VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
+// img_out, sticky_out (if not null): the image viewed, and whether the view is kept for later submissions.
+VkImageView texture_view(u32 id, VkImageViewType want, bool storage, Image** img_out = nullptr, bool* sticky_out = nullptr) {
+    Image* no_img;
+    bool no_sticky;
+    Image*& img_o = img_out ? *img_out : no_img;
+    bool& sticky_o = sticky_out ? *sticky_out : no_sticky;
+    img_o = nullptr, sticky_o = false;
     const u64 epoch = g_bind_epoch.load(std::memory_order_relaxed);
     const u64 ck = static_cast<u64>(id) | static_cast<u64>(want) << 32 | static_cast<u64>(storage) << 40;
     TexEntry e;
     {
         TabLock lk;
-        if (id >= g_tex.size() || !g_tex[id].valid) return VK_NULL_HANDLE;
-        if (auto it = g_view_cache.find(ck); it != g_view_cache.end() && it->second.gen == g_tex[id].gen && it->second.epoch == epoch) {
-            ViewHit& h = it->second;
-            if (h.sub == g_view_sub) return h.view;
+        if (id >= g_tex_gen.size() || !(g_tex_gen[id] & TexValid)) {
+            sticky_o = true;   // (nothing to do again while its registration stays)
+            return VK_NULL_HANDLE;
+        }
+        if (ViewHit* hp = g_view_cache.find(ck); hp && hp->gen == (g_tex_gen[id] & ~TexValid) && hp->epoch == epoch) {
+            ViewHit& h = *hp;
+            img_o = h.img, sticky_o = h.sticky;
+            if (h.sub == g_view_sub && (h.sticky || h.sparse == g_sparse_epoch)) return h.view;
             if (h.sticky) {
                 h.img->last_use = nvn::g_frame.load(std::memory_order_relaxed);
                 h.sub = g_view_sub;
@@ -1021,7 +1200,8 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
             return !(v && *v == '0');
         }();
         const bool sticky = sticky_on && set_keep_on() && !img->sparse && !img->pending && (img->gpu_written || img->uploaded);
-        g_view_cache[ck] = {e.gen, epoch, g_view_sub, v, img, sticky};
+        g_view_cache.put(ck, {e.gen, epoch, g_view_sub, g_sparse_epoch, v, img, sticky});
+        img_o = img, sticky_o = sticky;
     }
     return v;
 }
@@ -1051,8 +1231,11 @@ struct DrawArgs {
 // handles to views, addresses to buffers, vkUpdateDescriptorSets) cost a fifth of the submitting thread.
 // g_bind_epoch changes whenever what a handle or address resolves to may have (textures.h). HOST_NVN_NO_SET_CACHE=1: off.
 // Open addressing, emptied by stepping g_set_gen at draw_sub_begin: a key at most once (bind_stage looks before it keeps).
+// A set with views not kept across submissions (sparse images, uploads pending) is found only while g_sparse_epoch is as
+// when it was kept (SetSlot::sparse: that + 1; 0 for the others): resolving those again does the work a remapped sparse
+// image needs (sparse_image_use).
 struct SetSlot {
-    u64 key = 0, gen = 0;
+    u64 key = 0, gen = 0, sparse = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
 };
 constexpr size_t SetSlots = 1 << 15;
@@ -1062,98 +1245,135 @@ size_t g_set_kept = 0;
 u64 g_set_hits = 0, g_set_made = 0;
 u64 g_binds_total = 0, g_made_total = 0;   // never reset (draw_counts)
 
-VkDescriptorSet set_find(u64 key) {
+VkDescriptorSet set_find(u64 key, bool* fixed = nullptr) {
     for (size_t i = key & (SetSlots - 1);; i = (i + 1) & (SetSlots - 1)) {
         const SetSlot& e = g_set_cache[i];
         if (e.gen != g_set_gen) return VK_NULL_HANDLE;
-        if (e.key == key) return e.set;
+        if (e.key == key) {
+            if (e.sparse && e.sparse != g_sparse_epoch + 1) return VK_NULL_HANDLE;
+            if (fixed) *fixed = !e.sparse;
+            return e.set;
+        }
     }
 }
 
-void set_keep(u64 key, VkDescriptorSet set) {
+// fixed: the set's views are all kept across submissions (else it is found only while g_sparse_epoch stays).
+void set_keep(u64 key, VkDescriptorSet set, bool fixed = true) {
+    const u64 sparse = fixed ? 0 : g_sparse_epoch + 1;
+    size_t i = key & (SetSlots - 1);
+    for (; g_set_cache[i].gen == g_set_gen; i = (i + 1) & (SetSlots - 1))
+        if (g_set_cache[i].key == key) {   // (found out of date: kept again)
+            g_set_cache[i].set = set, g_set_cache[i].sparse = sparse;
+            return;
+        }
     if (g_set_kept >= SetSlots / 2) return;
     g_set_kept++;
-    size_t i = key & (SetSlots - 1);
-    while (g_set_cache[i].gen == g_set_gen) i = (i + 1) & (SetSlots - 1);
-    g_set_cache[i] = {key, g_set_gen, set};
+    g_set_cache[i] = {key, g_set_gen, sparse, set};
 }
+
+bool fast_base();
+bool fast_verify();
+void fast_mismatch(const char* fmt, ...);
 
 // What binding b of stage st resolves to in guest memory and textures, into out: a guest buffer range (3 values) or a
 // texture view (1); 0 values for the bindings made only from what stage_key holds (constant blocks, default sampler).
 // bind_stage fills the set from it; a kept set is used again only while it is the same (keep_find).
-u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3]) {
+// t (if not null): what resolving it did besides (Touch: its guest buffer, or the image viewed); *fixed is cleared when
+// resolving it again would do more than that (a view not kept across submissions: uploads to finish, sparse tiles).
+u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nullptr, bool* fixed = nullptr) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     const bool uniform = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    if (t) *t = Touch{};
     if (uniform || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+        u64 addr = 0, size = 0;
+        bool written = false;
         switch (b.kind) {
         case BKind::Ubo:
         case BKind::UboPtr:
-            if (b.reg < 18) bi = guest_buffer(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size, uniform);
+            if (b.reg < 18) addr = s.ubo[st][b.reg].addr, size = s.ubo[st][b.reg].size;
             break;
         case BKind::Ssbo:
-            if (b.reg < 16) bi = guest_buffer(s.ssbo[st][b.reg].addr, s.ssbo[st][b.reg].size, uniform, b.aux != 0);
+            if (b.reg < 16) addr = s.ssbo[st][b.reg].addr, size = s.ssbo[st][b.reg].size, written = b.aux != 0;
             break;
         case BKind::SsboUbo:
             if (b.reg < 18 && s.ubo[st][b.reg].addr) {
                 u64 rec[2] = {};
                 nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
-                bi = guest_buffer(rec[0], static_cast<u32>(rec[1]), uniform, b.aux != 0);
+                addr = rec[0], size = static_cast<u32>(rec[1]), written = b.aux != 0;
             }
             break;
         default: return 0;
         }
+        bi = guest_buffer(addr, size, uniform, written);
+        if (t && addr && size) *t = {addr, size, nullptr, written};
         out[0] = reinterpret_cast<u64>(bi.buffer), out[1] = bi.offset, out[2] = bi.range;
         return 3;
     }
     if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
         b.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
         VkImageView v = VK_NULL_HANDLE;
+        Image* img = nullptr;
+        bool sticky = true;
         if (b.kind == BKind::Tex && b.reg < 256) {
-            if (const u32 h = s.tex[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), false);
+            if (const u32 h = s.tex[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), false, &img, &sticky);
         } else if (b.kind == BKind::Img && b.reg < 8) {
-            if (const u32 h = s.img[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), true);
+            if (const u32 h = s.img[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), true, &img, &sticky);
         } else {
             return 0;
         }
+        if (t) t->img = img;
+        if (fixed && !sticky) *fixed = false;
         out[0] = reinterpret_cast<u64>(v);
         return 1;
     }
     return 0;
 }
 
-struct KeptSet {
-    VkDescriptorSet set;
-    u32 at, n;   // what its bindings resolved to (resolve), in g_keep_res
-};
-std::unordered_map<u64, KeptSet> g_keep_sets;   // of g_gen
-std::vector<u64> g_keep_res;
-u64 g_keep_hits = 0, g_keep_stale = 0, g_keep_gens = 0;
+u64 g_keep_hits = 0, g_keep_stale = 0, g_keep_gens = 0, g_keep_touched = 0;
 
 bool set_keep_on() {
     static const bool on = !getenv("HOST_NVN_NO_SET_KEEP") && !getenv("HOST_WATCH_SSBO") && !g_kept_on;
     return on;
 }
 
+// Kept sets found again by their touch list (KeptSet), without resolving their bindings: HOST_NVN_FAST_TOUCH=0 off.
+bool touch_on() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST_TOUCH");
+        return fast_base() && !(e && *e == '0');
+    }();
+    return on;
+}
 // Images and views destroyed while g_gen is current: freed (deferred) once it is retired and done (any thread).
 std::mutex g_grave_mu;
 std::vector<std::function<void()>> g_grave;
 u64 g_grave_bytes = 0;
 constexpr u64 GraveBytes = 512ull << 20;   // more retires g_gen early (draw_sub_begin)
 
-// g_gen's sets are no longer found; it is reset once the last submission that may use them is done (draw_sub_begin).
+// The graves so far go with g_gen (freed once it is retired and done).
+void graves_to_gen() {
+    std::scoped_lock lk{g_grave_mu};
+    for (auto& fn : g_grave) g_gen->grave.push_back(std::move(fn));
+    g_grave.clear();
+    g_grave_bytes = 0;
+}
+
+// g's sets are no longer found; it is reset once the last submission that may use them is done (draw_sub_begin).
+void retire_one(SetGen*& g) {
+    if (!g) return;
+    g_gen_retiring.push_back(g);
+    g->keep.clear();
+    g->res.clear();
+    g->touch.clear();
+    g = nullptr;
+}
+
+// g_gen retires, with the graves so far.
 void retire_gen() {
     if (!g_gen) return;
-    {
-        std::scoped_lock lk{g_grave_mu};
-        for (auto& fn : g_grave) g_gen->grave.push_back(std::move(fn));
-        g_grave.clear();
-        g_grave_bytes = 0;
-    }
-    g_gen_retiring.push_back(g_gen);
-    g_gen = nullptr;
-    g_keep_sets.clear();
-    g_keep_res.clear();
-    g_view_cache.clear();   // (its sticky views' images may be freed once this generation is done)
+    graves_to_gen();
+    retire_one(g_gen);
+    view_cache_clear();   // (its sticky views' images may be freed once this generation is done)
 }
 
 // The generation new kept sets go to (a full one is retired first).
@@ -1167,29 +1387,73 @@ SetGen* set_gen() {
     return g_gen;
 }
 
-// The kept set of stage sh under key, when its guest buffers and views resolve as they did (resolving them again also
-// does what this submission needs done for them: refreshing a pool's device copy, noting GPU writes, uploads).
-VkDescriptorSet keep_find(const State& s, const Shader* sh, u64 key) {
-    const auto it = g_keep_sets.find(key);
-    if (it == g_keep_sets.end()) return VK_NULL_HANDLE;
-    const u64* was = g_keep_res.data() + it->second.at;
+// Resolves sh's bindings and compares them with what set k resolved to; true when the same. Collects its touch list into
+// tl (when not null) and clears *fixed for views not kept across submissions.
+bool keep_same(const SetGen& g, const KeptSet& k, const State& s, const Shader* sh, std::vector<Touch>* tl, bool* fixed) {
+    const u64* was = g.res.data() + k.at;
     u32 i = 0;
-    bool same = true;
     for (const Binding& b : sh->bindings) {
         u64 r[3];
-        const u32 n = resolve(s, sh->stage, b, r);
-        if (i + n > it->second.n || !std::equal(r, r + n, was + i)) {
-            same = false;
-            break;
-        }
+        Touch t;
+        const u32 n = resolve(s, sh->stage, b, r, tl ? &t : nullptr, fixed);
+        if (i + n > k.n || !std::equal(r, r + n, was + i)) return false;
+        if (tl && (t.addr || t.img)) tl->push_back(t);
         i += n;
     }
-    if (!same || i != it->second.n) {
+    return i == k.n;
+}
+
+// The kept set of stage sh under key in generation g, when its guest buffers and views resolve as they did (resolving
+// them again also does what this submission needs done for them: refreshing a pool's device copy, noting GPU writes,
+// uploads). Found the same once, and g_bind_epoch and the view cache unchanged since (so every buffer and view would
+// resolve as then), it is used by its touch list: what resolving did besides, without the lookups (touch_on).
+VkDescriptorSet keep_find(SetGen& g, const State& s, const Shader* sh, u64 key, bool* fixed_out) {
+    *fixed_out = true;
+    KeptSet* const kp = g.keep.find(key);
+    if (!kp) return VK_NULL_HANDLE;
+    KeptSet& k = *kp;
+    const u64 epoch = g_bind_epoch.load(std::memory_order_acquire);
+    const bool touch = touch_on();
+    if (touch && k.touch_n != KeptSet::NoTouch && k.ok_epoch == epoch && k.ok_views == g_view_clears) {
+        const Touch* t = g.touch.data() + k.touch_at;
+        for (u32 i = 0; i < k.touch_n; i++)
+            if (!t[i].img && t[i].written) pool_gpu_write(t[i].addr, t[i].size);
+        if (g_bind_epoch.load(std::memory_order_acquire) == epoch) {   // (a write may have dropped a pool's copy)
+            const u64 frame = nvn::g_frame.load(std::memory_order_relaxed);
+            for (u32 i = 0; i < k.touch_n; i++) {
+                if (t[i].img) {
+                    t[i].img->last_use = frame;
+                } else {
+                    BufferRef r;
+                    pool_find(t[i].addr, 1, r, t[i].size);
+                }
+            }
+            g_keep_hits++, g_keep_touched++;
+            if (fast_verify() && !keep_same(g, k, s, sh, nullptr, nullptr))
+                fast_mismatch("kept set of %s (stage %u) by its touch list: its bindings resolve otherwise now", sh->name, static_cast<u32>(sh->stage));
+            return k.set;
+        }
+    }
+    thread_local std::vector<Touch> tl;
+    tl.clear();
+    bool fixed = true;
+    const bool want = touch && k.touch_n == KeptSet::NoTouch;
+    if (!keep_same(g, k, s, sh, want ? &tl : nullptr, &fixed)) {
         g_keep_stale++;
         return VK_NULL_HANDLE;
     }
+    *fixed_out = fixed;
+    if (touch && fixed) {
+        if (want) {
+            k.touch_at = static_cast<u32>(g.touch.size()), k.touch_n = static_cast<u32>(tl.size());
+            g.touch.insert(g.touch.end(), tl.begin(), tl.end());
+        }
+        k.ok_epoch = epoch, k.ok_views = g_view_clears;
+    } else {
+        k.ok_epoch = 0;
+    }
     g_keep_hits++;
-    return it->second.set;
+    return k.set;
 }
 
 // HOST_NVN_SET_MISS_STATS=1: on each descriptor set made, which parts of its key differ from the stage's previous key
@@ -1206,6 +1470,33 @@ u64 g_miss_group[KG_N], g_miss_first, g_miss_earlier_sub, g_subs;
 std::unordered_map<const Shader*, std::array<u64, KG_N>> g_miss_last;
 std::unordered_map<u64, u64> g_miss_seen;   // key -> g_set_gen it was made in
 
+// The large tables' hashes for stage_key: the whole handle tables (c2), the storage buffer table (c0) and a compute
+// stage's first 16 uniform slots, push constants. Hashing them for every stage bind was a third of stage_key.
+u64 tex_digest(const State& s, u32 st) {
+    State::Digests& d = s.dig[st];
+    if (d.tex_v != s.v_tex[st]) {
+        d.tex_v = s.v_tex[st];
+        d.tex = Common::CityHash64WithSeed(reinterpret_cast<const char*>(s.samp[st]), sizeof s.samp[st],
+                                           Common::CityHash64WithSeed(reinterpret_cast<const char*>(s.img[st]), sizeof s.img[st],
+                                                                      Common::CityHash64(reinterpret_cast<const char*>(s.tex[st]), sizeof s.tex[st])));
+    }
+    return d.tex;
+}
+u64 ssbo_digest(const State& s, u32 st) {
+    State::Digests& d = s.dig[st];
+    if (d.ssbo_v != s.v_ssbo[st]) d.ssbo_v = s.v_ssbo[st], d.ssbo = Common::CityHash64(reinterpret_cast<const char*>(s.ssbo[st]), sizeof s.ssbo[st]);
+    return d.ssbo;
+}
+u64 ubo16_digest(const State& s, u32 st) {
+    State::Digests& d = s.dig[st];
+    if (d.ubo_v != s.v_ubo[st]) d.ubo_v = s.v_ubo[st], d.ubo = Common::CityHash64(reinterpret_cast<const char*>(s.ubo[st]), sizeof(BufB) * 16);
+    return d.ubo;
+}
+u64 push_digest(const State& s, int i) {
+    if (s.push_dig_v[i] != s.v_push[i]) s.push_dig_v[i] = s.v_push[i], s.push_dig[i] = Common::CityHash64(reinterpret_cast<const char*>(s.push[i]), NVN_PUSH_SIZE);
+    return s.push_dig[i];
+}
+
 // What stage sh's descriptor set is made from in state s; 0 = not to be cached.
 u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
     static const bool off = getenv("HOST_NVN_NO_SET_CACHE") != nullptr;
@@ -1214,6 +1505,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
     thread_local std::vector<u8> k(1 << 14);
     size_t used = 0;
     const bool groups = set_miss_stats_on();
+    const bool dig = fast_base();   // (the tables' hashes in place of the tables)
     int grp = KG_HEAD;
     if (groups)
         for (u64& g : g_key_groups) g = 0;
@@ -1236,13 +1528,44 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
             if (b.reg < 18) put(&s.ubo[st][b.reg], sizeof(BufB));
             break;
         case BKind::Drv0:
-            grp = KG_DRV0_SSBO, put(s.ssbo[st], sizeof s.ssbo[st]);
+            grp = KG_DRV0_SSBO;
+            if (dig) {
+                const u64 h = ssbo_digest(s, st);
+                put(&h, 8);
+            } else {
+                put(s.ssbo[st], sizeof s.ssbo[st]);
+            }
             grp = KG_DRV0_DRAW;
-            if (st == SH_CS) put(s.ubo[st], sizeof(BufB) * 16), put(da.dispatch, 12);
-            else put(&da.base_vertex, 4), put(&da.base_instance, 4);
+            if (st == SH_CS) {
+                if (dig) {
+                    const u64 h = ubo16_digest(s, st);
+                    put(&h, 8);
+                } else {
+                    put(s.ubo[st], sizeof(BufB) * 16);
+                }
+                put(da.dispatch, 12);
+            } else {
+                put(&da.base_vertex, 4), put(&da.base_instance, 4);
+            }
             break;
-        case BKind::Drv2: grp = KG_DRV2, put(s.tex[st], sizeof s.tex[st]), put(s.img[st], sizeof s.img[st]), put(s.samp[st], sizeof s.samp[st]); break;
-        case BKind::Push: grp = KG_PUSH, put(s.push[st == SH_CS ? 1 : 0], NVN_PUSH_SIZE); break;
+        case BKind::Drv2:
+            grp = KG_DRV2;
+            if (dig) {
+                const u64 h = tex_digest(s, st);
+                put(&h, 8);
+            } else {
+                put(s.tex[st], sizeof s.tex[st]), put(s.img[st], sizeof s.img[st]), put(s.samp[st], sizeof s.samp[st]);
+            }
+            break;
+        case BKind::Push:
+            grp = KG_PUSH;
+            if (dig) {
+                const u64 h = push_digest(s, st == SH_CS ? 1 : 0);
+                put(&h, 8);
+            } else {
+                put(s.push[st == SH_CS ? 1 : 0], NVN_PUSH_SIZE);
+            }
+            break;
         case BKind::Ssbo:
             grp = KG_SSBO;
             if (b.reg < 16) put(&s.ssbo[st][b.reg], sizeof(BufB));
@@ -1264,7 +1587,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
             u64 g[3] = {h, 0, 0};
             const u32 tid = h & 0xfffff, sid = h >> 20;
             if (!tab) tab.emplace();
-            if (tid < g_tex.size()) g[1] = g_tex[tid].gen;
+            if (tid < g_tex_gen.size()) g[1] = g_tex_gen[tid];
             if (b.kind == BKind::Tex && sid < g_samp_gen.size()) g[2] = g_samp_gen[sid];
             put(g, sizeof g);
             break;
@@ -1317,12 +1640,20 @@ void note_ubo(const Shader* sh, u32 reg, u64 addr, u64 size, char kind = 'c') {
     }
 }
 
+// The submission's cache's key for a set of key `key` (0: none) under bind epoch `epoch`.
+u64 sub_key_of(u64 key, u64 epoch) {
+    if (!key) return 0;
+    const u64 k = key ^ (epoch + 1) * 0x9E3779B97F4A7C15ull;
+    return k ? k : 1;
+}
+
 // What bind_stage bound: the set, its key, and whether the same binding may be skipped while its key would stay the same
 // (the fast path: a set the submission's cache would give again).
 struct BindOut {
     u64 key = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     bool reusable = false;
+    bool fixed = true;   // no view of it changes with g_sparse_epoch
 };
 
 bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da, BindOut* out = nullptr) {
@@ -1330,24 +1661,26 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     const u32 st = sh->stage;
     const u64 key = stage_key(s, sh, da);   // (for the kept sets)
     // for the submission's cache, whose sets are used without resolving their bindings again
-    u64 sub_key = key ? key ^ (g_bind_epoch.load(std::memory_order_relaxed) + 1) * 0x9E3779B97F4A7C15ull : 0;
-    if (key && !sub_key) sub_key = 1;
+    const u64 sub_key = sub_key_of(key, g_bind_epoch.load(std::memory_order_relaxed));
     const bool keep = key && set_keep_on();
     g_binds_total++;
     if (key && !(dump_active() && !dump_brief())) {   // (a dump notes every binding of every draw)
-        if (const VkDescriptorSet kept = set_find(sub_key)) {
+        bool fixed = true;
+        if (const VkDescriptorSet kept = set_find(sub_key, &fixed)) {
             g_set_hits++;
             vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
-            if (out) *out = {key, kept, true};
+            if (out) *out = {key, kept, true, fixed};
             return true;
         }
-        if (keep)
-            if (const VkDescriptorSet kept = keep_find(s, sh, key)) {
-                set_keep(sub_key, kept);
+        if (keep) {
+            const VkDescriptorSet kept = g_gen ? keep_find(*g_gen, s, sh, key, &fixed) : VK_NULL_HANDLE;
+            if (kept) {
+                set_keep(sub_key, kept, fixed);
                 vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
-                if (out) *out = {key, kept, true};
+                if (out) *out = {key, kept, true, fixed};
                 return true;
             }
+        }
     }
     g_set_made++, g_made_total++;
     if (key && set_miss_stats_on()) {
@@ -1364,11 +1697,14 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     }
     g_used_placeholder = false;
     g_set_volatile = false;
+    bool made_fixed = true;
     SetGen* const gen = keep ? set_gen() : nullptr;
     VkDescriptorSet set = gen ? alloc_set_in(gen->pools, gen->pool_cur, sh->layout) : alloc_set(sh->layout);
     if (gen) gen->sets++;
     g_const_gen = gen;
-    const size_t res_at = g_keep_res.size();
+    thread_local std::vector<u64> res_scratch;
+    std::vector<u64>& res_v = gen ? gen->res : res_scratch;
+    const size_t res_at = res_v.size();
     u64 res[3];
     size_t nimg = 0, nbuf = 0;
     for (const Binding& b : sh->bindings) (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? nbuf : nimg) += b.count;
@@ -1410,8 +1746,8 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
             case BKind::UboPtr:
             case BKind::Ssbo:
             case BKind::SsboUbo:
-                resolve(s, st, b, res);
-                g_keep_res.insert(g_keep_res.end(), res, res + 3);
+                resolve(s, st, b, res, nullptr, &made_fixed);
+                res_v.insert(res_v.end(), res, res + 3);
                 bi = {reinterpret_cast<VkBuffer>(res[0]), res[1], res[2]};
                 if (b.kind != BKind::Ubo) break;
                 if (b.reg < 18 && dump_buffers()) note_ubo(sh, b.reg, s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size);
@@ -1419,8 +1755,9 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                     watch::add(s.ubo[st][b.reg].addr, s.ubo[st][b.reg].size), watch::bound(s.ubo[st][b.reg].addr);
                 break;
             case BKind::C1:
-                if (!sh->c1.empty())
-                    bi = constants(2, sh->c1.data(), sh->c1.size(), sh->c1.size(), [&](u8* p) { std::memcpy(p, sh->c1.data(), sh->c1.size()); });
+                if (!sh->c1.empty())   // (a shader's own constants never change: known by the shader)
+                    bi = constants(2, sh->c1.data(), sh->c1.size(), sh->c1.size(), [&](u8* p) { std::memcpy(p, sh->c1.data(), sh->c1.size()); },
+                                   fast_base() ? (reinterpret_cast<u64>(sh) * 0xC2B2AE3D27D4EB4Full) | 1 : 0);
                 break;
             case BKind::Drv0:
                 if (!have_c0) {
@@ -1438,6 +1775,14 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                     add(&st, 4), add(s.ssbo[st], sizeof s.ssbo[st]);
                     if (st == SH_CS) add(s.ubo[st], sizeof(BufB) * 16), add(da.dispatch, 12);
                     else add(&da.base_vertex, 4), add(&da.base_instance, 4);
+                    u64 pre = 0;
+                    if (fast_base()) {
+                        const u64 parts[5] = {st, ssbo_digest(s, st), st == SH_CS ? ubo16_digest(s, st) : 0,
+                                              st == SH_CS ? (static_cast<u64>(da.dispatch[0]) | static_cast<u64>(da.dispatch[1]) << 32)
+                                                          : (static_cast<u64>(static_cast<u32>(da.base_vertex)) | static_cast<u64>(static_cast<u32>(da.base_instance)) << 32),
+                                              st == SH_CS ? da.dispatch[2] : 0};
+                        pre = Common::CityHash64(reinterpret_cast<const char*>(parts), sizeof parts) | 1;
+                    }
                     c0 = constants(3, from, fn, C0Size, [&](u8* c) {
                         std::memset(c, 0, C0Size);
                         auto put = [&](u32 off, u64 addr, u64 size) {
@@ -1456,7 +1801,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                             const float point = 64.0f;
                             std::memcpy(c + 0x610, &point, 4);
                         }
-                    });
+                    }, pre);
                     have_c0 = true;
                 }
                 bi = c0;
@@ -1476,14 +1821,15 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                             const u32 h = s.samp[st][i] << 20;
                             std::memcpy(c + 0x568 + 8 * i, &h, 4);
                         }
-                    });
+                    }, fast_base() ? tex_digest(s, st) | 1 : 0);   // (the hash of the whole tables: more than the block is made from)
                     have_c2 = true;
                 }
                 bi = c2;
                 break;
             case BKind::Push: {
                 const u8* push = s.push[st == SH_CS ? 1 : 0];
-                bi = constants(5, push, NVN_PUSH_SIZE, NVN_PUSH_SIZE, [&](u8* p) { std::memcpy(p, push, NVN_PUSH_SIZE); });
+                bi = constants(5, push, NVN_PUSH_SIZE, NVN_PUSH_SIZE, [&](u8* p) { std::memcpy(p, push, NVN_PUSH_SIZE); },
+                               fast_base() ? push_digest(s, st == SH_CS ? 1 : 0) | 1 : 0);
                 break;
             }
             default: break;
@@ -1497,8 +1843,8 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
             if (b.kind == BKind::Tex && b.reg < 256) {
                 const u32 h = s.tex[st][b.reg];
                 const u32 tid = h & 0xfffff, sid = h >> 20;
-                resolve(s, st, b, res);
-                g_keep_res.push_back(res[0]);
+                resolve(s, st, b, res, nullptr, &made_fixed);
+                res_v.push_back(res[0]);
                 if (h) {
                     ii.imageView = reinterpret_cast<VkImageView>(res[0]);
                     ii.sampler = sampler_for(sid);
@@ -1521,8 +1867,8 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                               e.valid && !im ? " NO IMAGE" : "", fh, (void*)ii.imageView);
                 }
             } else if (b.kind == BKind::Img && b.reg < 8) {
-                resolve(s, st, b, res);
-                g_keep_res.push_back(res[0]);
+                resolve(s, st, b, res, nullptr, &made_fixed);
+                res_v.push_back(res[0]);
                 ii.imageView = reinterpret_cast<VkImageView>(res[0]);
             }
             if (b.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ii.sampler = VK_NULL_HANDLE;
@@ -1546,12 +1892,12 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     if (!writes.empty()) vkUpdateDescriptorSets(ctx().dev, static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &set, 0, nullptr);
     g_const_gen = nullptr;
-    if (key && !g_used_placeholder) set_keep(sub_key, set);
+    if (key && !g_used_placeholder) set_keep(sub_key, set, made_fixed);
     if (gen && !g_used_placeholder && !g_set_volatile)
-        g_keep_sets[key] = {set, static_cast<u32>(res_at), static_cast<u32>(g_keep_res.size() - res_at)};
+        gen->keep.put(key, KeptSet{set, static_cast<u32>(res_at), static_cast<u32>(res_v.size() - res_at)});
     else
-        g_keep_res.resize(res_at);
-    if (out) *out = {key, set, key && !g_used_placeholder && !g_set_volatile};
+        res_v.resize(res_at);
+    if (out) *out = {key, set, key && !g_used_placeholder && !g_set_volatile, made_fixed};
     return true;
 }
 
@@ -1812,7 +2158,7 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs, u64*
 // found the same set in the submission's cache (same key, g_bind_epoch, texture registrations), which itself does nothing
 // more. HOST_NVN_FAST=0: off; HOST_NVN_FAST_VERIFY=1: each skip is checked against the full work ("[RED] fast path
 // mismatch" lines).
-enum FastStat { FS_DRAWS, FS_PIPE, FS_DYN, FS_VI, FS_PIPE_BIND, FS_BINDS, FS_SETS, FS_NOT_REGS, FS_NOT_EPOCH, FS_NOT_SH, FS_NOT_VER, FS_N };
+enum FastStat { FS_DRAWS, FS_PIPE, FS_DYN, FS_VI, FS_PIPE_BIND, FS_BINDS, FS_SETS, FS_NOT_REGS, FS_NOT_EPOCH, FS_NOT_SH, FS_NOT_VER, FS_SAME_KEY, FS_MEMO, FS_N };
 u64 g_fast[FS_N];
 u64 g_fast_mismatches = 0;
 
@@ -1854,7 +2200,8 @@ void fast_mismatch(const char* fmt, ...) {
 struct BoundSet {
     const Shader* sh = nullptr;   // null: unknown (bind it)
     const State* s = nullptr;
-    u64 v_st = 0, v_push = 0, epoch = 0, regs = 0;
+    u64 dep = 0, v_push = 0, epoch = 0, regs = 0;
+    u64 sparse = 0;   // 0, or g_sparse_epoch + 1 when it was bound (a set with views that change with it)
     float vp[2] = {};
     int base[2] = {};
     u32 dispatch[3] = {};
@@ -1968,8 +2315,49 @@ void vertex_input_fast(VkCommandBuffer cb, const State& s, const Shader* vs) {
     g_bound.vi_ok = true, g_bound.vi_vs = vs, g_bound.vi_s = &s, g_bound.vi_ver = s.v_vtx, g_bound.vi_pools = pools, g_bound.vi_digest = d;
 }
 
-// bind_stage, unless b holds the set it would bind (same shader, stage tables, push constants, draw arguments its key
-// reads, bind epoch and texture registrations). Never for a set made from guest memory (SsboUbo: its key reads memory).
+// The newest version among the parts of state s that sh's stage_key reads (the slots of its bindings, the whole tables
+// where it reads those, push constants). Versions only grow and every change takes a new one, so this stays the same
+// exactly while none of them changes.
+u64 deps_version(const State& s, const Shader* sh) {
+    const u32 st = sh->stage;
+    u64 m = 0;
+    for (const Binding& b : sh->bindings) {
+        switch (b.kind) {
+        case BKind::Ubo:
+        case BKind::UboPtr:
+        case BKind::SsboUbo:
+            if (b.reg < 18) m = std::max(m, s.v_ubo_slot[st][b.reg]);
+            break;
+        case BKind::Ssbo: m = std::max(m, s.v_ssbo[st]); break;
+        case BKind::Drv0:
+            m = std::max(m, s.v_ssbo[st]);
+            if (st == SH_CS) m = std::max(m, s.v_ubo[st]);
+            break;
+        case BKind::Drv2: m = std::max(m, s.v_tex[st]); break;
+        case BKind::Tex:
+            if (b.reg < 256) m = std::max(m, s.v_tex_slot[st][b.reg]);
+            break;
+        case BKind::Img:
+            if (b.reg < 8) m = std::max(m, s.v_img_slot[st][b.reg]);
+            break;
+        case BKind::Push: m = std::max(m, s.v_push[st == SH_CS ? 1 : 0]); break;
+        default: break;
+        }
+    }
+    return m;
+}
+
+// bind_stage, unless b holds the set it would bind (same shader, the state its key reads, draw arguments its key reads,
+// bind epoch and texture registrations). Never for a set made from guest memory (SsboUbo: its key reads memory).
+// Per shader, the last stage bind of it in this submission (KeyMemo::sub == g_set_gen): when a stage's shader changes
+// back (25% of the stage binds not skipped), its key is known without stage_key while what that reads is unchanged.
+struct KeyMemo {
+    BoundSet b;
+    u64 sub = 0;
+};
+std::vector<KeyMemo> g_key_memo(1 << 10);
+KeyMemo& key_memo(const Shader* sh) { return g_key_memo[(reinterpret_cast<uintptr_t>(sh) * 0x9E3779B97F4A7C15ull) >> 54]; }
+
 void bind_fast(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da, BoundSet& b) {
     constexpr auto bit = [](BKind k) { return 1u << static_cast<u32>(k); };
     const State& s = state();
@@ -1977,12 +2365,18 @@ void bind_fast(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layo
     // (read before bind_stage reads what they guard: a change in between makes the next check fail)
     const u64 epoch = g_bind_epoch.load(std::memory_order_acquire), regs = g_reg_count.load(std::memory_order_acquire);
     g_fast[FS_BINDS]++;
-    if (b.sh == sh && b.s == &s && b.v_st == s.v_st[st] && b.epoch == epoch && b.regs == regs &&
-        (!(kinds & bit(BKind::Push)) || b.v_push == s.v_push[pi]) &&
-        (!(kinds & bit(BKind::Support)) || (std::memcmp(&b.vp[0], &da.vp_w, 4) == 0 && std::memcmp(&b.vp[1], &da.vp_h, 4) == 0)) &&
-        (!(kinds & bit(BKind::Drv0)) || (st == SH_CS ? std::memcmp(b.dispatch, da.dispatch, 12) == 0
-                                                     : b.base[0] == da.base_vertex && b.base[1] == da.base_instance))) {
+    const u64 dep = deps_version(s, sh);
+    // x's key is the one stage_key would give now
+    const auto same = [&](const BoundSet& x) {
+        return x.sh == sh && x.s == &s && x.dep == dep && x.epoch == epoch && x.regs == regs && (!x.sparse || x.sparse == g_sparse_epoch + 1) &&
+               (!(kinds & bit(BKind::Push)) || x.v_push == s.v_push[pi]) &&
+               (!(kinds & bit(BKind::Support)) || (std::memcmp(&x.vp[0], &da.vp_w, 4) == 0 && std::memcmp(&x.vp[1], &da.vp_h, 4) == 0)) &&
+               (!(kinds & bit(BKind::Drv0)) || (st == SH_CS ? std::memcmp(x.dispatch, da.dispatch, 12) == 0
+                                                            : x.base[0] == da.base_vertex && x.base[1] == da.base_instance));
+    };
+    if (same(b)) {
         g_fast[FS_SETS]++;
+        g_binds_total++;   // (counted as bound: the timeline's binds per submission stay comparable)
         if (fast_verify()) {
             const u64 key = stage_key(s, sh, da);
             if (key != b.key) fast_mismatch("descriptor set of %s (stage %u): key %016llx, kept %016llx", sh->name, st, static_cast<unsigned long long>(key),
@@ -1992,19 +2386,40 @@ void bind_fast(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layo
     }
     // (why not: the first of these that differs)
     if (b.sh != sh || b.s != &s) g_fast[FS_NOT_SH]++;
-    else if (b.v_st != s.v_st[st]) g_fast[FS_NOT_VER]++;
+    else if (b.dep != dep) g_fast[FS_NOT_VER]++;
     else if (b.epoch != epoch) g_fast[FS_NOT_EPOCH]++;
     else if (b.regs != regs) g_fast[FS_NOT_REGS]++;
+    KeyMemo& m = key_memo(sh);
+    if (m.sub == g_set_gen && same(m.b)) {
+        // (the set the submission's cache holds under that key, as bind_stage would find it)
+        bool fixed = true;
+        if (const VkDescriptorSet set = set_find(sub_key_of(m.b.key, epoch), &fixed)) {
+            g_fast[FS_MEMO]++;
+            g_set_hits++, g_binds_total++;
+            vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &set, 0, nullptr);
+            if (fast_verify()) {
+                const u64 key = stage_key(s, sh, da);
+                if (key != m.b.key) fast_mismatch("descriptor set of %s (stage %u) by its last key: key %016llx, kept %016llx", sh->name, st,
+                                                  static_cast<unsigned long long>(key), static_cast<unsigned long long>(m.b.key));
+            }
+            b = m.b;
+            b.set = set, b.sparse = fixed ? 0 : g_sparse_epoch + 1;
+            return;
+        }
+    }
     BindOut o;
     bind_stage(cb, bp, layout, sh, da, &o);
+    if (b.sh == sh && b.s == &s && o.key == b.key && o.set == b.set) g_fast[FS_SAME_KEY]++;   // (bound again for nothing)
     if (!o.reusable || (kinds & bit(BKind::SsboUbo))) {
         b = BoundSet{};
         return;
     }
-    b.sh = sh, b.s = &s, b.v_st = s.v_st[st], b.v_push = s.v_push[pi], b.epoch = epoch, b.regs = regs;
+    b.sh = sh, b.s = &s, b.dep = dep, b.v_push = s.v_push[pi], b.epoch = epoch, b.regs = regs;
     b.vp[0] = da.vp_w, b.vp[1] = da.vp_h, b.base[0] = da.base_vertex, b.base[1] = da.base_instance;
     std::memcpy(b.dispatch, da.dispatch, 12);
     b.key = o.key, b.set = o.set;
+    b.sparse = o.fixed ? 0 : g_sparse_epoch + 1;
+    m.b = b, m.sub = g_set_gen;
 }
 
 // The graphics pipeline bound (vkCmdBindPipeline unless it is bound already); a new layout: every set is bound again.
@@ -2409,7 +2824,7 @@ void draw_sub_begin(u64 done) {
     g_set_gen++, g_set_kept = 0, g_subs++;
     kept_sub_begin();
     g_view_sub++;
-    if (!set_keep_on()) g_view_cache.clear();
+    if (!set_keep_on()) view_cache_clear();
     dyn_reset();
     Device& c = ctx();
     while (!g_arena_busy.empty() && g_arena_busy.front()->value <= done) {
@@ -2443,7 +2858,7 @@ void draw_sub_begin(u64 done) {
         // Destroyed while no generation was current: no kept set may hold them. Many waiting: the current one goes.
         std::unique_lock lk{g_grave_mu};
         if (!g_gen) {
-            if (!g_grave.empty()) g_view_cache.clear();   // (no sticky view may outlive its image)
+            if (!g_grave.empty()) view_cache_clear();   // (no sticky view may outlive its image)
             for (auto& fn : g_grave) defer(std::move(fn));
             g_grave.clear();
             g_grave_bytes = 0;
@@ -2513,6 +2928,11 @@ VkCommandBuffer draw_sub_commit(u64 value) {
 
 void draw_cb_changed() { dyn_reset(); }
 
+void draw_sparse_changed() {
+    if (fast_base()) g_sparse_epoch++;
+    else bind_epoch_bump(false);   // (content: kept descriptor sets stay)
+}
+
 void draw_compute_changed() {
     g_bound.cs_pipe = VK_NULL_HANDLE, g_bound.cs_layout = VK_NULL_HANDLE, g_bound.cs = BoundSet{};
 }
@@ -2532,15 +2952,17 @@ void draw_queue_forget(u64 serial) {
 
 namespace {
 // x = v; ver gets a fresh version when that changes x (bytewise: a version never stays the same over a change).
-template <class T> void upd(T& x, const T& v, u64& ver) {
-    if (std::memcmp(&x, &v, sizeof(T)) == 0) return;
+template <class T> bool upd(T& x, const T& v, u64& ver) {
+    if (std::memcmp(&x, &v, sizeof(T)) == 0) return false;
     x = v;
     ver = ++g_ver;
+    return true;
 }
-void upd_bytes(void* x, const void* v, size_t n, u64& ver) {
-    if (std::memcmp(x, v, n) == 0) return;
+bool upd_bytes(void* x, const void* v, size_t n, u64& ver) {
+    if (std::memcmp(x, v, n) == 0) return false;
     std::memcpy(x, v, n);
     ver = ++g_ver;
+    return true;
 }
 }  // namespace
 
@@ -2603,12 +3025,14 @@ bool draw_state(u32 op, const u8* a, u32 size) {
     case OP_BIND_UBO_SMALL: {
         p_bind_buf t;
         const p_bind_buf* b = bind_buf_rec(op, a, &t);
-        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 18) upd(s.ubo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]);
+        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 18 && upd(s.ubo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]))
+            s.v_ubo[b->stage] = s.v_ubo_slot[b->stage][b->index] = s.v_st[b->stage];
         break;
     }
     case OP_BIND_SSBO: {
         const auto* b = reinterpret_cast<const p_bind_buf*>(a);
-        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 16) upd(s.ssbo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]);
+        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 16 && upd(s.ssbo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]))
+            s.v_ssbo[b->stage] = s.v_st[b->stage];
         break;
     }
     case OP_BIND_TEX:
@@ -2620,13 +3044,15 @@ bool draw_state(u32 op, const u8* a, u32 size) {
         bh_fresh(b);
         if (b->stage < 0 || b->stage >= SH_N) break;
         u64& ver = s.v_st[b->stage];
+        bool changed = false;
         for (int i = 0; i < b->n; i++) {
             const int slot = b->first + i;
             const u32 h = static_cast<u32>(b->h[i]);
-            if (op == OP_BIND_SAMP) { if (slot >= 0 && slot < 128) upd(s.samp[b->stage][slot], h >> 20, ver); }
-            else if (op == OP_BIND_IMG) { if (slot >= 0 && slot < 8) upd(s.img[b->stage][slot], h, ver); }
-            else if (slot >= 0 && slot < 256) upd(s.tex[b->stage][slot], h, ver);
+            if (op == OP_BIND_SAMP) { if (slot >= 0 && slot < 128) changed |= upd(s.samp[b->stage][slot], h >> 20, ver); }
+            else if (op == OP_BIND_IMG) { if (slot >= 0 && slot < 8 && upd(s.img[b->stage][slot], h, ver)) changed = true, s.v_img_slot[b->stage][slot] = ver; }
+            else if (slot >= 0 && slot < 256 && upd(s.tex[b->stage][slot], h, ver)) changed = true, s.v_tex_slot[b->stage][slot] = ver;
         }
+        if (changed) s.v_tex[b->stage] = ver;
         break;
     }
     case OP_VIEWPORTS: {
@@ -2711,7 +3137,7 @@ void draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) {
 
 void draw_set_tex_pool_n(int n) {
     std::scoped_lock lk{g_tab_mu};
-    if (n > 0 && static_cast<size_t>(n) > g_tex.size()) g_tex.resize(static_cast<size_t>(n));
+    if (n > 0 && static_cast<size_t>(n) > g_tex.size()) g_tex.resize(static_cast<size_t>(n)), g_tex_gen.resize(static_cast<size_t>(n));
 }
 
 // The game registers the same texture and sampler handles again and again: only a change makes what a handle resolves
@@ -2721,7 +3147,7 @@ u64 g_reg_changes = 0, g_reg_same = 0;
 void draw_reg_tex(int id, const tex_t* t, const view_t* v, bool image) {
     if (id < 0 || id >= (1 << 20)) return;
     std::scoped_lock lk{g_tab_mu};
-    if (static_cast<size_t>(id) >= g_tex.size()) g_tex.resize(static_cast<size_t>(id) + 1);
+    if (static_cast<size_t>(id) >= g_tex.size()) g_tex.resize(static_cast<size_t>(id) + 1), g_tex_gen.resize(static_cast<size_t>(id) + 1);
     TexEntry& e = g_tex[static_cast<size_t>(id)];
     const bool valid = t && t->serial;
     const bool same = e.valid == valid && (!valid || (e.t.serial == t->serial && e.t.mem == t->mem && e.image == image &&
@@ -2739,6 +3165,7 @@ void draw_reg_tex(int id, const tex_t* t, const view_t* v, bool image) {
         if (v) e.v = *v;
         e.image = image;
     }
+    g_tex_gen[static_cast<size_t>(id)] = e.gen | (valid ? TexValid : 0);
     g_reg_count.fetch_add(1, std::memory_order_release);
 }
 
@@ -2762,12 +3189,14 @@ void draw_reg_samp(int id, const samp_par* p) {
 void draw_prog_release(const prog_t* p) {
     std::scoped_lock lk{g_prog_mu};
     g_progs.erase(p->serial);
+    if (ProgHit& h = prog_hit(p->serial); h.serial == p->serial) h.serial = 0;
 }
 
 void draw_prog_forget(const prog_t* p) {
     // Its shaders stay bound as resolved (the Shader objects live for the whole run).
     std::scoped_lock lk{g_prog_mu};
     g_progs.erase(p->serial);
+    if (ProgHit& h = prog_hit(p->serial); h.serial == p->serial) h.serial = 0;
 }
 
 void draw_tex_cpu_written(const tex_t* t) {
@@ -2823,20 +3252,33 @@ void draw_log_stats() {
     if (set_keep_on())
         LOG("nvk: kept descriptor sets: %llu found again, %llu out of date; %zu kept; generations %llu (%zu retired); this one: %llu sets, "
             "%zu constant blocks (%llu shared) in %zu MB; texture views from earlier submissions %llu",
-            static_cast<unsigned long long>(g_keep_hits), static_cast<unsigned long long>(g_keep_stale), g_keep_sets.size(),
+            static_cast<unsigned long long>(g_keep_hits), static_cast<unsigned long long>(g_keep_stale), g_gen ? g_gen->keep.size() : 0,
             static_cast<unsigned long long>(g_keep_gens), g_gen_retired.size(), static_cast<unsigned long long>(g_gen ? g_gen->sets : 0),
             g_gen ? g_gen->consts.size() : 0, static_cast<unsigned long long>(g_gen ? g_gen->const_hits : 0),
             g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0, static_cast<unsigned long long>(g_view_sticky_hits));
-    g_keep_hits = g_keep_stale = g_view_sticky_hits = 0;
+    if (set_keep_on() && fast_base())
+        LOG("nvk: kept descriptor sets: %llu found by their touch list", static_cast<unsigned long long>(g_keep_touched));
+    g_keep_hits = g_keep_stale = g_view_sticky_hits = g_keep_touched = 0;
     if (fast_base()) {
+        static u64 last_sparse = 0, last_clears = 0, last_b[4] = {};
+        u64 b[4];
+        pool_bumps(b);
+        LOG("nvk: fast path: sparse remaps +%llu, view cache emptied +%llu; bind epoch from pools: copies made +%llu, dropped +%llu, pools added +%llu, gone +%llu",
+            static_cast<unsigned long long>(g_sparse_epoch - last_sparse), static_cast<unsigned long long>(g_view_clears - last_clears),
+            static_cast<unsigned long long>(b[0] - last_b[0]), static_cast<unsigned long long>(b[1] - last_b[1]),
+            static_cast<unsigned long long>(b[2] - last_b[2]), static_cast<unsigned long long>(b[3] - last_b[3]));
+        last_sparse = g_sparse_epoch, last_clears = g_view_clears;
+        std::copy(b, b + 4, last_b);
         LOG("nvk: fast path: %llu draws: pipeline found %llu, bind skipped %llu, dynamic state skipped %llu, vertex input skipped %llu; "
-            "stage binds %llu, %llu skipped (not: other shader %llu, tables %llu, epoch %llu, registrations %llu)%s%llu",
+            "stage binds %llu, %llu skipped (not: other shader %llu, tables %llu, epoch %llu, registrations %llu; the same set again %llu), %llu by the shader's last key%s%llu",
             static_cast<unsigned long long>(g_fast[FS_DRAWS]), static_cast<unsigned long long>(g_fast[FS_PIPE]),
             static_cast<unsigned long long>(g_fast[FS_PIPE_BIND]), static_cast<unsigned long long>(g_fast[FS_DYN]),
             static_cast<unsigned long long>(g_fast[FS_VI]), static_cast<unsigned long long>(g_fast[FS_BINDS]),
             static_cast<unsigned long long>(g_fast[FS_SETS]), static_cast<unsigned long long>(g_fast[FS_NOT_SH]),
             static_cast<unsigned long long>(g_fast[FS_NOT_VER]), static_cast<unsigned long long>(g_fast[FS_NOT_EPOCH]),
-            static_cast<unsigned long long>(g_fast[FS_NOT_REGS]), fast_verify() ? "; verify: mismatches " : "; mismatches ",
+            static_cast<unsigned long long>(g_fast[FS_NOT_REGS]), static_cast<unsigned long long>(g_fast[FS_SAME_KEY]),
+            static_cast<unsigned long long>(g_fast[FS_MEMO]),
+            fast_verify() ? "; verify: mismatches " : "; mismatches ",
             static_cast<unsigned long long>(g_fast_mismatches));
         for (u64& v : g_fast) v = 0;
     }
