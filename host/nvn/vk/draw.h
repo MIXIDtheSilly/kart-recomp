@@ -54,6 +54,7 @@ bool draw_render_enabled();
 // in the stream read memory through these.
 void draw_note_write(volatile void* host, const void* data, u32 size);
 void draw_cb_changed();   // the commands that follow go into another command buffer state: forget what is bound
+void draw_compute_changed();   // something else bound a compute pipeline or descriptors (copies.cpp)
 u32 draw_written_word(volatile void* host);
 // Draws issued so far (for the dump trigger).
 u64 draw_total();

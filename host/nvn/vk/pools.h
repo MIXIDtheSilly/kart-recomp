@@ -35,5 +35,7 @@ void pool_note(u64 addr, u64 bytes, int kind);
 // The buffer behind [addr, addr + len); false if no pool holds all of it. use: how much from addr on the GPU will read
 // (0: up to the pool's end), for the pools whose copy is brought up to date only where a submission reads it.
 bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use = 0);
+// Steps whenever what pool_find gives for some address may change (pools made or gone, device copies made or dropped).
+u64 pool_gen();
 
 }  // namespace nvk

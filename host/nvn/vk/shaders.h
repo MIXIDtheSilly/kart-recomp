@@ -52,6 +52,7 @@ struct Shader {
     VkShaderModule module = VK_NULL_HANDLE;
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     std::vector<Binding> bindings;
+    u32 kinds = 0;                  // bit 1 << BKind of each kind among its bindings
     std::vector<u8> c1;
     u32 inputs = 0;                 // vertex stage: input locations read
     u8 input_type[32] = {};         // 0 float, 1 sint, 2 uint

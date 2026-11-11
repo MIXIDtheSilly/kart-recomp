@@ -186,6 +186,7 @@ void copy_bc3_to_bc1(VkCommandBuffer cb, Image* si, Image* di, const VkImageSubr
     }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_strip);
     vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_strip_layout, 0, 2, wr);
+    draw_compute_changed();
     const u32 n = static_cast<u32>(blocks);
     vkCmdPushConstants(cb, g_strip_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n);
     vkCmdDispatch(cb, (n + 255) / 256, 1, 1);

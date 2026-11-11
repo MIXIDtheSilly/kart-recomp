@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdarg>
 #include <cstring>
 #include <atomic>
 #include <condition_variable>
@@ -353,6 +354,7 @@ struct TabLock {
 std::vector<VkSampler> g_samp_vk;   // under g_tab_mu
 std::vector<u64> g_samp_gen;        // as TexEntry::gen, per sampler handle (under g_tab_mu)
 u64 g_reg_gen = 0;                  // the last generation handed out (under g_tab_mu)
+std::atomic<u64> g_reg_count{0};    // steps after every registration that changes an entry (the fast path, any thread)
 
 VkSampler sampler_for(u32 id) {
     samp_par p;
@@ -385,6 +387,7 @@ VkSampler sampler_for(u32 id) {
 struct BufB {
     u64 addr = 0, size = 0;
 };
+u64 g_ver = 0;   // the last version handed out (State's versions; renderer thread)
 struct State {
     const Shader* sh[SH_N] = {};
     bool prog_bad = false;  // the bound program's shaders could not all be found
@@ -417,10 +420,19 @@ struct State {
     int render_mode = 2;
     u8 push[2][NVN_PUSH_SIZE] = {};
     u8 vp_sw[16][4] = {};
+    // Versions of what the draw path reads, changed by draw_state only when a record really changes it (fresh values from
+    // g_ver, so they differ between queues too): the fast path (Bound) compares these instead of the state.
+    u64 v_dyn;          // all set_dynamic reads (blend .. vp_sw)
+    u64 v_vtx;          // va, vs, vb (set_vertex_input)
+    u64 v_st[SH_N];     // a stage's ubo, ssbo, tex, samp and img tables (stage_key)
+    u64 v_push[2];      // push constants (graphics, compute)
     State() {
         for (int i = 0; i < 8; i++)
             blend[i] = nvn::blend_st{static_cast<u64>(i), NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE,
                                      NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
+        v_dyn = ++g_ver, v_vtx = ++g_ver;
+        for (u64& v : v_st) v = ++g_ver;
+        for (u64& v : v_push) v = ++g_ver;
     }
 };
 std::unordered_map<u64, std::unique_ptr<State>> g_states;
@@ -698,7 +710,7 @@ VkPipeline pipeline_for(const PipeDesc& d, const Shader* ts, const Shader* vs, c
     return p;
 }
 
-VkPipeline graphics_pipeline(const Shader* vs, const Shader* ps, VkPipelineLayout layout, const Shader* ts = nullptr) {
+PipeDesc graphics_desc(const Shader* vs, const Shader* ps, const Shader* ts) {
     PipeDesc d{};
     d.kind = vs->stage == SH_MS ? 1 : 0;
     d.ncolor = static_cast<u32>(R.ncolor);
@@ -707,7 +719,11 @@ VkPipeline graphics_pipeline(const Shader* vs, const Shader* ps, VkPipelineLayou
     d.df = R.depth.img && (R.depth.img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? R.depth.format : VK_FORMAT_UNDEFINED;
     d.sf = R.depth.img && (R.depth.img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? R.depth.format : VK_FORMAT_UNDEFINED;
     d.samples = static_cast<u32>(R.samples);
-    return pipeline_for(d, ts, vs, ps, layout);
+    return d;
+}
+
+VkPipeline graphics_pipeline(const Shader* vs, const Shader* ps, VkPipelineLayout layout, const Shader* ts = nullptr) {
+    return pipeline_for(graphics_desc(vs, ps, ts), ts, vs, ps, layout);
 }
 
 VkPipeline compute_pipeline(const Shader* cs, VkPipelineLayout layout) {
@@ -1301,7 +1317,15 @@ void note_ubo(const Shader* sh, u32 reg, u64 addr, u64 size, char kind = 'c') {
     }
 }
 
-bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da) {
+// What bind_stage bound: the set, its key, and whether the same binding may be skipped while its key would stay the same
+// (the fast path: a set the submission's cache would give again).
+struct BindOut {
+    u64 key = 0;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    bool reusable = false;
+};
+
+bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da, BindOut* out = nullptr) {
     State& s = state();
     const u32 st = sh->stage;
     const u64 key = stage_key(s, sh, da);   // (for the kept sets)
@@ -1314,12 +1338,14 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
         if (const VkDescriptorSet kept = set_find(sub_key)) {
             g_set_hits++;
             vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
+            if (out) *out = {key, kept, true};
             return true;
         }
         if (keep)
             if (const VkDescriptorSet kept = keep_find(s, sh, key)) {
                 set_keep(sub_key, kept);
                 vkCmdBindDescriptorSets(cb, bp, layout, sh->set, 1, &kept, 0, nullptr);
+                if (out) *out = {key, kept, true};
                 return true;
             }
     }
@@ -1525,6 +1551,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
         g_keep_sets[key] = {set, static_cast<u32>(res_at), static_cast<u32>(g_keep_res.size() - res_at)};
     else
         g_keep_res.resize(res_at);
+    if (out) *out = {key, set, key && !g_used_placeholder && !g_set_volatile};
     return true;
 }
 
@@ -1542,9 +1569,14 @@ struct DynShadow {
     bool known[D_N] = {};
     bool mesh = false;
 } g_dyn;
+u64 g_dyn_misses = 0;   // dyn_same answers "set it" (the fast path's check)
+int g_dyn_miss_slot = -1;
+
+void bound_reset();
 
 void dyn_reset() {
     for (bool& k : g_dyn.known) k = false;
+    bound_reset();
 }
 
 // True when slot already holds the n bytes at p; otherwise it is recorded as holding them (the caller sets the state).
@@ -1555,6 +1587,7 @@ bool dyn_same(int slot, const void* p, size_t n) {
     if (g_dyn.known[slot] && v.size() == n && std::memcmp(v.data(), p, n) == 0) return true;
     v.assign(static_cast<const u8*>(p), static_cast<const u8*>(p) + n);
     g_dyn.known[slot] = true;
+    if (!g_dyn_misses++) g_dyn_miss_slot = slot;
     return false;
 }
 template <class... T> bool dyn_same_v(int slot, const T&... a) {
@@ -1667,14 +1700,19 @@ void set_dynamic(VkCommandBuffer cb, const State& s, const Shader* ps, VkPrimiti
     if (s.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) ONCE_RED("alpha test %u: drawn without it", static_cast<unsigned>(s.color.alpha_func));
 }
 
-void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs) {
+// digest: when not null, a hash of everything bound (the fast path's check).
+void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs, u64* digest = nullptr) {
+    // (zeroed whole, padding too: the descriptions are compared as bytes, dyn_same)
     VkVertexInputBindingDescription2EXT binds[17];
     VkVertexInputAttributeDescription2EXT attrs[32];
+    std::memset(binds, 0, sizeof binds);
+    std::memset(attrs, 0, sizeof attrs);
     u32 nb = 0, na = 0, streams = 0;
     bool zero = false;
     for (u32 loc = 0; loc < 32; loc++) {
         if (!(vs->inputs >> loc & 1)) continue;
-        VkVertexInputAttributeDescription2EXT a{VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT};
+        VkVertexInputAttributeDescription2EXT& a = attrs[na++];
+        a.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
         a.location = loc;
         VkFormat f = VK_FORMAT_UNDEFINED;
         if (loc < 16 && s.va[loc].fmt && s.va[loc].stream < 16) f = vertex_format(s.va[loc].fmt);
@@ -1690,19 +1728,18 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs) {
             a.offset = 0;
             zero = true;
         }
-        attrs[na++] = a;
     }
     VkBuffer bufs[17];
     VkDeviceSize offs[17], sizes[17];
     for (u32 i = 0; i < 16; i++) {
         if (!(streams >> i & 1)) continue;
-        VkVertexInputBindingDescription2EXT b{VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT};
+        VkVertexInputBindingDescription2EXT& b = binds[nb++];
+        b.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT;
         b.binding = i;
         b.stride = s.vs[i].stride;
         b.inputRate = s.vs[i].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
         b.divisor = 1;
         if (s.vs[i].divisor > 1) ONCE_RED("vertex stream divisor %u: drawn with divisor 1", s.vs[i].divisor);
-        binds[nb++] = b;
         BufferRef r;
         if (s.vb[i].address && pool_find(s.vb[i].address, 1, r, s.vb[i].size)) {
             bufs[i] = r.buffer, offs[i] = r.offset, sizes[i] = std::min<u64>(r.size, s.vb[i].size ? s.vb[i].size : r.size);
@@ -1712,12 +1749,12 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs) {
         vkCmdBindVertexBuffers2(cb, i, 1, &bufs[i], &offs[i], &sizes[i], nullptr);
     }
     if (zero) {
-        VkVertexInputBindingDescription2EXT b{VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT};
+        VkVertexInputBindingDescription2EXT& b = binds[nb++];
+        b.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT;
         b.binding = 16;
         b.stride = 0;
         b.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         b.divisor = 1;
-        binds[nb++] = b;
         const VkBuffer nb_ = VK_NULL_HANDLE;
         const VkDeviceSize zo = 0, zs = VK_WHOLE_SIZE;
         vkCmdBindVertexBuffers2(cb, 16, 1, &nb_, &zo, &zs, nullptr);
@@ -1754,6 +1791,233 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs) {
         k.assign(reinterpret_cast<const u8*>(binds), reinterpret_cast<const u8*>(binds + nb));
         k.insert(k.end(), reinterpret_cast<const u8*>(attrs), reinterpret_cast<const u8*>(attrs + na));
         if (!dyn_same(D_VI, k.data(), k.size())) vkCmdSetVertexInputEXT(cb, nb, binds, na, attrs);
+        if (digest) {
+            for (u32 i = 0; i < 16; i++) {
+                if (!(streams >> i & 1)) continue;
+                const u64 b[4] = {i, reinterpret_cast<u64>(bufs[i]), offs[i], sizes[i]};
+                k.insert(k.end(), reinterpret_cast<const u8*>(b), reinterpret_cast<const u8*>(b + 4));
+            }
+            *digest = Common::CityHash64(reinterpret_cast<const char*>(k.data()), k.size());
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the fast path
+// Most of a draw's work repeats the draw before it: the same pipeline (76% of draws), dynamic state (89%), vertex
+// input (40%), and for ~30% of the stage binds the same descriptor set. What the command buffer being recorded has bound
+// is kept here with the versions of the State it was made from (draw_state steps a version only on a real change), and a
+// draw does only what changed. Forgotten with the dynamic state's shadow (dyn_reset: another command buffer), after a mesh
+// draw (graphics), and when something else binds a compute pipeline (draw_compute_changed). A skipped step would have
+// bound exactly what is bound already, with no other effect: a stage bind is skipped only where bind_stage would have
+// found the same set in the submission's cache (same key, g_bind_epoch, texture registrations), which itself does nothing
+// more. HOST_NVN_FAST=0: off; HOST_NVN_FAST_VERIFY=1: each skip is checked against the full work ("[RED] fast path
+// mismatch" lines).
+enum FastStat { FS_DRAWS, FS_PIPE, FS_DYN, FS_VI, FS_PIPE_BIND, FS_BINDS, FS_SETS, FS_NOT_REGS, FS_NOT_EPOCH, FS_NOT_SH, FS_NOT_VER, FS_N };
+u64 g_fast[FS_N];
+u64 g_fast_mismatches = 0;
+
+bool fast_base() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST");
+        const bool on = !(e && *e == '0') && !pool_stats_on() && !set_miss_stats_on() && !getenv("HOST_NVN_NO_DYN_SHADOW") &&
+                        !getenv("HOST_WATCH_SSBO") && !getenv("HOST_NVN_TRACE_PS") && !getenv("HOST_NVN_NO_SET_CACHE");
+        LOG("nvk: renderer fast path %s", on ? "on" : "off");
+        return on;
+    }();
+    return on;
+}
+bool fast_verify() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_FAST_VERIFY");
+        return e && *e == '1';
+    }();
+    return on;
+}
+// (a dump notes every step of every draw)
+bool fast_on() { return fast_base() && !dump_active() && !dump_tracing(); }
+
+void fast_mismatch(const char* fmt, ...) {
+    g_fast_mismatches++;
+    static u64 logged = 0, last = 0;
+    const u64 now = host_ns();
+    if (logged >= 200 && now - last < 1'000'000'000ull) return;   // (the first 200, then one a second)
+    logged++, last = now;
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    LOG("[RED] fast path mismatch: %s (%llu so far)", b, static_cast<unsigned long long>(g_fast_mismatches));
+}
+
+// One descriptor set bound for a stage, and what its key was made from.
+struct BoundSet {
+    const Shader* sh = nullptr;   // null: unknown (bind it)
+    const State* s = nullptr;
+    u64 v_st = 0, v_push = 0, epoch = 0, regs = 0;
+    float vp[2] = {};
+    int base[2] = {};
+    u32 dispatch[3] = {};
+    u64 key = 0;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+};
+// The dynamic state's inputs (set_dynamic), compared bytewise.
+struct DynKey {
+    const State* s;
+    u64 v_dyn;
+    const Shader* ps;
+    u32 topo, w, h, ncolor, samples, flags;
+};
+struct Bound {
+    VkPipeline gfx_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout gfx_layout = VK_NULL_HANDLE;
+    BoundSet gfx[5];   // by set index
+    bool dyn_ok = false;
+    DynKey dyn{};
+    float vp_w = 1, vp_h = 1;   // what set_dynamic gave the draw
+    bool vi_ok = false;
+    const Shader* vi_vs = nullptr;
+    const State* vi_s = nullptr;
+    u64 vi_ver = 0, vi_pools = 0, vi_digest = 0;
+    VkPipeline cs_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout cs_layout = VK_NULL_HANDLE;
+    BoundSet cs;
+} g_bound;
+
+void bound_reset() { g_bound = Bound{}; }
+
+void bound_gfx_reset() {
+    const Bound keep = g_bound;
+    g_bound = Bound{};
+    g_bound.cs_pipe = keep.cs_pipe, g_bound.cs_layout = keep.cs_layout, g_bound.cs = keep.cs;
+}
+
+// Pipelines and their layouts by PipeDesc, without hashing it (pipeline_for's CityHash and map took 4% of the renderer):
+// direct-mapped by the shaders, the whole description compared.
+struct PipeMemo {
+    PipeDesc d{};
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+};
+constexpr size_t PipeMemoN = 1 << 12;
+std::vector<PipeMemo> g_pipe_memo(PipeMemoN);
+
+PipeMemo& pipe_memo(const PipeDesc& d) {
+    u64 h = d.vs * 0x9E3779B97F4A7C15ull ^ d.ps * 0xC2B2AE3D27D4EB4Full ^ d.ts * 0x165667B19E3779F9ull;
+    h ^= (static_cast<u64>(d.colors[0]) << 32 | static_cast<u64>(d.df) << 8 | d.ncolor << 4 | d.samples) * 0x27D4EB2F165667C5ull;
+    return g_pipe_memo[(h ^ h >> 29) & (PipeMemoN - 1)];
+}
+
+// The layout and pipeline of desc d (made by make() when not in the memo).
+template <class Make> bool fast_pipeline(const PipeDesc& d, VkPipelineLayout& layout, VkPipeline& pipe, Make make) {
+    PipeMemo& m = pipe_memo(d);
+    if (m.pipe && std::memcmp(&m.d, &d, sizeof d) == 0) {
+        layout = m.layout, pipe = m.pipe;
+        g_fast[FS_PIPE]++;
+        return true;
+    }
+    make();
+    if (pipe) m = {d, layout, pipe};
+    return false;
+}
+
+// set_dynamic, unless what it reads is what it last set in this command buffer.
+void dynamic_fast(VkCommandBuffer cb, const State& s, const Shader* ps, VkPrimitiveTopology topo, DrawArgs& da) {
+    DynKey k{};
+    k.s = &s, k.v_dyn = s.v_dyn, k.ps = ps;
+    k.topo = static_cast<u32>(topo), k.w = R.extent.width, k.h = R.extent.height, k.ncolor = static_cast<u32>(R.ncolor);
+    k.samples = static_cast<u32>(R.samples);
+    const bool has_depth = R.depth.img && (R.depth.img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT);
+    const bool has_stencil = R.depth.img && (R.depth.img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+    k.flags = static_cast<u32>(has_depth) | static_cast<u32>(has_stencil) << 1 | (g_origin_ll.load(std::memory_order_relaxed) != 0) << 2 |
+              (g_queue_origin_ll.load(std::memory_order_relaxed) != 0) << 3 | (g_depth_zero.load(std::memory_order_relaxed) != 0) << 4;
+    if (g_bound.dyn_ok && std::memcmp(&k, &g_bound.dyn, sizeof k) == 0) {
+        g_fast[FS_DYN]++;
+        da.vp_w = g_bound.vp_w, da.vp_h = g_bound.vp_h;
+        if (fast_verify()) {
+            g_dyn_misses = 0;
+            DrawArgs t = da;
+            set_dynamic(cb, s, ps, topo, t);
+            if (g_dyn_misses || std::memcmp(&t.vp_w, &da.vp_w, 4) || std::memcmp(&t.vp_h, &da.vp_h, 4))
+                fast_mismatch("dynamic state: %llu slots differ (first %d), viewport %gx%g, kept %gx%g", static_cast<unsigned long long>(g_dyn_misses),
+                              g_dyn_miss_slot, t.vp_w, t.vp_h, da.vp_w, da.vp_h);
+        }
+        return;
+    }
+    set_dynamic(cb, s, ps, topo, da);
+    g_bound.dyn = k, g_bound.dyn_ok = true;
+    g_bound.vp_w = da.vp_w, g_bound.vp_h = da.vp_h;
+}
+
+// set_vertex_input, unless its inputs are those of the last one in this command buffer (vertex buffers resolved the same:
+// pool_find's results change only with pool_gen; its per-submission copies were made by the first).
+void vertex_input_fast(VkCommandBuffer cb, const State& s, const Shader* vs) {
+    const u64 pools = pool_gen();
+    if (g_bound.vi_ok && g_bound.vi_vs == vs && g_bound.vi_s == &s && g_bound.vi_ver == s.v_vtx && g_bound.vi_pools == pools) {
+        g_fast[FS_VI]++;
+        if (fast_verify()) {
+            u64 d = 0;
+            set_vertex_input(cb, s, vs, &d);
+            if (d != g_bound.vi_digest) fast_mismatch("vertex input of %s: digest %016llx, kept %016llx", vs->name, static_cast<unsigned long long>(d),
+                                                      static_cast<unsigned long long>(g_bound.vi_digest));
+        }
+        return;
+    }
+    u64 d = 0;
+    set_vertex_input(cb, s, vs, fast_verify() ? &d : nullptr);
+    g_bound.vi_ok = true, g_bound.vi_vs = vs, g_bound.vi_s = &s, g_bound.vi_ver = s.v_vtx, g_bound.vi_pools = pools, g_bound.vi_digest = d;
+}
+
+// bind_stage, unless b holds the set it would bind (same shader, stage tables, push constants, draw arguments its key
+// reads, bind epoch and texture registrations). Never for a set made from guest memory (SsboUbo: its key reads memory).
+void bind_fast(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, const Shader* sh, const DrawArgs& da, BoundSet& b) {
+    constexpr auto bit = [](BKind k) { return 1u << static_cast<u32>(k); };
+    const State& s = state();
+    const u32 st = sh->stage, kinds = sh->kinds, pi = st == SH_CS ? 1 : 0;
+    // (read before bind_stage reads what they guard: a change in between makes the next check fail)
+    const u64 epoch = g_bind_epoch.load(std::memory_order_acquire), regs = g_reg_count.load(std::memory_order_acquire);
+    g_fast[FS_BINDS]++;
+    if (b.sh == sh && b.s == &s && b.v_st == s.v_st[st] && b.epoch == epoch && b.regs == regs &&
+        (!(kinds & bit(BKind::Push)) || b.v_push == s.v_push[pi]) &&
+        (!(kinds & bit(BKind::Support)) || (std::memcmp(&b.vp[0], &da.vp_w, 4) == 0 && std::memcmp(&b.vp[1], &da.vp_h, 4) == 0)) &&
+        (!(kinds & bit(BKind::Drv0)) || (st == SH_CS ? std::memcmp(b.dispatch, da.dispatch, 12) == 0
+                                                     : b.base[0] == da.base_vertex && b.base[1] == da.base_instance))) {
+        g_fast[FS_SETS]++;
+        if (fast_verify()) {
+            const u64 key = stage_key(s, sh, da);
+            if (key != b.key) fast_mismatch("descriptor set of %s (stage %u): key %016llx, kept %016llx", sh->name, st, static_cast<unsigned long long>(key),
+                                            static_cast<unsigned long long>(b.key));
+        }
+        return;
+    }
+    // (why not: the first of these that differs)
+    if (b.sh != sh || b.s != &s) g_fast[FS_NOT_SH]++;
+    else if (b.v_st != s.v_st[st]) g_fast[FS_NOT_VER]++;
+    else if (b.epoch != epoch) g_fast[FS_NOT_EPOCH]++;
+    else if (b.regs != regs) g_fast[FS_NOT_REGS]++;
+    BindOut o;
+    bind_stage(cb, bp, layout, sh, da, &o);
+    if (!o.reusable || (kinds & bit(BKind::SsboUbo))) {
+        b = BoundSet{};
+        return;
+    }
+    b.sh = sh, b.s = &s, b.v_st = s.v_st[st], b.v_push = s.v_push[pi], b.epoch = epoch, b.regs = regs;
+    b.vp[0] = da.vp_w, b.vp[1] = da.vp_h, b.base[0] = da.base_vertex, b.base[1] = da.base_instance;
+    std::memcpy(b.dispatch, da.dispatch, 12);
+    b.key = o.key, b.set = o.set;
+}
+
+// The graphics pipeline bound (vkCmdBindPipeline unless it is bound already); a new layout: every set is bound again.
+void pipeline_fast(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipe, VkPipelineLayout layout) {
+    const bool cs = bp == VK_PIPELINE_BIND_POINT_COMPUTE;
+    VkPipeline& bound = cs ? g_bound.cs_pipe : g_bound.gfx_pipe;
+    if (bound != pipe) vkCmdBindPipeline(cb, bp, pipe), bound = pipe;
+    else g_fast[FS_PIPE_BIND]++;
+    VkPipelineLayout& bl = cs ? g_bound.cs_layout : g_bound.gfx_layout;
+    if (bl != layout) {
+        bl = layout;
+        if (cs) g_bound.cs = BoundSet{};
+        else for (BoundSet& b : g_bound.gfx) b = BoundSet{};
     }
 }
 
@@ -1808,6 +2072,7 @@ void do_mesh(VkCommandBuffer cb, const nvn::p_draw* d) {
     if (g_skip_draw) { g_stats[ST_DISABLED]++; return; }
     DrawArgs da;
     begin_rendering(cb);
+    bound_gfx_reset();   // (binds a mesh pipeline, its layout's sets and dynamic state of its own)
     set_dynamic(cb, s, ps, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, da, true);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     checkpoint(cb, 1, ts, ms, ps);
@@ -1896,10 +2161,29 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
         return;
     }
     const Shader* sets[2] = {vs, ps};
-    VkPipelineLayout layout = layout_for(sets, 2);
-    VkPipeline pipe = graphics_pipeline(vs, ps, layout);
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    bool fast = fast_on();
+    const auto slow_pipeline = [&] {
+        layout = layout_for(sets, 2);
+        pipe = graphics_pipeline(vs, ps, layout);
+    };
+    if (fast) {
+        if (fast_pipeline(graphics_desc(vs, ps, nullptr), layout, pipe, slow_pipeline)) {
+            if (fast_verify()) {
+                const VkPipelineLayout l = layout_for(sets, 2);
+                const VkPipeline p = graphics_pipeline(vs, ps, l);
+                if (l != layout || p != pipe) fast_mismatch("pipeline of %s %s", vs->name, ps ? ps->name : "-");
+            }
+        } else if (pipe) {
+            trace_first_use(pipe, vs, ps);
+        }
+    } else {
+        slow_pipeline();
+        if (pipe) trace_first_use(pipe, vs, ps);
+    }
     if (!pipe) { g_stats[ST_NO_PIPELINE]++; return; }
-    trace_first_use(pipe, vs, ps);
+    fast = fast && !dump_tracing();   // (the first use of a pipeline is traced: all of this draw then)
     // index / indirect buffers first: a missing one skips the draw before anything is recorded
     BufferRef ib{}, ind{};
     VkIndexType itype = VK_INDEX_TYPE_UINT16;
@@ -1928,12 +2212,23 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
     da.base_vertex = di ? di->base_vertex : (d ? d->first : 0);
     da.base_instance = d ? d->base_instance : di->base_instance;
     begin_rendering(cb);
-    set_dynamic(cb, s, ps, quads ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : t.topo, da);
-    set_vertex_input(cb, s, vs);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    checkpoint(cb, 0, vs, ps, nullptr);
-    bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, vs, da);
-    if (ps) bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ps, da);
+    if (fast) {
+        g_fast[FS_DRAWS]++;
+        dynamic_fast(cb, s, ps, quads ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : t.topo, da);
+        vertex_input_fast(cb, s, vs);
+        pipeline_fast(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe, layout);
+        checkpoint(cb, 0, vs, ps, nullptr);
+        bind_fast(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, vs, da, g_bound.gfx[vs->set]);
+        if (ps) bind_fast(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ps, da, g_bound.gfx[ps->set]);
+    } else {
+        if (fast_base()) bound_gfx_reset();
+        set_dynamic(cb, s, ps, quads ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : t.topo, da);
+        set_vertex_input(cb, s, vs);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        checkpoint(cb, 0, vs, ps, nullptr);
+        bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, vs, da);
+        if (ps) bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ps, da);
+    }
     const u32 query = dump_query_begin(cb);
     if (quads) {
         // quads as triangles: 0 1 2, 0 2 3 per quad, from the draw's own indices when it has them
@@ -2004,12 +2299,29 @@ void do_dispatch(VkCommandBuffer cb, const nvn::p_dispatch* d) {
     BufferRef ind{};
     if (d->ind && (g_skip_ind || !pool_find(d->ind, 12, ind))) { g_stats[ST_INDIRECT]++; return; }
     const Shader* sets[1] = {cs};
-    VkPipelineLayout layout = layout_for(sets, 1);
-    VkPipeline pipe = compute_pipeline(cs, layout);
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const bool fast = fast_on();
+    bool memo = false;
+    const auto slow_pipeline = [&] {
+        layout = layout_for(sets, 1);
+        pipe = compute_pipeline(cs, layout);
+    };
+    if (fast) {
+        PipeDesc pd{};
+        pd.kind = 2, pd.vs = cs->key;
+        memo = fast_pipeline(pd, layout, pipe, slow_pipeline);
+        if (memo && fast_verify()) {
+            const VkPipelineLayout l = layout_for(sets, 1);
+            if (l != layout || compute_pipeline(cs, l) != pipe) fast_mismatch("compute pipeline of %s", cs->name);
+        }
+    } else {
+        slow_pipeline();
+    }
     if (!pipe) { g_stats[ST_NO_PIPELINE]++; return; }
     end_rendering(cb);
     dump_trace(false);
-    trace_first_use(pipe, cs, nullptr);
+    if (!memo) trace_first_use(pipe, cs, nullptr);
     DrawArgs da;
     da.dispatch[0] = static_cast<u32>(d->x), da.dispatch[1] = static_cast<u32>(d->y), da.dispatch[2] = static_cast<u32>(d->z);
     if (d->ind) {
@@ -2019,9 +2331,16 @@ void do_dispatch(VkCommandBuffer cb, const nvn::p_dispatch* d) {
         nvn::gpu_read(d->ind, g, 12);
         std::memcpy(da.dispatch, g, 12);
     }
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    checkpoint(cb, 2, cs, nullptr, nullptr);
-    bind_stage(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, cs, da);
+    if (fast && !dump_tracing()) {
+        pipeline_fast(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe, layout);
+        checkpoint(cb, 2, cs, nullptr, nullptr);
+        bind_fast(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, cs, da, g_bound.cs);
+    } else {
+        if (fast_base()) draw_compute_changed();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        checkpoint(cb, 2, cs, nullptr, nullptr);
+        bind_stage(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, cs, da);
+    }
     if (d->ind) vkCmdDispatchIndirect(cb, ind.buffer, ind.offset);
     else vkCmdDispatch(cb, da.dispatch[0], da.dispatch[1], da.dispatch[2]);
     full_barrier(cb);
@@ -2194,6 +2513,10 @@ VkCommandBuffer draw_sub_commit(u64 value) {
 
 void draw_cb_changed() { dyn_reset(); }
 
+void draw_compute_changed() {
+    g_bound.cs_pipe = VK_NULL_HANDLE, g_bound.cs_layout = VK_NULL_HANDLE, g_bound.cs = BoundSet{};
+}
+
 void draw_queue_activate(u64 serial) {
     auto& p = g_states[serial];
     if (!p) p = std::make_unique<State>();
@@ -2206,6 +2529,20 @@ void draw_queue_forget(u64 serial) {
     if (S == it->second.get()) S = nullptr;
     g_states.erase(it);
 }
+
+namespace {
+// x = v; ver gets a fresh version when that changes x (bytewise: a version never stays the same over a change).
+template <class T> void upd(T& x, const T& v, u64& ver) {
+    if (std::memcmp(&x, &v, sizeof(T)) == 0) return;
+    x = v;
+    ver = ++g_ver;
+}
+void upd_bytes(void* x, const void* v, size_t n, u64& ver) {
+    if (std::memcmp(x, v, n) == 0) return;
+    std::memcpy(x, v, n);
+    ver = ++g_ver;
+}
+}  // namespace
 
 bool draw_state(u32 op, const u8* a, u32 size) {
     using namespace nvn;
@@ -2231,46 +2568,47 @@ bool draw_state(u32 op, const u8* a, u32 size) {
         case 0: {
             blend_st bl{};
             std::memcpy(&bl, b->bytes, std::min(n, sizeof bl));
-            s.blend[bl.target & 7] = bl;
+            upd(s.blend[bl.target & 7], bl, s.v_dyn);
             break;
         }
-        case 1: std::memcpy(&s.color, b->bytes, std::min(n, sizeof s.color)); break;
-        case 2: std::memcpy(&s.chmask, b->bytes, std::min(n, sizeof s.chmask)); break;
-        case 3: std::memcpy(&s.ms, b->bytes, std::min(n, sizeof s.ms)); break;
-        case 4: std::memcpy(&s.poly, b->bytes, std::min(n, sizeof s.poly)); break;
-        case 5: std::memcpy(&s.ds, b->bytes, std::min(n, sizeof s.ds)); break;
+        case 1: upd_bytes(&s.color, b->bytes, std::min(n, sizeof s.color), s.v_dyn); break;
+        case 2: upd_bytes(&s.chmask, b->bytes, std::min(n, sizeof s.chmask), s.v_dyn); break;
+        case 3: upd_bytes(&s.ms, b->bytes, std::min(n, sizeof s.ms), s.v_dyn); break;
+        case 4: upd_bytes(&s.poly, b->bytes, std::min(n, sizeof s.poly), s.v_dyn); break;
+        case 5: upd_bytes(&s.ds, b->bytes, std::min(n, sizeof s.ds), s.v_dyn); break;
         default: break;
         }
         break;
     }
     case OP_BIND_VATTR: {
         const auto* b = reinterpret_cast<const p_bind_vattr*>(a);
-        for (int i = 0; i < 16; i++) s.va[i] = va_st{};
-        for (int i = 0; i < b->n && b->first + i < 16; i++) std::memcpy(&s.va[b->first + i], &b->st[i], 4);
+        va_st va[16] = {};
+        for (int i = 0; i < b->n && b->first + i < 16; i++) std::memcpy(&va[b->first + i], &b->st[i], 4);
+        upd_bytes(s.va, va, sizeof va, s.v_vtx);
         break;
     }
     case OP_BIND_VSTREAM: {
         const auto* b = reinterpret_cast<const p_bind_vstream*>(a);
-        for (int i = 0; i < b->n && b->first + i < 16; i++) s.vs[b->first + i] = b->st[i];
+        for (int i = 0; i < b->n && b->first + i < 16; i++) upd(s.vs[b->first + i], b->st[i], s.v_vtx);
         break;
     }
     case OP_BIND_VBUF:
     case OP_BIND_VBUF1: {
         p_bind_vbuf t;
         const p_bind_vbuf* b = vbuf_rec(op, a, &t);
-        for (int i = 0; i < b->n && b->first + i < 16; i++) s.vb[b->first + i] = b->r[i];
+        for (int i = 0; i < b->n && b->first + i < 16; i++) upd(s.vb[b->first + i], b->r[i], s.v_vtx);
         break;
     }
     case OP_BIND_UBO:
     case OP_BIND_UBO_SMALL: {
         p_bind_buf t;
         const p_bind_buf* b = bind_buf_rec(op, a, &t);
-        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 18) s.ubo[b->stage][b->index] = {b->addr, b->size};
+        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 18) upd(s.ubo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]);
         break;
     }
     case OP_BIND_SSBO: {
         const auto* b = reinterpret_cast<const p_bind_buf*>(a);
-        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 16) s.ssbo[b->stage][b->index] = {b->addr, b->size};
+        if (b->stage >= 0 && b->stage < SH_N && b->index >= 0 && b->index < 16) upd(s.ssbo[b->stage][b->index], BufB{b->addr, b->size}, s.v_st[b->stage]);
         break;
     }
     case OP_BIND_TEX:
@@ -2281,49 +2619,51 @@ bool draw_state(u32 op, const u8* a, u32 size) {
         const p_bind_handles* b = bind_rec(op, a, &t);
         bh_fresh(b);
         if (b->stage < 0 || b->stage >= SH_N) break;
+        u64& ver = s.v_st[b->stage];
         for (int i = 0; i < b->n; i++) {
             const int slot = b->first + i;
             const u32 h = static_cast<u32>(b->h[i]);
-            if (op == OP_BIND_SAMP) { if (slot >= 0 && slot < 128) s.samp[b->stage][slot] = h >> 20; }
-            else if (op == OP_BIND_IMG) { if (slot >= 0 && slot < 8) s.img[b->stage][slot] = h; }
-            else if (slot >= 0 && slot < 256) s.tex[b->stage][slot] = h;
+            if (op == OP_BIND_SAMP) { if (slot >= 0 && slot < 128) upd(s.samp[b->stage][slot], h >> 20, ver); }
+            else if (op == OP_BIND_IMG) { if (slot >= 0 && slot < 8) upd(s.img[b->stage][slot], h, ver); }
+            else if (slot >= 0 && slot < 256) upd(s.tex[b->stage][slot], h, ver);
         }
         break;
     }
     case OP_VIEWPORTS: {
         const auto* b = reinterpret_cast<const p_viewports*>(a);
-        for (int i = 0; i < b->n && b->first + i < 16; i++) std::memcpy(s.vp[b->first + i], b->v[i], 16);
-        s.nvp = std::max(s.nvp, std::min(16, b->first + b->n));
+        for (int i = 0; i < b->n && b->first + i < 16; i++) upd_bytes(s.vp[b->first + i], b->v[i], 16, s.v_dyn);
+        upd(s.nvp, std::max(s.nvp, std::min(16, b->first + b->n)), s.v_dyn);
         break;
     }
-    case OP_SCISSOR: std::memcpy(&s.sc, a, sizeof s.sc); s.has_sc = true; break;
+    case OP_SCISSOR: upd_bytes(&s.sc, a, sizeof s.sc, s.v_dyn); upd(s.has_sc, true, s.v_dyn); break;
     case OP_DEPTH_RANGE: {
         const auto* b = reinterpret_cast<const p_depth_range*>(a);
-        s.dn = b->n, s.df = b->f;
+        upd(s.dn, b->n, s.v_dyn), upd(s.df, b->f, s.v_dyn);
         break;
     }
     case OP_STENCIL: {
         const auto* b = reinterpret_cast<const p_stencil*>(a);
         for (int f = 0; f < 2; f++) {
             if (!(b->face >> f & 1)) continue;
-            if (b->which == 0) s.st_vmask[f] = static_cast<u32>(b->value_mask);
-            else if (b->which == 1) s.st_wmask[f] = static_cast<u32>(b->mask);
-            else s.st_ref[f] = static_cast<u32>(b->ref);
+            if (b->which == 0) upd(s.st_vmask[f], static_cast<u32>(b->value_mask), s.v_dyn);
+            else if (b->which == 1) upd(s.st_wmask[f], static_cast<u32>(b->mask), s.v_dyn);
+            else upd(s.st_ref[f], static_cast<u32>(b->ref), s.v_dyn);
         }
         break;
     }
-    case OP_POLY_OFFSET: std::memcpy(&s.po, a, sizeof s.po); break;
-    case OP_BLEND_COLOR: std::memcpy(s.blend_color, a, 16); break;
+    case OP_POLY_OFFSET: upd_bytes(&s.po, a, sizeof s.po, s.v_dyn); break;
+    case OP_BLEND_COLOR: upd_bytes(s.blend_color, a, 16, s.v_dyn); break;
     case OP_PRIM_RESTART: {
         const auto* b = reinterpret_cast<const p_prim_restart*>(a);
-        s.prim_restart = b->on != 0;
-        s.restart_index = b->index;
+        upd(s.prim_restart, b->on != 0, s.v_dyn);
+        upd(s.restart_index, b->index, s.v_dyn);
         if (b->on && b->index != 0xffff && b->index != 0xffffffffu) ONCE_RED("primitive restart index %#x: Vulkan restarts at all ones", b->index);
         break;
     }
-    case OP_DEPTH_CLAMP: s.depth_clamp = reinterpret_cast<const p_depth_clamp*>(a)->on != 0; break;
-    case OP_RAST_DISCARD: s.rast_discard = reinterpret_cast<const p_rast_discard*>(a)->on != 0; break;
+    case OP_DEPTH_CLAMP: upd(s.depth_clamp, reinterpret_cast<const p_depth_clamp*>(a)->on != 0, s.v_dyn); break;
+    case OP_RAST_DISCARD: upd(s.rast_discard, reinterpret_cast<const p_rast_discard*>(a)->on != 0, s.v_dyn); break;
     case OP_RENDER_COND: {
+        // (render_mode is read by every draw: no version)
         const auto* b = reinterpret_cast<const p_render_cond*>(a);
         s.render_mode = b->mode;
         if (b->mode < 2) {
@@ -2346,12 +2686,13 @@ bool draw_state(u32 op, const u8* a, u32 size) {
     }
     case OP_VP_SWIZZLE: {
         const auto* b = reinterpret_cast<const p_vp_swizzle*>(a);
-        for (int i = 0; i < b->n && b->first + i < 16; i++) std::memcpy(s.vp_sw[b->first + i], b->sw[i], 4);
+        for (int i = 0; i < b->n && b->first + i < 16; i++) upd_bytes(s.vp_sw[b->first + i], b->sw[i], 4, s.v_dyn);
         break;
     }
     case OP_PUSH_CONST: {
         const auto* b = reinterpret_cast<const p_push_const*>(a);
-        if (b->offset < NVN_PUSH_SIZE) std::memcpy(s.push[b->compute ? 1 : 0] + b->offset, b->data, std::min<u32>(b->size, NVN_PUSH_SIZE - b->offset));
+        const int c = b->compute ? 1 : 0;
+        if (b->offset < NVN_PUSH_SIZE) upd_bytes(s.push[c] + b->offset, b->data, std::min<u32>(b->size, NVN_PUSH_SIZE - b->offset), s.v_push[c]);
         break;
     }
     case OP_ALPHA_REF:
@@ -2392,11 +2733,13 @@ void draw_reg_tex(int id, const tex_t* t, const view_t* v, bool image) {
     g_reg_changes++;
     e.gen = ++g_reg_gen;
     e.valid = valid;
-    if (!e.valid) return;
-    e.t = *t;
-    e.has_v = v != nullptr;
-    if (v) e.v = *v;
-    e.image = image;
+    if (valid) {
+        e.t = *t;
+        e.has_v = v != nullptr;
+        if (v) e.v = *v;
+        e.image = image;
+    }
+    g_reg_count.fetch_add(1, std::memory_order_release);
 }
 
 void draw_reg_samp(int id, const samp_par* p) {
@@ -2413,6 +2756,7 @@ void draw_reg_samp(int id, const samp_par* p) {
     g_samp_gen[static_cast<size_t>(id)] = ++g_reg_gen;
     e = {p != nullptr, p ? *p : samp_par{}};
     if (static_cast<size_t>(id) < g_samp_vk.size()) g_samp_vk[static_cast<size_t>(id)] = VK_NULL_HANDLE;
+    g_reg_count.fetch_add(1, std::memory_order_release);
 }
 
 void draw_prog_release(const prog_t* p) {
@@ -2484,6 +2828,18 @@ void draw_log_stats() {
             g_gen ? g_gen->consts.size() : 0, static_cast<unsigned long long>(g_gen ? g_gen->const_hits : 0),
             g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0, static_cast<unsigned long long>(g_view_sticky_hits));
     g_keep_hits = g_keep_stale = g_view_sticky_hits = 0;
+    if (fast_base()) {
+        LOG("nvk: fast path: %llu draws: pipeline found %llu, bind skipped %llu, dynamic state skipped %llu, vertex input skipped %llu; "
+            "stage binds %llu, %llu skipped (not: other shader %llu, tables %llu, epoch %llu, registrations %llu)%s%llu",
+            static_cast<unsigned long long>(g_fast[FS_DRAWS]), static_cast<unsigned long long>(g_fast[FS_PIPE]),
+            static_cast<unsigned long long>(g_fast[FS_PIPE_BIND]), static_cast<unsigned long long>(g_fast[FS_DYN]),
+            static_cast<unsigned long long>(g_fast[FS_VI]), static_cast<unsigned long long>(g_fast[FS_BINDS]),
+            static_cast<unsigned long long>(g_fast[FS_SETS]), static_cast<unsigned long long>(g_fast[FS_NOT_SH]),
+            static_cast<unsigned long long>(g_fast[FS_NOT_VER]), static_cast<unsigned long long>(g_fast[FS_NOT_EPOCH]),
+            static_cast<unsigned long long>(g_fast[FS_NOT_REGS]), fast_verify() ? "; verify: mismatches " : "; mismatches ",
+            static_cast<unsigned long long>(g_fast_mismatches));
+        for (u64& v : g_fast) v = 0;
+    }
     if (set_miss_stats_on()) {
         std::string m;
         for (int i = 0; i < KG_N; i++)

@@ -521,6 +521,8 @@ void pool_note(u64 addr, u64 bytes, int kind) {
     by.clear(), at = now, f0 = fr;
 }
 
+u64 pool_gen() { return g_pools_gen.load(std::memory_order_acquire); }
+
 bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
     // Every buffer of every draw comes through here: what was found last for this address's page, per thread. An entry
     // answers for the addresses from its pool's start up to the next pool's, where the search below finds that pool first.

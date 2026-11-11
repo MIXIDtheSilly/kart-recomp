@@ -341,6 +341,7 @@ bool reflect(std::vector<u32>& w, Shader& sh, const Row& row) {
         if (b.kind == BKind::GmemLog && !sh.unsupported) sh.unsupported = "global memory write log";
         if (b.kind == BKind::GmemMap && !sh.unsupported) sh.unsupported = "raw global memory (pool table not built yet)";
         sh.bindings.push_back(b);
+        sh.kinds |= 1u << static_cast<u32>(b.kind);
     }
     std::sort(sh.bindings.begin(), sh.bindings.end(), [](const Binding& a, const Binding& b) { return a.binding < b.binding; });
     return true;
