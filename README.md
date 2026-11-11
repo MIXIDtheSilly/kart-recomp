@@ -25,7 +25,7 @@ and `out/`, `gen/`, `build/` and `work/` hold code derived from the game: keep t
 ```
  rtld/main/subsdk0/sdk (AArch64) --lift.py--> <module>_*.cpp --MSVC /MD--> build/<module>.lib
                                                                               │
- Eglantine (F:\switch2\ref\Eglantine, branch aot-backend, GPL-3.0)            │
+ Eglantine (deps\Eglantine + patches\eglantine.patch, GPL-3.0)                │
    core/arm/aot/arm_aot.cpp   CPU backend replacing dynarmic  ◄───────────────┘
    kernel, Switch 2 services, GPU (Ampere/NVN2), audio: unchanged emulator code
 ```
@@ -68,8 +68,8 @@ mapped into the 512 GiB fastmem view. The GPU reads the pool directly, so pages 
 write-protected in the view. `svcMapMemory` and shared memory are real aliases of physical pages.
 
 The host compiles with Eglantine's core flags (`egl.rsp`: its defines and include paths, `/GR-`), so
-class layouts match the prebuilt libraries in `F:\switch2\ref\egl-build`. Rebuild those first
-(`build_egl.bat`) when Eglantine's `video_core` changes. `egl-build` is RelWithDebInfo with
+class layouts match the prebuilt libraries in `deps\egl-build` (`EGL_BUILD`). Rebuild those first
+(`python tools\setup_deps.py egl`) when Eglantine's `video_core` changes. `egl-build` is RelWithDebInfo with
 `CMAKE_CXX_FLAGS_RELWITHDEBINFO=/O2 /Ob2 /DNDEBUG` (CMake's default `/Ob1` inlines only functions
 marked inline: races ran ~5% slower).
 
@@ -228,12 +228,67 @@ and Eglantine's GPU consumes the command stream.
 
 Verification so far: 2,481 integer and 997 SIMD leaf functions identical to Unicorn on every case.
 
-## Rebuilding
+## Building
+
+You need your own dump of the game (its `exefs\` and `romfs\` folders), of the version this was made
+for: module build ids `main` 9e244438c3d8ef1c..., `sdk` 90ebba182862b9ec..., `subsdk0`
+d39a7a3d44530bb6..., `rtld` 35b31ae27e472602... (`out\<module>.json` after step 3). Game patches
+and a few addresses in `host\` are tied to that version.
+
+Requirements: Windows 10/11 x64; Visual Studio 2026 with "Desktop development with C++" (it brings
+CMake and Ninja); Git; Python 3.13 with `pip install backports.zstd` (and `unicorn` for
+`difftest.py`); the .NET 10 SDK (shader translator); a Vulkan 1.3 GPU. Optional: LLVM for
+`BUILD_CC=clang`. Keep the repository in a path without spaces.
 
 ```
-python tools/build_all.py          # lift + compile rtld, main, subsdk0, sdk (~25 min)
-python tools/gen_glue.py
-cmake -S <Eglantine> -B <build> -DEDEN_AOT_DIR=F:/switch2/recomp ...
-cmake --build <build> --target yuzu-cmd
-set EDEN_AOT=1 && eden-cli.exe -g "<dump>\exefs\main"
+:: 1. Where the dump is (local.cfg is not committed; tools\paths.py lists every setting)
+echo KART_GAME=D:\dumps\kart> local.cfg
+
+:: 2. Dependencies into deps\: Eglantine and plumber-racer-2 cloned at pinned commits, patches\ applied,
+::    Eglantine's libraries and the shader translator built (an hour or more, mostly Eglantine)
+python tools\setup_deps.py
+
+:: 3. Unpack and lift the game's modules, then compile them (~25 min for all four)
+python tools\nso.py D:\dumps\kart\exefs out
+for %m in (rtld main subsdk0 sdk) do python tools\scan.py out %m && python tools\funcs.py out %m
+python tools\build_all.py
+python tools\gen_glue.py
+
+:: 4. The game's shaders, translated to SPIR-V into work\nvn_shaders
+python tools\nvn_shaders.py
+
+:: 5. The host and the run
+host\build.bat
+host\out\kart.exe
 ```
+
+`kart.exe` takes the dump folder as its first argument, else `KART_GAME` from the environment or
+`local.cfg`. `kart.exe <dump> --bake-textures` fills the decoded texture cache
+(`work\nvn_texcache`) ahead of time; pipelines are made ahead of time on the first runs.
+`BUILD_MP=<n>` caps parallel compiles in every build step.
+
+The dependencies stay where they are upstream; this repository keeps only its changes to them:
+
+| dependency | upstream | patch | used for |
+|------------|----------|-------|----------|
+| Eglantine (GPL-3.0) | [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine) `adae763570` | `patches\eglantine.patch` | GPU (`video_core`), audio, the AOT CPU backend (`src\core\arm\aot`) |
+| plumber-racer-2 (MIT) | [cheemu21/plumber-racer-2](https://github.com/cheemu21/plumber-racer-2) `843170ac3e` | `patches\plumber-racer-2.patch` | shader splitting and the Ryujinx-based shader translator |
+
+After changing a dependency in its `deps\` folder, `python tools\setup_deps.py patches` writes its
+patch again. To use existing clones elsewhere, point `EGL`, `EGL_BUILD` and `NVN_REF` at them in
+`local.cfg`.
+
+The emulator route (recompiled code inside Eglantine instead of the standalone host):
+
+```
+cmake -S deps\Eglantine -B deps\egl-build -DEDEN_AOT_DIR=<this repository>
+cmake --build deps\egl-build --target yuzu-cmd
+set EDEN_AOT=1 && deps\egl-build\bin\eden-cli.exe -g "<dump>\exefs\main"
+```
+
+## License
+
+GPL-3.0-or-later (`LICENSE`): `host\nv\` and `host\services\gsv.cpp` come from Eden / yuzu
+(GPL-3.0-or-later), and `kart.exe` links Eglantine's GPL libraries. `host\nvn\nvn.h` is MIT
+(h1k421), `tools\texbake\stb_image_write.h` public domain / MIT. The game's code and data are not
+part of this repository and must never be added to it.

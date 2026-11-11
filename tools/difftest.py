@@ -23,12 +23,13 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import a64  # noqa: E402
 import lift  # noqa: E402
+import paths  # noqa: E402
 
 SCRATCH, SCRATCH_SIZE = 0x100000000, 0x10000
 STACK, STACK_SIZE = 0x110000000, 0x10000
 SENTINEL = 0x1000
 MAX_STEPS = 200000
-VCVARS = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+VCVARS = paths.get("VCVARS")
 
 CASE_IN = struct.Struct("<QQ31QQQQ512s")
 CASE_OUT = struct.Struct("<Q31QQQ512sQ")

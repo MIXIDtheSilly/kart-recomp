@@ -5,7 +5,8 @@ Pipeline (after nxnative / plumber-racer-2 `dm/gfx/tools`, MIT):
   1. split   : ref shader_split.py scans RomFS + exefs/main and writes BTCD record packages (<stage>_<group>.bin), shader_map.tsv,
                shader_facts.tsv, shader_pairs.tsv  -> work/nvn_shaders/split/     (run once; needs `pip install backports.zstd` on Python < 3.14)
   2. jobs    : per shader, build the dmsh_xlate job exactly like dmsh_build.py job_for() does for NVN2 records
-  3. xlate   : work/nvn_xlate/dmsh_xlate (the Ryujinx translator, TargetApi.Vulkan) -> <key>.spv + <key>.res.json in work/nvn_shaders/
+  3. xlate   : dmsh_xlate (the Ryujinx translator, TargetApi.Vulkan; NVN_XLATE, built by tools/setup_deps.py xlate) -> <key>.spv + <key>.res.json in work/nvn_shaders/
+Paths (plumber-racer-2, the game dump, the translator) come from tools/paths.py: the environment or local.cfg.
 Key = sha256(control[:0x30] + 00000000 + control[0x34:0x48] + code area)[:16] (NVN2: shader_split.py skey/key_ctl, 0x48 control bytes with +0x30 zeroed;
 the 0x880 rule of the first NVN generation does not apply to version-0xc9 sections).
 
@@ -16,13 +17,16 @@ import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, s
 sys.dont_write_bytecode = True
 RECOMP = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 WORK = os.path.join(RECOMP, 'work')
-REF = os.environ.get('NVN_REF', r'F:\switch2\ref\plumber-racer-2')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths
+REF = paths.get('NVN_REF')
 GAME_ID = '0400C3F00006E000'
-ROMFS = os.environ.get('KART_ROMFS', r'F:\switch2\Kart\base\romfs')
-MAIN = os.environ.get('KART_MAIN', r'F:\switch2\Kart\base\exefs\main')
+_GAME = paths.get('KART_GAME')
+ROMFS = os.environ.get('KART_ROMFS') or (os.path.join(_GAME, 'romfs') if _GAME else '')
+MAIN = os.environ.get('KART_MAIN') or (os.path.join(_GAME, 'exefs', 'main') if _GAME else '')
 OUT = os.path.join(WORK, 'nvn_shaders')
 SPLIT = os.path.join(OUT, 'split')
-XLATE_DIR = os.path.join(WORK, 'nvn_xlate', 'dmsh_xlate', 'bin', 'Release', 'net10.0')
+XLATE_DIR = paths.get('NVN_XLATE')
 XLATE_EXE = os.path.join(XLATE_DIR, 'dmsh_xlate.exe')
 SPIRV_VAL = os.environ.get('SPIRV_VAL', r'C:\VulkanSDK\1.4.363.0\Bin\spirv-val.exe')
 REF_TOOLS = os.path.join(REF, 'dm', 'gfx', 'tools')
@@ -257,8 +261,10 @@ def main():
     a = ap.parse_args()
     outdir = a.out; os.makedirs(outdir, exist_ok=True)
     if not os.path.exists(XLATE_EXE):
-        sys.exit(f'{XLATE_EXE} missing: dotnet build -c Release in {os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(XLATE_DIR))))}')
+        sys.exit(f'{XLATE_EXE} missing: python tools/setup_deps.py xlate (or set NVN_XLATE in local.cfg)')
     if a.split or not os.path.exists(os.path.join(SPLIT, 'shader_map.tsv')):
+        if not ROMFS or not MAIN:
+            paths.game()   # (exits: KART_GAME not set)
         run_split()
     amp, mesh = ref_module('dmsh_ampere'), ref_module('dmsh_meshstage')
     rows, facts = load_tables()

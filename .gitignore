@@ -14,3 +14,7 @@ __pycache__/
 # Built by tools/texbake/build.bat
 /tools/texbake/*.exe
 /tools/texbake/*.obj
+
+# Dependencies fetched and built by tools/setup_deps.py, and local paths (tools/paths.py)
+/deps/
+/local.cfg

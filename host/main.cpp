@@ -582,7 +582,36 @@ int main(int argc, char** argv) {
     timeBeginPeriod(1);
     SetConsoleOutputCP(CP_UTF8);
 
-    fs::path game = argc > 1 ? fs::path(argv[1]) : fs::path("F:/switch2/Kart/base");
+    // The game dump (the folder holding exefs\ and romfs\): the first argument, else KART_GAME from the environment,
+    // else from local.cfg at the repository root (host\out\kart.exe -> ..\..), as the build tools read it
+    fs::path game;
+    if (argc > 1) {
+        game = argv[1];
+    } else if (const char* e = getenv("KART_GAME"); e && *e) {
+        game = e;
+    } else {
+        wchar_t exe[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const fs::path root = fs::path(std::wstring(exe, n)).parent_path().parent_path().parent_path();
+        std::ifstream cfg(root / "local.cfg");
+        for (std::string line; std::getline(cfg, line);) {
+            line = line.substr(0, line.find('#'));
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const auto trim = [](std::string s) {
+                const size_t a = s.find_first_not_of(" \t\r\""), b = s.find_last_not_of(" \t\r\"");
+                return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+            };
+            if (trim(line.substr(0, eq)) != "KART_GAME") continue;
+            const fs::path v = fs::u8path(trim(line.substr(eq + 1)));
+            game = v.is_absolute() ? v : root / v;
+        }
+    }
+    if (game.empty()) {
+        fprintf(stderr, "usage: kart.exe <game dump folder, holding exefs\\ and romfs\\> [--bake-textures [n]]\n"
+                        "       (or set KART_GAME to that folder, in the environment or in local.cfg)\n");
+        return 2;
+    }
     g_config.game_dir = game;
     g_config.user_dir = fs::current_path() / "user";
     fs::create_directories(g_config.user_dir);

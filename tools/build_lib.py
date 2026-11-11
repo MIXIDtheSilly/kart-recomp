@@ -12,8 +12,10 @@ import sys
 import time
 from pathlib import Path
 
+import paths
+
 ROOT = Path(__file__).resolve().parent.parent
-VCVARS = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+VCVARS = paths.get("VCVARS")
 
 
 def main():
@@ -91,7 +93,7 @@ def main():
     print(f"built {a.module}.lib ({size / 2**20:.0f} MiB) in {time.time() - t:.0f} s")
 
 
-CLANG = r"C:\Program Files\LLVM\bin\clang-cl.exe"
+CLANG = paths.get("CLANG")
 
 
 def vcvars_env():

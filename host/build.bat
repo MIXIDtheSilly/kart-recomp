@@ -1,17 +1,22 @@
 @echo off
 rem Builds out\kart.exe: the host runtime, the recompiled modules and Eglantine's GPU (video_core).
-rem Everything compiles with Eglantine's core flags (egl.rsp: defines and include paths, no RTTI)
-rem so class layouts match the prebuilt Eglantine libraries.
-call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
+rem Everything compiles with Eglantine's core flags (egl.rsp, written to out\egl.rsp with the paths filled in:
+rem defines and include paths, no RTTI) so class layouts match the prebuilt Eglantine libraries.
+rem Paths (Eglantine, its build, Visual Studio) come from tools\paths.py: the environment, local.cfg, or deps\.
+rem BUILD_MP=<n>: at most n compiler processes (default: one per core).
 cd /d %~dp0
-set EGL=F:\switch2\ref\Eglantine
-set EB=F:\switch2\ref\egl-build
+for /f "usebackq delims=" %%L in (`python ..\tools\paths.py bat`) do set "%%L"
+if not exist "%EGL%\src\video_core" (echo Eglantine not found at "%EGL%": run python tools\setup_deps.py, or set EGL in local.cfg & exit /b 1)
+if not exist "%EGL_BUILD%\src\video_core\video_core.lib" (echo Eglantine's libraries not found in "%EGL_BUILD%": run python tools\setup_deps.py egl & exit /b 1)
+call "%VCVARS%" >nul 2>nul
+set EB=%EGL_BUILD%
 set CPM=%EGL%\.cache\cpm
 set SDL3=%CPM%\sdl3\3.4.14-1788231389-147a8ee32d-windows-amd64
 if not exist out\obj mkdir out\obj
 if not exist out\obj\nvcore mkdir out\obj\nvcore
-set CFLAGS=/nologo /c /O2 /Zi /MD /std:c++20 /EHsc /GR- /permissive- /utf-8 /Zc:preprocessor /Zc:inline /Zc:externConstexpr /Zc:throwingNew /volatile:iso /W3 /wd4100 /wd4324 /wd4201 /MP /D_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS @egl.rsp /I. /I%SDL3%\include /Foout\obj\ /Fdout\obj\vc.pdb
-cl %CFLAGS% *.cpp services\*.cpp ..\gen\aot_modules.cpp %EGL%\src\core\frontend\emu_window.cpp %EGL%\src\core\frontend\framebuffer_layout.cpp nv\*.cpp nv\devices\*.cpp || exit /b 1
+python ..\tools\paths.py rsp egl.rsp out\egl.rsp || exit /b 1
+set CFLAGS=/nologo /c /O2 /Zi /MD /std:c++20 /EHsc /GR- /permissive- /utf-8 /Zc:preprocessor /Zc:inline /Zc:externConstexpr /Zc:throwingNew /volatile:iso /W3 /wd4100 /wd4324 /wd4201 /MP%BUILD_MP% /D_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS @out\egl.rsp /I. /I"%SDL3%\include" /Foout\obj\ /Fdout\obj\vc.pdb
+cl %CFLAGS% *.cpp services\*.cpp ..\gen\aot_modules.cpp "%EGL%\src\core\frontend\emu_window.cpp" "%EGL%\src\core\frontend\framebuffer_layout.cpp" nv\*.cpp nv\devices\*.cpp || exit /b 1
 if not exist out\obj\nvn mkdir out\obj\nvn
 cl %CFLAGS% /Foout\obj\nvn\ nvn\*.cpp nvn\vk\*.cpp || exit /b 1
 rem nv\core has file names nv\devices uses too (nvmap.cpp).
