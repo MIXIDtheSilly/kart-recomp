@@ -41,7 +41,9 @@ std::unordered_map<u64, WaitList> g_arbiter;  // svcWaitForAddress
 std::unordered_map<u64, WaitList> g_condvar;  // svcWaitProcessWideKeyAtomic
 std::unordered_map<u64, WaitList> g_mutex;    // svcArbitrateLock
 
-std::unordered_map<u32, KThread*> g_threads_by_handle;
+// (for the statistics and dump_threads; holds the threads alive: a thread whose handles were all closed was freed, and
+// both read freed memory through the pointer kept here)
+std::unordered_map<u32, std::shared_ptr<KThread>> g_threads_by_handle;
 
 void enqueue(WaitList& list, KThread* t) {
     auto it = std::find_if(list.begin(), list.end(), [&](KThread* o) { return o->priority > t->priority; });
@@ -202,7 +204,7 @@ void start_sched_sampler() {
                 static_cast<unsigned long long>(st.woke_hist[4] / 5));
             // The threads that queued longest: id, priority, ideal core, mask, entry, ms/s queued, core use.
             std::vector<KThread*> top;
-            for (auto& [h, t] : g_threads_by_handle) if (t->st_queued_n || t->st_owned) top.push_back(t);
+            for (auto& [h, t] : g_threads_by_handle) if (t->st_queued_n || t->st_owned) top.push_back(t.get());
             std::sort(top.begin(), top.end(), [](KThread* a, KThread* b) { return a->st_queued_ns > b->st_queued_ns; });
             char per[1200] = {};
             int pn = 0;
@@ -359,7 +361,11 @@ bool block(std::unique_lock<std::mutex>& lk, KThread* t, s64 timeout_ns) {
         t->wake_ns = 0;
     }
     sched_acquire(lk, t);
-    return ok;
+    // Waiting for a core releases the kernel lock, and a thread whose time ran out is still on its wait list until its
+    // caller takes it off: a signal that came meanwhile woke this thread, so it counts as woken. Reported as a timeout
+    // the signal was lost (the console's kernel takes a thread off its list the moment its time is up): a signal for
+    // one waiter went to a thread that did not act on it, and the waiter it was meant for slept for ever.
+    return ok || t->woken;
 }
 
 std::atomic_ref<u32> word(u64 addr) { return std::atomic_ref<u32>(*reinterpret_cast<u32*>(gptr(addr))); }
@@ -516,7 +522,7 @@ void start_main_thread(u64 entry, u64 stack_top, u64 stack_size) {
     t->ctx.x[1] = t->handle;
     {
         std::scoped_lock lk{g_lock};
-        g_threads_by_handle[t->handle] = t.get();
+        g_threads_by_handle[t->handle] = t;
     }
     (void)stack_size;
     launch(t.get());
@@ -607,8 +613,11 @@ static u32 svc_wait_key(Ctx* c) {
     const s64 timeout = static_cast<s64>(c->x[3]);
     KThread* self = t_current;
     std::unique_lock lk{g_lock};
-    release_mutex(addr);
+    // The "has waiters" word first, then the mutex, as the console's kernel writes them: code that takes the mutex in
+    // user mode the moment it is free (no kernel call) and finds the word still 0 skips its signal, and this thread
+    // would sleep for ever.
     word(key).store(1);
+    release_mutex(addr);
     self->mutex_addr = addr;
     self->mutex_tag = tag;
     self->wait_kind = 2;
@@ -621,9 +630,14 @@ static u32 svc_wait_key(Ctx* c) {
                  static_cast<unsigned long long>(key), static_cast<unsigned long long>(c->x[30]));
     }
     if (!ok) {
-        // Timed out: still queued on the condition variable or on the mutex.
+        if (self->wait_kind == 4) {
+            // Signalled after its time ran out (while it waited for a core) and queued for the mutex since: the signal
+            // is its own now, so it waits for the mutex as any signalled thread does.
+            block(lk, self, -1);
+            return self->wait_result;
+        }
+        // Timed out: still queued on the condition variable.
         if (self->wait_kind == 2) remove(g_condvar, key, self);
-        if (self->wait_kind == 4) remove(g_mutex, addr, self);
         self->wait_kind = 0;
         return KResult::TimedOut;
     }
@@ -814,7 +828,7 @@ void dump_threads() {
     std::unordered_map<KThread*, std::string> sched;
     {
         std::unique_lock lk{g_lock, std::try_to_lock};  // the crashing thread may hold it
-        for (auto& [h, t] : g_threads_by_handle) threads.push_back(t);
+        for (auto& [h, t] : g_threads_by_handle) threads.push_back(t.get());
         for (s32 core = 0; core < NumCores; core++)
             if (g_owner[core]) sched[g_owner[core]] = "owns core " + std::to_string(core);
         for (KThread* r : g_ready) sched[r] = "ready";
@@ -913,7 +927,7 @@ void svc(Ctx* c, u32 imm) {
         t->handle = add_handle(t);
         {
             std::scoped_lock lk{g_lock};
-            g_threads_by_handle[t->handle] = t.get();
+            g_threads_by_handle[t->handle] = t;
         }
         c->x[1] = t->handle;
         break;
