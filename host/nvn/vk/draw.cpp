@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -663,13 +665,13 @@ VkPipelineLayout layout_for(const Shader* const* sets, u32 n, bool mesh_push = f
 void save_pcache_now();
 
 // On a thread of its own (the cache is ~100 MB: writing it took 5% of the submitting thread); one save at a time.
+std::atomic<bool> g_pcache_busy{false};
 void save_pcache() {
     if (!g_pcache || g_pcache_path.empty()) return;
-    static std::atomic<bool> busy{false};
-    if (busy.exchange(true)) return;
+    if (g_pcache_busy.exchange(true)) return;
     std::thread([] {
         save_pcache_now();
-        busy.store(false);
+        g_pcache_busy.store(false);
     }).detach();
 }
 
@@ -889,10 +891,179 @@ void warm_one(const PipeDesc& d) {
     g_warm_cv.notify_all();
 }
 
+// ---- pipelines made ahead of time, before the game first draws with them
+// A pipeline the game has not drawn with in any start yet cost the renderer 150-230 ms when it first appeared (free roam
+// is full of them). The game's shader packages list which vertex and pixel shaders go together (tools/nvn_shaders.py
+// --split: split\shader_pairs.tsv, pso_pairs.tsv; every pipeline seen so far is among them), and a pixel shader nearly
+// always draws to the same targets, so the pipelines still to come can be guessed: each pair with the targets its pixel
+// shader (else its vertex shader) was seen with, else the most common ones. They are made once into the pipeline cache
+// and dropped (the renderer then makes them from it in ~1-2 ms); <cache>.primed lists the ones done, so later starts
+// skip them. Also every compute shader. HOST_NVN_PRIME=0: not.
+
+std::string g_primed_path() { return g_pcache_path + ".primed"; }
+
+std::unordered_set<u64> load_primed() {
+    std::unordered_set<u64> keys;
+    std::ifstream f(g_primed_path(), std::ios::binary);
+    for (u64 k; f.read(reinterpret_cast<char*>(&k), sizeof k);) keys.insert(k);
+    return keys;
+}
+
+void save_primed(const std::unordered_set<u64>& keys) {
+    const std::string file = g_primed_path(), tmp = file + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        for (const u64 k : keys) f.write(reinterpret_cast<const char*>(&k), sizeof k);
+        if (!f.good()) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, file, ec);
+}
+
+struct Targets {
+    u32 ncolor;
+    VkFormat colors[8];
+    VkFormat df, sf;
+    u32 samples;
+    bool operator==(const Targets& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+};
+
+Targets targets_of(const PipeDesc& d) {
+    Targets t{};
+    t.ncolor = d.ncolor;
+    std::memcpy(t.colors, d.colors, sizeof t.colors);
+    t.df = d.df, t.sf = d.sf, t.samples = d.samples;
+    return t;
+}
+
+std::vector<PipeDesc> predicted_descs(const std::vector<PipeDesc>& seen, const std::unordered_set<u64>& primed) {
+    std::vector<PipeDesc> out;
+    std::unordered_map<u64, std::vector<Targets>> by_ps, by_vs;
+    std::vector<std::pair<Targets, u32>> common;   // targets by how many seen pipelines use them
+    std::unordered_set<u64> have;                  // desc keys already made in some start
+    const auto add = [](std::vector<Targets>& v, const Targets& t) {
+        if (std::find(v.begin(), v.end(), t) == v.end()) v.push_back(t);
+    };
+    for (const PipeDesc& d : seen) {
+        have.insert(desc_key(d));
+        if (d.kind != 0) continue;
+        const Targets t = targets_of(d);
+        add(by_ps[d.ps], t), add(by_vs[d.vs], t);
+        auto it = std::find_if(common.begin(), common.end(), [&](const auto& c) { return c.first == t; });
+        if (it == common.end()) common.emplace_back(t, 1);
+        else it->second++;
+    }
+    std::sort(common.begin(), common.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    const auto most_common = [&](u32 ncolor) -> const Targets* {
+        for (const auto& c : common)
+            if (c.first.ncolor == ncolor) return &c.first;
+        return nullptr;
+    };
+    const auto push = [&](PipeDesc d) {
+        const u64 k = desc_key(d);
+        if (!have.count(k) && !primed.count(k) && have.insert(k).second) out.push_back(d);
+    };
+    const std::string dir = shader_folder();
+    std::unordered_set<u64> pairs_done;
+    for (const char* name : {"\\split\\shader_pairs.tsv", "\\split\\pso_pairs.tsv"}) {
+        std::ifstream f(dir + name);
+        for (std::string line; std::getline(f, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            char* end = nullptr;
+            const u64 vs = std::strtoull(line.c_str(), &end, 16);
+            const u64 ps = std::strtoull(end, nullptr, 16);
+            if (!vs || !ps || !pairs_done.insert(vs * 0x9E3779B97F4A7C15ull ^ ps).second) continue;
+            PipeDesc d{};
+            d.kind = 0, d.vs = vs, d.ps = ps;
+            std::vector<Targets> ts;
+            if (auto it = by_ps.find(ps); it != by_ps.end()) ts = it->second;
+            else if (auto iv = by_vs.find(vs); iv != by_vs.end()) ts = iv->second;
+            else {
+                // Neither seen: the most common targets for as many colours as the pixel shader writes (one target is
+                // by far the most common even for shaders writing more, so that one too)
+                const Shader* s = shader_by_key(ps);
+                if (!usable(s)) continue;
+                u32 n = 0;
+                for (u32 i = 0; i < 8; i++)
+                    if (s->outputs & (1u << i)) n = i + 1;
+                for (const u32 want : {n, n ? 1u : 0u})
+                    if (const Targets* t = most_common(want)) add(ts, *t);
+            }
+            for (const Targets& t : ts) {
+                d.ncolor = t.ncolor;
+                std::memcpy(d.colors, t.colors, sizeof d.colors);
+                d.df = t.df, d.sf = t.sf, d.samples = t.samples;
+                push(d);
+            }
+        }
+    }
+    std::ifstream f(dir + "\\refl.tsv");
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        char* end = nullptr;
+        const u64 key = std::strtoull(line.c_str(), &end, 16);
+        if (key && std::strncmp(end, "\tcs", 3) == 0) {
+            PipeDesc d{};
+            d.kind = 2, d.vs = key;
+            push(d);
+        }
+    }
+    return out;
+}
+
+// Makes the pipeline into the cache and drops it (any thread); true when it was made.
+bool prime_one(const PipeDesc& d) {
+    const Shader* vs = shader_by_key(d.vs);
+    const Shader* ps = d.ps ? shader_by_key(d.ps) : nullptr;
+    if (!usable(vs) || (d.ps && !usable(ps))) return false;
+    VkPipeline p;
+    if (d.kind == 2) {
+        const Shader* sets[1] = {vs};
+        p = make_compute(vs, layout_for(sets, 1));
+    } else {
+        const Shader* sets[2] = {vs, ps};
+        p = make_graphics(d, nullptr, vs, ps, layout_for(sets, 2));
+    }
+    if (!p) return false;
+    vkDestroyPipeline(ctx().dev, p, nullptr);
+    return true;
+}
+
+void prime(const std::vector<PipeDesc>& seen) {
+    if (const char* e = getenv("HOST_NVN_PRIME"); e && std::strcmp(e, "0") == 0) return;
+    const u64 t0 = host_ns();
+    std::unordered_set<u64> primed = load_primed();
+    const std::vector<PipeDesc> list = predicted_descs(seen, primed);
+    if (list.empty()) return;
+    LOG("nvk: making %zu pipelines ahead of time (%zu done in earlier starts)", list.size(), primed.size());
+    std::atomic<size_t> next{0}, made{0};
+    std::mutex mu;
+    const u32 n = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 6u);
+    std::vector<std::thread> threads;
+    for (u32 i = 0; i < n; i++)
+        threads.emplace_back([&] {
+            SetThreadDescription(GetCurrentThread(), L"NVN pipelines ahead of time");
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            for (size_t k; (k = next++) < list.size();) {
+                made += prime_one(list[k]);
+                std::scoped_lock lk{mu};
+                primed.insert(desc_key(list[k]));   // (also the ones that could not be made: not again)
+            }
+        });
+    for (std::thread& t : threads) t.join();
+    // (the cache first, so a listed pipeline is in it; after a save already running)
+    while (g_pcache_busy.exchange(true)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    save_pcache_now();
+    g_pcache_busy.store(false);
+    save_primed(primed);
+    LOG("nvk: made %zu pipelines ahead of time in %llu ms on %u threads", made.load(),
+        static_cast<unsigned long long>((host_ns() - t0) / 1'000'000), n);
+}
+
 // Makes the pipelines of the last starts' list, in the order they were first made, on threads of their own below the
-// game's priority (HOST_NVN_WARMUP=0: not).
+// game's priority (HOST_NVN_WARMUP=0: not), then the ones still to come (prime).
 void warm_up(std::vector<PipeDesc> list) {
-    if (const char* e = getenv("HOST_NVN_WARMUP"); (e && std::strcmp(e, "0") == 0) || list.empty()) return;
+    if (const char* e = getenv("HOST_NVN_WARMUP"); e && std::strcmp(e, "0") == 0) return;
     std::thread([list = std::move(list)] {
         const u64 t0 = host_ns();
         std::atomic<size_t> next{0};
@@ -914,6 +1085,7 @@ void warm_up(std::vector<PipeDesc> list) {
             static_cast<unsigned long long>((host_ns() - t0) / 1'000'000), n, made);
         // Long only when the driver had to compile them (a new driver, or the layouts changed): keep what it made
         if (host_ns() - t0 > 10'000'000'000ull) save_pcache();
+        prime(list);
     }).detach();
 }
 

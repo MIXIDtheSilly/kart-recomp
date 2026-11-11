@@ -415,6 +415,8 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
 
 }  // namespace
 
+std::string shader_folder() { return shader_dir(); }
+
 u32 stage_set(ShStage s) {
     switch (s) {
     case SH_VS: case SH_CS: return 0;

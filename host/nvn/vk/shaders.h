@@ -66,6 +66,8 @@ struct Shader {
 const Shader* shader(const u8 key[8]);
 // The same by the key as a number (Shader::key). Any thread.
 const Shader* shader_by_key(u64 key);
+// The folder of the translated shaders (work/nvn_shaders, or HOST_NVN_SHADERS).
+std::string shader_folder();
 // Number of shaders in the reflection table (0: table missing).
 size_t shader_count();
 
