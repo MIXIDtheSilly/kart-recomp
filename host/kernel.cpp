@@ -833,8 +833,16 @@ void dump_threads() {
                 ResumeThread(h);
             }
         }
-        LOG("thread %llu (handle %#x, prio %d, core %d) %s key %#llx lr %s %s [%s]", t->id, t->handle, t->priority,
-            t->core, k >= 0 && k <= 4 ? kinds[k] : "?", t->wait_key, describe_guest(t->ctx.x[30]).c_str(),
+        // What a waiter waits on: the arbiter word, or the mutex word (its owner's thread handle, bit 30 = has waiters;
+        // for a condition variable wait, the mutex it takes back).
+        char word[96] = "";
+        if (const u64 a = k == 2 ? t->mutex_addr : k == 3 || k == 4 ? t->wait_key : 0) {
+            const mem::Info i = mem::query(a);
+            if (i.state != mem::Free && (i.perm & mem::R))
+                snprintf(word, sizeof word, " %s %#llx = %#x", k == 3 ? "word" : "mutex", static_cast<unsigned long long>(a), ld<u32>(a));
+        }
+        LOG("thread %llu (handle %#x, prio %d, core %d) %s key %#llx%s lr %s %s [%s]", t->id, t->handle, t->priority,
+            t->core, k >= 0 && k <= 4 ? kinds[k] : "?", t->wait_key, word, describe_guest(t->ctx.x[30]).c_str(),
             where.c_str(), sched.count(t) ? sched[t].c_str() : "-");
     }
 }

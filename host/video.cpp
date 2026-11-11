@@ -629,10 +629,13 @@ int debug_page_state(u64 va) {
     return state;
 }
 
+static std::atomic<u64> g_last_frame_ns{0};
 void report_frame_stats(double fps, double frame_ms, double gpu_wait_ms) {
+    g_last_frame_ns.store(host_ns(), std::memory_order_relaxed);
     std::scoped_lock lk{g_stats_lock};
     g_stats = {fps, frame_ms, gpu_wait_ms, true};
 }
+unsigned long long last_frame_ns() { return g_last_frame_ns.load(std::memory_order_relaxed); }
 
 // HOST_POLL_VA=<addr>[,<addr>...] (hex, with HOST_TIMELINE): a thread samples these guest words
 // every few microseconds and logs each change, with the steady clock in microseconds (the clock

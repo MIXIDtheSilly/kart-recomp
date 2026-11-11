@@ -6,6 +6,7 @@
 #include <thread>
 #include <dbghelp.h>
 #include <timeapi.h>
+#include <tlhelp32.h>
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "winmm.lib")
 
@@ -257,6 +258,69 @@ std::string host_symbol(u64 rip) {
     return out;
 }
 
+// The code addresses of a suspended thread's host stack, innermost first.
+static int walk_host_stack(CONTEXT ctx, u64* out, int max) {
+    int n = 0;
+    __try {
+        while (n < max && ctx.Rip) {
+            out[n++] = ctx.Rip;
+            DWORD64 base = 0;
+            if (PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr)) {
+                void* data = nullptr;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &data, &frame, nullptr);
+            } else {  // a leaf function: its return address is on top of the stack
+                ctx.Rip = *reinterpret_cast<const u64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+// Every thread of the process with its host call stack, for a stall: where each one runs or waits. A recompiled
+// function carries its guest address in its name, so a guest thread's stack is also its guest call chain. A thread is
+// suspended only while its stack is read; names are looked up after it runs again (the lookup takes locks it may hold).
+static void dump_host_stacks() {
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    int idle = 0;
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        const HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        u64 pcs[28];
+        int n = 0;
+        if (SuspendThread(h) != static_cast<DWORD>(-1)) {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(h, &ctx)) n = walk_host_stack(ctx, pcs, 28);
+            ResumeThread(h);
+        }
+        PWSTR desc = nullptr;
+        GetThreadDescription(h, &desc);
+        CloseHandle(h);
+        std::string line;
+        bool pool_idle = false;
+        for (int i = 0; i < n; i++) {
+            std::string s = host_symbol(pcs[i]);
+            if (i == 0 && s.find("WaitForWorkViaWorkerFactory") != std::string::npos) pool_idle = true;
+            if (s.size() > 90) s.resize(90);
+            line += i ? " < " : " ";
+            line += s;
+        }
+        if (pool_idle) idle++;   // (a thread-pool thread with nothing to do)
+        else LOG("stack of host thread %lu (%ls):%s", te.th32ThreadID, desc && *desc ? desc : L"-", line.c_str());
+        if (desc) LocalFree(desc);
+    }
+    CloseHandle(snap);
+    if (idle) LOG("and %d idle thread-pool threads", idle);
+}
+
 namespace {
 
 LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
@@ -487,7 +551,30 @@ int main(int argc, char** argv) {
         std::thread([secs] {
             std::this_thread::sleep_for(std::chrono::seconds{secs});
             kern::dump_threads();
+            dump_host_stacks();
         }).detach();
+    }
+    // A stall: the game showed frames and then none for HOST_STALL_DUMP_S seconds (default 10, 0 = never; normal runs
+    // never go 6 s without one). Logs what every guest thread waits on and every host thread's stack, once per stall
+    // and at most 3 times a run: the rare mid-race hang leaves no other trace.
+    {
+        const char* v = std::getenv("HOST_STALL_DUMP_S");
+        const int secs = v ? std::atoi(v) : 10;
+        if (secs > 0) {
+            std::thread([secs] {
+                SetThreadDescription(GetCurrentThread(), L"stall watch");
+                u64 dumped_for = 0;
+                for (int dumps = 0; dumps < 3;) {
+                    std::this_thread::sleep_for(std::chrono::seconds{1});
+                    const u64 last = video::last_frame_ns();
+                    if (!last || last == dumped_for || host_ns() - last < static_cast<u64>(secs) * 1'000'000'000ull) continue;
+                    dumped_for = last, dumps++;
+                    LOG("[RED] stall: no frame for %d s. Guest threads, then every host thread's stack:", secs);
+                    kern::dump_threads();
+                    dump_host_stacks();
+                }
+            }).detach();
+        }
     }
     // KART_PGO_DUMP=<s>: write the PGO profile (LLVM_PROFILE_FILE, default default.profraw) after that many
     // seconds. The runtime only writes it at a clean exit, and benchmark runs end by killing the process.
