@@ -31,6 +31,7 @@ std::unordered_map<u64, bool> g_failed;    // serials whose image could not be m
 // frame's texture object over that memory finds what was rendered there.
 std::unordered_map<u64, Image*> g_shared;  // by shape_key
 std::vector<Image*> g_parked;
+std::atomic<u64> g_sysmem_bytes{0};   // images in system memory (Image::sysmem)
 constexpr u64 ParkNs = 2'000'000'000ull;
 u64 g_shared_hits = 0, g_revived = 0, g_created = 0, g_stats_at = 0;
 // Live image memory: ASTC textures are recompressed to BC3 here, 1 byte a texel (the console has 1 for 4x4 ASTC, 0.25 for 8x8).
@@ -59,6 +60,7 @@ void destroy(Image* img) {
     upload_async_cancel(img);
     const u64 bytes = alloc_size(img->alloc);
     bytes_of_kind(img) -= bytes;
+    if (img->sysmem) g_sysmem_bytes -= bytes;
     // The last submissions using it may still run, and kept descriptor sets may hold its views.
     defer_past_kept([img] {
         Device& c = ctx();
@@ -333,6 +335,18 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     g_created++;
     bytes_of_kind(img) += alloc_size(img->alloc);
+    {   // put in system memory (VRAM full when it was made): the GPU reads it over PCIe
+        VmaAllocationInfo ai2;
+        vmaGetAllocationInfo(ctx().vma, img->alloc, &ai2);
+        const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+        vmaGetMemoryProperties(ctx().vma, &mp);
+        static u32 logged = 0;
+        img->sysmem = !(mp->memoryTypes[ai2.memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (img->sysmem) g_sysmem_bytes += ai2.size;
+        if (img->sysmem && logged++ < 50)
+            LOG("nvk: [WARNING] image %ux%ux%u x%u, %u levels, NVN format %#x (%llu MB) went to system memory (VRAM full)", img->width,
+                img->height, img->depth, img->layers, img->levels, d.format, static_cast<unsigned long long>(ai2.size >> 20));
+    }
     img->mem = nvn::ga(t->mem);
     if (const u64 key = shape_key(t); key && g_shared.emplace(key, img).second) img->shape = key;
     return img;
@@ -389,8 +403,12 @@ void image_evict_cold() {
         if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             used += b[h].usage, budget += b[h].budget, spare += b[h].statistics.blockBytes - b[h].statistics.allocationBytes;
     used -= std::min(used, spare);
-    if (used * 10 < budget * 9) return;
-    const u64 want = std::min(used - budget * 85 / 100, u64{512} << 20);
+    // Device memory that went to system memory instead (VRAM had no room when it was made: the GPU reads it over PCIe):
+    // pressure too, whatever the totals say.
+    // (images only: sparse.cpp parks unused terrain tiles in system memory on purpose)
+    const u64 spilled = g_sysmem_bytes.load();
+    if (used * 10 < budget * 9 && !spilled) return;
+    const u64 want = std::min(std::max(used * 10 >= budget * 9 ? used - budget * 85 / 100 : 0, spilled), u64{512} << 20);
 
     // Only what guest storage still holds: what the GPU made exists nowhere else
     std::scoped_lock lk{g_lock};
@@ -408,6 +426,10 @@ void image_evict_cold() {
         freed += alloc_size(img->alloc);
         gone.insert(img);
     }
+    // The images in system memory go too (made again on their next use, in the room just made): else they stay there for good.
+    if (spilled)
+        for (auto& [serial, img] : g_images)
+            if (img->sysmem && !img->sparse && !img->gpu_written && !img->parked && img->has_content && !img->pending) gone.insert(img);
     if (gone.empty()) return;
     for (auto it = g_images.begin(); it != g_images.end();)
         it = gone.count(it->second) ? g_images.erase(it) : std::next(it);
@@ -417,8 +439,8 @@ void image_evict_cold() {
         destroy(img);
     }
     bind_epoch_bump();
-    LOG("nvk: device memory short (%llu of %llu MB): %zu textures not used for %llu s released, %llu MB", static_cast<unsigned long long>(used >> 20),
-        static_cast<unsigned long long>(budget >> 20), gone.size(), static_cast<unsigned long long>(after_frames / 60), static_cast<unsigned long long>(freed >> 20));
+    LOG("nvk: device memory short (%llu of %llu MB, %llu MB in system memory): %zu textures not used for %llu s released, %llu MB",
+        static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(spilled >> 20), gone.size(), static_cast<unsigned long long>(after_frames / 60), static_cast<unsigned long long>(freed >> 20));
 }
 
 void image_pool_gone(u64 lo, u64 hi) {

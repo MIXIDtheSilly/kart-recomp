@@ -305,6 +305,9 @@ void create_device(Device& c) {
     ai.device = c.dev;
     ai.instance = c.instance;
     ai.vulkanApiVersion = VK_API_VERSION_1_3;
+    // 64 MB blocks (VMA's default 256): a block goes back to the driver only once empty, and freed textures left
+    // ~1.4 GB of 256 MB blocks unused but held, pushing new ones into system memory; anything over 32 MB gets its own.
+    ai.preferredLargeHeapBlockSize = 64ull << 20;
     ai.pVulkanFunctions = &vf;
     check(vmaCreateAllocator(&ai, &c.vma), "vmaCreateAllocator");
 

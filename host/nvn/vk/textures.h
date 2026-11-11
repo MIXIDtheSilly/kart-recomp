@@ -27,6 +27,7 @@ struct Image {
     bool gpu_written = false;   // rendered to / written by shaders or copies: guest storage is no longer its content
     bool uploaded = false;      // content taken from guest storage once
     u32 upload_count = 0;       // uploads from storage so far (statistics)
+    bool sysmem = false;        // its memory is in system memory (VRAM was full when it was made)
     bool has_content = false;   // an upload from storage was recorded (its content is defined)
     std::shared_ptr<struct AsyncUpload> pending;  // an upload being prepared on the worker thread (upload.h)
     // Texture objects over the same storage and shape share the image (textures.cpp): refs counts them. parked: when the
