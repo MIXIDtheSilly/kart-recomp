@@ -322,7 +322,6 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img->image;
     b.subresourceRange = full_range(img);
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     std::scoped_lock lk{g_lock};
     auto [it, fresh] = g_images.emplace(t->serial, img);
     if (!fresh) {  // another thread made it first
@@ -330,6 +329,8 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
         delete img;
         return it->second;
     }
+    // (only for the image kept: one destroyed right away must not be in cb, where the driver thread may record it later)
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     g_created++;
     bytes_of_kind(img) += alloc_size(img->alloc);
     img->mem = nvn::ga(t->mem);

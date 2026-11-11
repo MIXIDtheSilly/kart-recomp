@@ -16,6 +16,7 @@
 #include "draw.h"
 #include "present.h"
 #include "replay_int.h"
+#include "vkq.h"
 
 namespace nvk {
 namespace {
@@ -279,6 +280,7 @@ void dump_query_end(VkCommandBuffer cb, u32 q) {
 
 void dump_flush(u64 value) {
     if (g_pending.empty() && g_query_read == g_query_next && g_recheck.empty()) return;
+    vkq::sync();   // (the dump modes keep the driver thread off; in case one does not)
     Device& c = ctx();
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     const VkSemaphore sem = timeline();

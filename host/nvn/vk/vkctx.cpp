@@ -2,6 +2,7 @@
 
 #include "dump.h"
 #include "hitch.h"
+#include "vkq.h"
 
 #include "../../memory.h"
 
@@ -283,6 +284,7 @@ void create_device(Device& c) {
     dci.ppEnabledExtensionNames = want.data();
     check(vkCreateDevice(c.phys, &dci, nullptr, &c.dev), "vkCreateDevice");
     load_device(c.dev);
+    vkq::install_cmd_proxy();   // (HOST_NVN_CMD_PROXY: recording on the driver thread too)
     vkGetDeviceQueue(c.dev, c.family, 0, &c.queue);
 
     if (c.feat.host_import) {
@@ -432,6 +434,7 @@ VkCommandPool g_oneoff_pool = VK_NULL_HANDLE;
 
 VkCommandBuffer begin_oneoff() {
     Device& c = ctx();
+    vkq::sync();   // (a one-off is waited for: whatever the driver thread still has goes first)
     g_oneoff_lock.lock();
     if (!g_oneoff_pool) {
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -460,6 +463,7 @@ void end_oneoff(VkCommandBuffer cb) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
+    vkq::sync();
     {
         std::scoped_lock lk{c.queue_lock};
         check(vkQueueSubmit(c.queue, 1, &si, fence), "vkQueueSubmit (one-off)");

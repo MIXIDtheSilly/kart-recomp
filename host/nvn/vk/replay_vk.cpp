@@ -28,6 +28,7 @@
 #include "sparse.h"
 #include "textures.h"
 #include "vkctx.h"
+#include "vkq.h"
 
 namespace nvn {
 namespace {
@@ -471,26 +472,30 @@ void flush_partial() {
     end_rendering(cb);   // (rendering always loads and stores: the next draw opens it again)
     vkEndCommandBuffer(cb);
     const VkCommandBuffer pre = draw_sub_flush();
-    const VkCommandBuffer cbs[2] = {pre, cb};
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = pre ? 2 : 1;
-    si.pCommandBuffers = pre ? cbs : &cb;
-    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     VkSemaphore bind_sem = VK_NULL_HANDLE;
     const u64 bind_value = sparse_commit(&bind_sem);
-    const VkPipelineStageFlags bind_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (bind_value) {
-        ts.waitSemaphoreValueCount = 1;
-        ts.pWaitSemaphoreValues = &bind_value;
-        si.pNext = &ts;
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &bind_sem;
-        si.pWaitDstStageMask = &bind_stage;
-    }
     {
         HitchTimer ht{HI_SUBMIT};
-        std::scoped_lock lk{c.queue_lock};
-        check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit (part)");
+        // (on the driver thread when it is on: everything the submit needs, by value)
+        vkq::run([pre, cb, bind_sem, bind_value] {
+            Device& c = ctx();
+            const VkCommandBuffer cbs[2] = {pre, cb};
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = pre ? 2 : 1;
+            si.pCommandBuffers = pre ? cbs : &cb;
+            VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            const VkPipelineStageFlags bind_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            if (bind_value) {
+                ts.waitSemaphoreValueCount = 1;
+                ts.pWaitSemaphoreValues = &bind_value;
+                si.pNext = &ts;
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &bind_sem;
+                si.pWaitDstStageMask = &bind_stage;
+            }
+            std::scoped_lock lk{c.queue_lock};
+            check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit (part)");
+        });
     }
     if (g_cur->more_used == g_cur->more.size()) {
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -524,8 +529,9 @@ void full_barrier(VkCommandBuffer cb) { nvn::full_barrier(cb); }
 void nvk::defer(std::function<void()> fn) {
     using namespace nvn;
     std::scoped_lock lk{g_mu};
-    // The submission being recorded counts too: it may already reference the object.
-    const u64 after = g_submitted.load() + (g_cur ? 1 : 0);
+    // The submission being recorded counts too: it may already reference the object. So does work still waiting for
+    // the driver thread (vkq.h; a queued present of the window image, say): the next submission is appended after it.
+    const u64 after = g_submitted.load() + (g_cur || !vkq::idle() ? 1 : 0);
     if (g_done.load() >= after) {
         fn();
         return;
@@ -751,39 +757,43 @@ void vk_rp_exec(const uint8_t* p) {
 }
 
 uint64_t vk_rp_sub_commit() {
-    Device& c = ctx();
     VkCommandBuffer cb = g_cur->cb;
     end_rendering(cb);
     vkEndCommandBuffer(cb);
     const u64 value = g_submitted.load() + 1;
     g_cur->value = value;
     const VkCommandBuffer pre = draw_sub_commit(value);
-    const VkCommandBuffer cbs[2] = {pre, cb};
-    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    ts.signalSemaphoreValueCount = 1;
-    ts.pSignalSemaphoreValues = &value;
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.pNext = &ts;
-    si.commandBufferCount = pre ? 2 : 1;
-    si.pCommandBuffers = pre ? cbs : &cb;
     const VkSemaphore sem = timeline();
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &sem;
     // Sparse images' tile binds of this submission go first
     VkSemaphore bind_sem = VK_NULL_HANDLE;
     const u64 bind_value = sparse_commit(&bind_sem);
-    const VkPipelineStageFlags bind_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (bind_value) {
-        ts.waitSemaphoreValueCount = 1;
-        ts.pWaitSemaphoreValues = &bind_value;
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &bind_sem;
-        si.pWaitDstStageMask = &bind_stage;
-    }
     {
         HitchTimer ht{HI_SUBMIT};
-        std::scoped_lock lk{c.queue_lock};
-        check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+        // (on the driver thread when it is on. The completion thread may wait for `value` before it is submitted: a
+        // timeline wait for a value not yet submitted just waits.)
+        vkq::run([pre, cb, sem, value, bind_sem, bind_value] {
+            Device& c = ctx();
+            const VkCommandBuffer cbs[2] = {pre, cb};
+            VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            ts.signalSemaphoreValueCount = 1;
+            ts.pSignalSemaphoreValues = &value;
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.pNext = &ts;
+            si.commandBufferCount = pre ? 2 : 1;
+            si.pCommandBuffers = pre ? cbs : &cb;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &sem;
+            const VkPipelineStageFlags bind_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            if (bind_value) {
+                ts.waitSemaphoreValueCount = 1;
+                ts.pWaitSemaphoreValues = &bind_value;
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &bind_sem;
+                si.pWaitDstStageMask = &bind_stage;
+            }
+            std::scoped_lock lk{c.queue_lock};
+            check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+        });
     }
     g_submitted.store(value);
     if (dump_active()) dump_flush(value);
@@ -1006,16 +1016,31 @@ bool rp_wait(uint64_t fence, uint64_t timeout_ns) {
 bool rp_wait_acq(uint64_t fence, uint64_t timeout_ns) { return rp_wait(fence, timeout_ns); }
 void vk_rp_finish() { rp_wait(g_submitted.load(), UINT64_MAX); }
 void vk_rp_drain() {
+    vkq::sync();
     vk_rp_finish();
     vkDeviceWaitIdle(ctx().dev);
 }
 
 // ---------------------------------------------------------------- present
+// The whole present (acquire, blit, submit, vkQueuePresentKHR) runs on the driver thread when it is on, after the
+// submissions before it. It waits on the GPU for the last submitted value, taken here.
 uint64_t vk_rp_present(const tex_t* t, double, const int* crop) {
     static std::atomic<u64> n{0};
     Image* img = t ? image_find(t->serial) : nullptr;
-    if (img) present(img->image, img->format, img->width, img->height, crop, g_submitted.load());
-    else present(VK_NULL_HANDLE, VK_FORMAT_B8G8R8A8_UNORM, 1, 1, nullptr, g_submitted.load());
+    struct Args {
+        VkImage image = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+        u32 w = 1, h = 1;
+        bool has_crop = false;
+        int crop[4]{};
+        u64 ready = 0;
+    } a;
+    if (img) {
+        a.image = img->image, a.format = img->format, a.w = img->width, a.h = img->height;
+        if (crop) a.has_crop = true, std::memcpy(a.crop, crop, sizeof a.crop);
+    }
+    a.ready = g_submitted.load();
+    vkq::run([a] { present(a.image, a.format, a.w, a.h, a.has_crop ? a.crop : nullptr, a.ready); });
     return ++n;
 }
 void rp_present_wait(uint64_t) {}

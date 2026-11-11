@@ -29,6 +29,7 @@
 
 #include "../nvn_int.h"
 #include "hitch.h"
+#include "vkq.h"
 
 namespace nvk {
 u64 g_hitch_ns[HI_N];
@@ -87,6 +88,7 @@ void renderer_loop() {
     SetThreadDescription(GetCurrentThread(), L"NVN renderer");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     nvk::t_hitch = true;
+    nvk::vkq::attach();   // queue work from here on goes to the driver thread (vkq.h)
     for (;;) {
         Step s;
         {

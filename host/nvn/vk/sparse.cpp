@@ -15,6 +15,7 @@
 #include "../nvn_tex.h"
 #include "../replay.h"
 #include "hitch.h"
+#include "vkq.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 
@@ -712,26 +713,28 @@ u64 sparse_commit(VkSemaphore* sem) {
         si.pNext = &ti;
         check(vkCreateSemaphore(c.dev, &si, nullptr, &g_sem), "sparse bind semaphore");
     }
-    std::vector<VkSparseImageMemoryBindInfo> ib;
-    std::vector<VkSparseImageOpaqueMemoryBindInfo> ob;
-    for (auto& [im, v] : binds) ib.push_back({im, static_cast<u32>(v.size()), v.data()});
-    for (auto& [im, v] : opaque) ob.push_back({im, static_cast<u32>(v.size()), v.data()});
     const u64 value = ++g_sem_value;
-    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    ts.signalSemaphoreValueCount = 1;
-    ts.pSignalSemaphoreValues = &value;
-    VkBindSparseInfo bi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
-    bi.pNext = &ts;
-    bi.imageBindCount = static_cast<u32>(ib.size());
-    bi.pImageBinds = ib.data();
-    bi.imageOpaqueBindCount = static_cast<u32>(ob.size());
-    bi.pImageOpaqueBinds = ob.data();
-    bi.signalSemaphoreCount = 1;
-    bi.pSignalSemaphores = &g_sem;
-    {
+    // (on the driver thread when it is on, in its place among the submits: the closure owns the binds)
+    vkq::run([binds = std::move(binds), opaque = std::move(opaque), value, bsem = g_sem]() mutable {
+        Device& c = ctx();
+        std::vector<VkSparseImageMemoryBindInfo> ib;
+        std::vector<VkSparseImageOpaqueMemoryBindInfo> ob;
+        for (auto& [im, v] : binds) ib.push_back({im, static_cast<u32>(v.size()), v.data()});
+        for (auto& [im, v] : opaque) ob.push_back({im, static_cast<u32>(v.size()), v.data()});
+        VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ts.signalSemaphoreValueCount = 1;
+        ts.pSignalSemaphoreValues = &value;
+        VkBindSparseInfo bi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        bi.pNext = &ts;
+        bi.imageBindCount = static_cast<u32>(ib.size());
+        bi.pImageBinds = ib.data();
+        bi.imageOpaqueBindCount = static_cast<u32>(ob.size());
+        bi.pImageOpaqueBinds = ob.data();
+        bi.signalSemaphoreCount = 1;
+        bi.pSignalSemaphores = &bsem;
         std::scoped_lock lk{c.queue_lock};
         check(vkQueueBindSparse(c.queue, 1, &bi, VK_NULL_HANDLE), "vkQueueBindSparse");
-    }
+    });
     *sem = g_sem;
     return value;
 }
