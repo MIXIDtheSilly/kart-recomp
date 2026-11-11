@@ -1,6 +1,8 @@
 #include "upload.h"
 
 #include <algorithm>
+#include <map>
+#include <execution>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -53,8 +55,68 @@ struct Geom {
 
 Geom geom_of(const Image* img) { return {img->type, img->aspect, img->width, img->height, img->depth, img->layers, img->levels}; }
 
+// Big buffers (staging data, files read back) from a pool of blocks freed before, not zero-filled: a fresh 85 MB
+// vector cost 15-50 ms in page faults and zeroing each time a texture was read back from the disk cache.
+struct BlockPool {
+    static constexpr size_t Big = 1u << 20, Keep = 128u << 20;   // pooled from this size; idle bytes kept at most
+    std::mutex mu;
+    std::multimap<size_t, void*> idle;           // by block size
+    std::unordered_map<void*, size_t> size_of;   // every pooled block handed out
+    size_t idle_bytes = 0;
+    void* get(size_t n) {
+        n = (n + Big - 1) & ~(Big - 1);
+        {
+            std::scoped_lock lk{mu};
+            auto it = idle.lower_bound(n);
+            if (it != idle.end() && it->first <= n + n / 4) {
+                void* p = it->second;
+                idle_bytes -= it->first;
+                size_of[p] = it->first;
+                idle.erase(it);
+                return p;
+            }
+        }
+        void* p = ::operator new(n);
+        std::scoped_lock lk{mu};
+        size_of[p] = n;
+        return p;
+    }
+    void put(void* p) {
+        std::unique_lock lk{mu};
+        auto it = size_of.find(p);
+        const size_t n = it->second;
+        size_of.erase(it);
+        if (idle_bytes + n <= Keep) {
+            idle.emplace(n, p), idle_bytes += n;
+            return;
+        }
+        lk.unlock();
+        ::operator delete(p);
+    }
+};
+inline BlockPool g_blocks;
+
+template <typename T>
+struct PoolAlloc {
+    using value_type = T;
+    PoolAlloc() = default;
+    template <typename U> PoolAlloc(const PoolAlloc<U>&) {}
+    T* allocate(size_t n) {
+        const size_t b = n * sizeof(T);
+        return static_cast<T*>(b >= BlockPool::Big ? g_blocks.get(b) : ::operator new(b));
+    }
+    void deallocate(T* p, size_t n) {
+        if (n * sizeof(T) >= BlockPool::Big) g_blocks.put(p);
+        else ::operator delete(p);
+    }
+    template <typename U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // (not zeroed)
+    template <typename U, typename... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+    template <typename U> bool operator==(const PoolAlloc<U>&) const { return true; }
+};
+using Bytes = std::vector<u8, PoolAlloc<u8>>;
+
 struct Prepared {
-    std::vector<u8> staging;
+    Bytes staging;
     std::vector<VkBufferImageCopy> regions;
 };
 
@@ -136,7 +198,7 @@ void convert(const Geom& g, const nvn_texdesc& d, const Untiled& u, Prepared& ou
     int bw = 1, bh = 1;
     ::nvn_fmt_bpb(d.format, &bw, &bh);
     const bool astc = format(static_cast<u32>(d.format)).kind == FmtKind::Astc;
-    std::vector<u8>& staging = out.staging;
+    Bytes& staging = out.staging;
     std::vector<u8> rgba;
     for (const Untiled::Part& pt : u.parts) {
         const std::span<const u8> blocks(u.blocks.data() + pt.at, pt.bytes);
@@ -258,7 +320,7 @@ u64 g_cache_bytes = 0;
 u64 cache_max() {
     static const u64 mb = [] {
         const char* e = getenv("HOST_NVN_UPLOAD_CACHE_MB");
-        return e ? std::strtoull(e, nullptr, 10) : 1024ull;
+        return e ? std::strtoull(e, nullptr, 10) : 256ull;   // (the disk cache is fast now)
     }();
     return mb << 20;
 }
@@ -305,7 +367,12 @@ struct DiskHead {
     u32 nregions, _pad;
     u64 staging, packed;
 };
-constexpr u32 DiskMagic = 0x4354564E, DiskVersion = 2;   // "NVTC"
+// Version 3: the staging data packed in pieces of DiskChunk bytes (u32 count, then each piece's packed size, then the
+// pieces), unpacked on several threads: one 85 MB block took 25-185 ms to read back on one thread, and the renderer
+// waits for that when the game copies a texture the moment it streams it in. Version 2 (one block) is still read,
+// and written again as version 3.
+constexpr u32 DiskMagic = 0x4354564E, DiskVersion = 3, DiskVersionOne = 2;   // "NVTC"
+constexpr u64 DiskChunk = 4ull << 20;
 
 std::mutex g_disk_mu;
 std::condition_variable g_disk_cv;
@@ -352,41 +419,104 @@ std::string disk_file(u64 key) {
     return disk_dir() + b;
 }
 
-bool disk_get(u64 key, Prepared& out) {
+// The prepared upload of key from the folder; *old: it is in the one-block format (to be written again).
+bool disk_get(u64 key, Prepared& out, bool* old) {
     if (disk_dir().empty()) return false;
-    FILE* f = std::fopen(disk_file(key).c_str(), "rb");
-    if (!f) return false;
+    // The whole file in one read, by the Win32 calls (not the C runtime's streams)
+    const u64 t0 = host_ns();
+    const HANDLE fh = CreateFileA(disk_file(key).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER fsize{};
+    Bytes file;
+    bool ok = GetFileSizeEx(fh, &fsize) && fsize.QuadPart >= static_cast<LONGLONG>(sizeof(DiskHead)) && fsize.QuadPart < (1ll << 31);
+    const u64 t1 = host_ns();
+    if (ok) {
+        file.resize(static_cast<size_t>(fsize.QuadPart));
+        DWORD got = 0;
+        ok = ReadFile(fh, file.data(), static_cast<DWORD>(file.size()), &got, nullptr) && got == file.size();
+    }
+    CloseHandle(fh);
+    const u64 t2 = host_ns();
     DiskHead h{};
-    std::vector<u8> packed;
-    bool ok = std::fread(&h, sizeof h, 1, f) == 1 && h.magic == DiskMagic && h.version == DiskVersion && h.key == key &&
-              h.nregions && h.nregions < 4096 && h.packed < (1ull << 31) && h.staging < (1ull << 31);
+    if (ok) std::memcpy(&h, file.data(), sizeof h);
+    ok = ok && h.magic == DiskMagic && (h.version == DiskVersion || h.version == DiskVersionOne) && h.key == key && h.nregions &&
+         h.nregions < 4096 && h.packed < (1ull << 31) && h.staging < (1ull << 31);
+    *old = h.version == DiskVersionOne;
+    size_t at = sizeof h;
+    const auto take = [&](void* dst, size_t n) {
+        if (!ok || file.size() - at < n) return ok = false;
+        std::memcpy(dst, file.data() + at, n);
+        at += n;
+        return true;
+    };
+    std::vector<u32> sizes;
     if (ok) {
         out.regions.resize(h.nregions);
-        packed.resize(h.packed);
-        ok = std::fread(out.regions.data(), sizeof(VkBufferImageCopy), h.nregions, f) == h.nregions &&
-             std::fread(packed.data(), 1, h.packed, f) == h.packed;
+        take(out.regions.data(), h.nregions * sizeof(VkBufferImageCopy));
+        if (!*old) {
+            u32 n = 0;
+            take(&n, sizeof n);
+            ok = ok && n == (h.staging + DiskChunk - 1) / DiskChunk;
+            if (ok) sizes.resize(n), take(sizes.data(), n * sizeof(u32));
+        } else {
+            sizes.push_back(static_cast<u32>(h.packed));
+        }
+        ok = ok && file.size() - at == h.packed;
     }
-    std::fclose(f);
+    u64 t3 = t2;
     if (ok) {
-        out.staging.resize(h.staging);
-        ok = Common::Compression::DecompressDataLZ4(out.staging.data(), out.staging.size(), packed.data(), packed.size()) ==
-             static_cast<int>(h.staging);
+        const u8* packed = file.data() + at;
+        std::vector<u64> off(sizes.size() + 1, 0);
+        for (size_t i = 0; i < sizes.size(); i++) off[i + 1] = off[i] + sizes[i];
+        ok = off.back() == h.packed;
+        if (ok) {
+            out.staging.resize(h.staging);
+            t3 = host_ns();
+            const u64 piece = *old ? h.staging : DiskChunk;
+            std::atomic<bool> good{true};
+            const auto unpack = [&](size_t i) {
+                const u64 o = i * piece, n = std::min(piece, h.staging - o);
+                if (Common::Compression::DecompressDataLZ4(out.staging.data() + o, n, packed + off[i], sizes[i]) != static_cast<int>(n))
+                    good.store(false);
+            };
+            if (sizes.size() == 1) {
+                unpack(0);   // (not through the shared thread pool for one piece)
+            } else {
+                std::vector<size_t> idx(sizes.size());
+                for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+                std::for_each(std::execution::par, idx.begin(), idx.end(), unpack);
+            }
+            ok = good.load();
+        }
     }
+    if (host_ns() - t0 > 20'000'000ull)
+        LOG("nvk: disk cache %llu KB: open %llu ms, read %llu, unpacked alloc %llu, unpack %llu", static_cast<unsigned long long>(h.staging >> 10),
+            static_cast<unsigned long long>((t1 - t0) / 1'000'000), static_cast<unsigned long long>((t2 - t1) / 1'000'000),
+            static_cast<unsigned long long>((t3 - t2) / 1'000'000), static_cast<unsigned long long>((host_ns() - t3) / 1'000'000));
     if (!ok) out = Prepared{};
     return ok;
 }
 
 // One prepared upload into the folder; the bytes it takes there, 0 when it could not be written.
 u64 disk_write(u64 key, const Prepared& p) {
-    const std::vector<u8> packed = Common::Compression::CompressDataLZ4(p.staging.data(), p.staging.size());
-    if (packed.empty()) return 0;
-    const DiskHead h{DiskMagic, DiskVersion, key, static_cast<u32>(p.regions.size()), 0, p.staging.size(), packed.size()};
+    std::vector<std::vector<u8>> chunks;
+    std::vector<u32> sizes;
+    u64 total = 0;
+    for (u64 o = 0; o < p.staging.size(); o += DiskChunk) {
+        chunks.push_back(Common::Compression::CompressDataLZ4(p.staging.data() + o, std::min<u64>(DiskChunk, p.staging.size() - o)));
+        if (chunks.back().empty()) return 0;
+        sizes.push_back(static_cast<u32>(chunks.back().size()));
+        total += chunks.back().size();
+    }
+    const u32 n = static_cast<u32>(chunks.size());
+    const DiskHead h{DiskMagic, DiskVersion, key, static_cast<u32>(p.regions.size()), 0, p.staging.size(), total};
     const std::string file = disk_file(key), tmp = file + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) return 0;
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
               std::fwrite(p.regions.data(), sizeof(VkBufferImageCopy), p.regions.size(), f) == p.regions.size() &&
-              std::fwrite(packed.data(), 1, packed.size(), f) == packed.size();
+              std::fwrite(&n, sizeof n, 1, f) == 1 && std::fwrite(sizes.data(), sizeof(u32), n, f) == n;
+    for (const std::vector<u8>& c : chunks) ok = ok && std::fwrite(c.data(), 1, c.size(), f) == c.size();
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
     if (ok) std::filesystem::rename(tmp, file, ec);
@@ -394,7 +524,7 @@ u64 disk_write(u64 key, const Prepared& p) {
         std::filesystem::remove(tmp, ec);
         return 0;
     }
-    return sizeof h + p.regions.size() * sizeof(VkBufferImageCopy) + packed.size();
+    return sizeof h + p.regions.size() * sizeof(VkBufferImageCopy) + 4 + n * 4ull + total;
 }
 
 void disk_writer() {
@@ -437,11 +567,20 @@ void run(AsyncUpload& j) {
         auto p = std::make_shared<Prepared>();
         Untiled u;
         j.ok = untile(j.g, j.d, j.src.data(), j.size, u);
+        const u64 t1 = host_ns();
         const u64 dk = j.ok && !disk_dir().empty() ? content_key(j.g, j.d, u) : 0;
-        const bool disk = dk && disk_get(dk, *p);
+        const u64 t2 = host_ns();
+        bool old = false;
+        const bool disk = dk && disk_get(dk, *p, &old);
         if (j.ok && !disk) convert(j.g, j.d, u, *p);
         j.took = host_ns() - t0;
+        if (j.took > 30'000'000ull)   // a big one: where its time went
+            LOG("nvk: upload %ux%u x%u, %u levels, %llu MB: %llu ms (untile %llu, key %llu, %s %llu)", j.g.width, j.g.height, j.g.layers,
+                j.g.levels, static_cast<unsigned long long>(j.size >> 20), static_cast<unsigned long long>(j.took / 1'000'000),
+                static_cast<unsigned long long>((t1 - t0) / 1'000'000), static_cast<unsigned long long>((t2 - t1) / 1'000'000),
+                disk ? "disk read" : "decode", static_cast<unsigned long long>((host_ns() - t2) / 1'000'000));
         if (disk) {
+            if (old) disk_put(dk, p);   // again in pieces
             std::scoped_lock lk{g_q_mu};
             g_n_disk++, g_ms_disk += j.took / 1'000'000;
         } else if (dk) {
@@ -525,11 +664,22 @@ bool upload_async_start(Image* img, const nvn::tex_t* t) {
         static bool started = false;
         if (!started) {
             started = true;
-            // One thread: the decode inside spreads over the ASTC worker pool (video_core/textures/workers.cpp).
-            std::thread([] {
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                worker();
-            }).detach();
+            // A few threads (HOST_NVN_UPLOAD_WORKERS, default 4): an upload from the disk cache (untile, hash, read,
+            // unpack) runs on one thread only, and the game streams hundreds at once in free roam; with one worker they
+            // queued for 250 ms on average (1 s worst) and the renderer stood still for the ones a copy needed. A
+            // decode (cache miss) still spreads over the ASTC worker pool (video_core/textures/workers.cpp).
+            const char* e = getenv("HOST_NVN_UPLOAD_WORKERS");
+            const int n = std::clamp(e ? std::atoi(e) : 4, 1, 16);
+            // At normal priority: below it, a worker waited ~30 ms (two scheduler ticks) for a CPU after each file read
+            // while the game's threads ran, and the renderer often waits for the upload a worker has
+            // (HOST_NVN_UPLOAD_PRIORITY=<Windows thread priority>, e.g. -1 for below normal).
+            const char* pe = getenv("HOST_NVN_UPLOAD_PRIORITY");
+            const int prio = pe ? std::atoi(pe) : THREAD_PRIORITY_NORMAL;
+            for (int i = 0; i < n; i++)
+                std::thread([prio] {
+                    SetThreadPriority(GetCurrentThread(), prio);
+                    worker();
+                }).detach();
         }
         g_q.push_back(std::move(j));
         log_stats();
@@ -712,6 +862,35 @@ void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
     }
 }
 
+// The folder's files still in the one-block format written again in pieces (version 3), on `threads` threads.
+void repack_disk(u32 threads) {
+    std::vector<u64> keys;
+    std::error_code ec;
+    for (const auto& f : std::filesystem::directory_iterator(disk_dir(), ec))
+        if (f.path().extension() == ".bc") keys.push_back(std::strtoull(f.path().stem().string().c_str(), nullptr, 16));
+    const u64 t0 = host_ns();
+    std::atomic<size_t> next{0}, repacked{0}, failed{0};
+    std::vector<std::thread> pool;
+    for (u32 i = 0; i < threads; i++)
+        pool.emplace_back([&] {
+            for (size_t k; (k = next++) < keys.size();) {
+                FILE* f = std::fopen(disk_file(keys[k]).c_str(), "rb");
+                if (!f) continue;
+                DiskHead h{};
+                const bool one = std::fread(&h, sizeof h, 1, f) == 1 && h.magic == DiskMagic && h.version == DiskVersionOne;
+                std::fclose(f);
+                if (!one) continue;
+                Prepared p;
+                bool old = false;
+                if (disk_get(keys[k], p, &old) && disk_write(keys[k], p)) repacked++;
+                else failed++;
+            }
+        });
+    for (std::thread& t : pool) t.join();
+    LOG("bake: %zu cache files written again in pieces, %zu failed, of %zu (%llu s)", repacked.load(), failed.load(), keys.size(),
+        static_cast<unsigned long long>((host_ns() - t0) / 1'000'000'000));
+}
+
 }  // namespace
 
 int bake_textures(const std::filesystem::path& game, size_t check) {
@@ -723,6 +902,7 @@ int bake_textures(const std::filesystem::path& game, size_t check) {
         LOG("[RED] bake: the decoded texture cache is turned off (HOST_NVN_TEXCACHE=0)");
         return 1;
     }
+    if (!check) repack_disk(half);
     std::vector<std::filesystem::path> files;
     std::error_code ec;
     for (const auto& f : std::filesystem::recursive_directory_iterator(game / "romfs", ec))
