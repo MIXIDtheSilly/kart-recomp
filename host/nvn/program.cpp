@@ -64,7 +64,7 @@ void ctl_lens(const uint8_t* c, uint32_t* nctl, uint32_t* ncode) {
     memcpy(&own, c + 0x20, 4);
     *nctl = own >= 0x760 && own < 0x880 ? own : 0x880;
 }
-// mapped: computed only when the code area is readable (at SetShaders: Mario sets some programs with an unmapped address first and fills it in before the first draw).
+// mapped: computed only when the code area is readable (at SetShaders: one earlier game sets some programs with an unmapped address first and fills it in before the first draw).
 // sd->control and sd->data are guest addresses. The control section is only guaranteed valid during SetShaders (NVN lets the caller free it once it returns, and Unity does).
 bool keys_hash(const NVNshaderData& sd, bool mapped, uint8_t out[8]) {
     const u64 control = (u64)(uintptr_t)sd.control;

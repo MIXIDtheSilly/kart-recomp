@@ -59,10 +59,10 @@ bool flushed(u64 a, u64 n) {   // whether the CPU flushed any of [a, a + n)
 }
 
 // ---------- Sparse virtual pools ----------
-// Monster Hunter Rise and Mario Kart World build GPU heaps from separately allocated physical pools mapped at offsets of their own into one huge virtual pool (this game: the
+// Some games build GPU heaps from separately allocated physical pools mapped at offsets of their own into one huge virtual pool (this game: the
 // terrain caches, 8192x8192 arrays of 68 layers in sparse pools, written by the CPU into physical pools, then mapped; no GPU copy writes them). Every virtual pool gets a reserved
 // address range at Initialize, since the game may create its textures and buffers before mapping anything; its first mapping request then decides (MapVirtual):
-// one that maps the whole pool from offset 0 keeps the alias (the range is given back; Super Mario Bros. Wonder's pool), anything else makes the pool sparse.
+// one that maps the whole pool from offset 0 keeps the alias (the range is given back; one earlier game's pool), anything else makes the pool sparse.
 // OCTOPATH TRAVELER (Unreal Engine 4) gives each streamed texture a virtual pool of its own (0x20000 to 0x560000 bytes, flags 0x2a1), creates the texture in it, maps its mip
 // tail from a 4 MB physical pool and later the higher mips from other pages of it, after writing their texels there on the CPU: aliased, the texture had no storage (created
 // before any mapping) and the later mappings were refused. A pool larger than the application pool (app_pool 0x265100000) is sparse from the start.
@@ -163,7 +163,7 @@ bool vpool_map(vpool* v, const map_req& r) {   // caller holds g_vp_mu; -> false
         if (!ph->mem || r.poff < 0 || (uint64_t)r.poff + r.size > ph->size) { LOG("[RED] nvn: virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void*)v->pool, (const void*)ph, (unsigned long long)ph->size, (void*)ph->mem, (unsigned long long)r.poff, (unsigned long long)r.size); return false; }
         phys = ga(ph->mem) + (u64)r.poff;
     }
-    // Which virtual page mapped each physical page last (sparse_stale). Mario Kart World's terrain caches recycle a
+    // Which virtual page mapped each physical page last (sparse_stale). The game's terrain caches recycle a
     // physical page by mapping it at another tile without unmapping the tile that had it; the page table keeps the old
     // tile as an alias, as the console's does (other pools alias on purpose: render targets sharing memory), and the
     // old tiles are told to the renderer, which drops such tiles from its sampled-only sparse images (sparse.cpp).

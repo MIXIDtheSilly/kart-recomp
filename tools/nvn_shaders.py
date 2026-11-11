@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mario Kart World (Switch 2, NVN2 / Ampere sm86) shaders -> Vulkan SPIR-V, offline.
+"""The game's (Switch 2, NVN2 / Ampere sm86) shaders -> Vulkan SPIR-V, offline.
 
 Pipeline (after nxnative / plumber-racer-2 `dm/gfx/tools`, MIT):
   1. split   : ref shader_split.py scans RomFS + exefs/main and writes BTCD record packages (<stage>_<group>.bin), shader_map.tsv,

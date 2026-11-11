@@ -46,7 +46,7 @@ static void cmd_new_segment(cmd_t* o, uint8_t* mem, size_t n) {
 // overlapping it; segments overflowing from a host segment keep the same range.
 // The segment pool grows on demand (SMBW opening course: many small command buffers each overflow once per frame); abort only beyond HOSTSEG_CAP in total.
 // A segment is HOSTSEG_SZ, with two exceptions (hostseg_size): an empty pool with a length of at most HOSTSEG_SMALL outside a recording gets that much rounded up to HOSTSEG_SMALL
-// (Super Mario Odyssey hands out many such 512-byte grants before recording), and a record larger than HOSTSEG_SZ gets a segment that holds it. A free segment is taken again only for a request of its own size; the cap counts every segment's bytes.
+// (one earlier game hands out many such 512-byte grants before recording), and a record larger than HOSTSEG_SZ gets a segment that holds it. A free segment is taken again only for a request of its own size; the cap counts every segment's bytes.
 // An empty-pool grant outside a recording means the game's own allocator for command memory came back empty. On hardware a null pool cannot be written to, so a game only gets here
 // when the host's records outgrew what it measured for them. Those segments have no guest range to be reclaimed by, so they are not reclaimed; the cap's abort names the state, and the fix belongs in the record sizes
 namespace {
@@ -215,7 +215,7 @@ NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NV
 NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const float *rgba, int mask) {
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; memcpy(r->rgba, rgba, 16);
 }
-// Clears of integer targets (Paper Mario: The Thousand-Year Door): recorded as floats, which the renderer converts to the attachment's integer type (the load action's clear colour,
+// Clears of integer targets (seen in an earlier game): recorded as floats, which the renderer converts to the attachment's integer type (the load action's clear colour,
 // clear_color_tri); exact up to 2^24 in magnitude, and 0xffffffff rounds to 2^32, which converts back to it
 NVN(nvnCommandBufferClearColori, void, NVNcommandBuffer *c, int index, const int *rgba, int mask) {
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; for (int i = 0; i < 4; i++) r->rgba[i] = (float)rgba[i];
@@ -329,7 +329,7 @@ NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, 
 // Indirect: the {count, instances, first, base instance} record at ind is usually written by the GPU earlier in the frame (Hyrule Warriors: Age of Calamity's first battle), so the replay
 // issues an indirect draw from the pool buffer instead of reading it at record or replay time
 // NVN2 mesh draw: count task (or, with no task stage, mesh) workgroups from first, recorded as a draw of the replay's own primitive (nvn_obj.h NVN_PRIM_MESH), so the pass
-// planning sees a draw that needs the pass's depth and colour like any other. Mario Kart World's race pass draws with it
+// planning sees a draw that needs the pass's depth and colour like any other. This game's race pass draws with it
 NVN_NOPROTO(nvnCommandBufferDrawMeshTasks, void, NVNcommandBuffer *c, int first, int n) { if (n > 0) rec_draw(c, p_draw{NVN_PRIM_MESH, first, n, 1, 0, 0}); }
 NVN(nvnCommandBufferDrawArraysIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress ind) { rec_draw(c, p_draw{pr, 0, 0, 1, 0, ind}); }
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
@@ -537,7 +537,7 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 // The stencil test ZCull's stencil cull assumes (a stencil function, then its reference and mask): only a hint for culling ahead of the real stencil test, which the draws'
 // depth-stencil state still does. The host does no ZCull, so there is nothing to set (Donkey Kong Bananza: EQUAL, 0xff)
 NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
-// NVN2 variable-rate shading: the shading rate image palette and image are hints (Mario Kart World sets the palette on every command buffer); full-rate shading is always correct
+// NVN2 variable-rate shading: the shading rate image palette and image are hints (the game sets the palette on every command buffer); full-rate shading is always correct
 NVN_NOPROTO(nvnCommandBufferShadingRateImagePalette, void, NVNcommandBuffer *c) { (void)c; }
 NVN_NOPROTO(nvnCommandBufferBindShadingRateImage, void, NVNcommandBuffer *c) { (void)c; }
 NVN_NOPROTO(nvnCommandBufferSetShadingRatePaletteMode, void, NVNcommandBuffer *c) { (void)c; }

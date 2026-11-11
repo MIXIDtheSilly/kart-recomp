@@ -74,10 +74,10 @@ struct samp_par { uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction;
 struct samp_builder_t { NVNdevice* dev; samp_par p; };                                      NVN_FITS(samp_builder_t, NVNsamplerBuilder);
 struct samp_t { uint32_t magic; samp_par p; };                                              NVN_FITS(samp_t, NVNsampler);
 
-// The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see program.cpp.
+// The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in an earlier game); see program.cpp.
 // sd[].data / sd[].control are GUEST addresses (NVNshaderData as the game filled it in).
 struct prog_t { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; };           NVN_FITS(prog_t, NVNprogram);   // serial: table key for the renderer's resolved result
-static_assert(sizeof(prog_t) == 112, "prog_t is 112 bytes (Mario's NVNprogram is smaller than the header's)");
+static_assert(sizeof(prog_t) == 112, "prog_t is 112 bytes (a game's NVNprogram can be smaller than the header's)");
 
 struct sync_t { uint32_t magic, fenced; uint64_t fence; };   /* fenced 2: by WindowAcquireTexture */ NVN_FITS(sync_t, NVNsync);
 struct ev_builder_t { const pool_t* pool; int64_t off; };                                   NVN_FITS(ev_builder_t, NVNeventBuilder);
@@ -157,7 +157,7 @@ struct p_depth_clamp { int32_t on; };   // SetDepthClamp: depth outside [near, f
 struct p_vp_swizzle { int32_t first, n; uint8_t sw[16][4]; };   // SetViewportSwizzles: per viewport the source of clip x, y, z, w (NVNviewportSwizzle) XOR the identity (0, 2, 4, 6), so 0 = unchanged
 struct p_bind_program { const prog_t* prog; int32_t stages; };
 // kind: 0 blend 1 color 2 chmask 3 ms 4 poly 5 ds. Recorded with the state object's own bytes only: 16 bytes with the header for color, channel mask and polygon state,
-// 24 for blend, multisample and depth-stencil, instead of 40 for all. Readers take that kind's size from bytes. Games size display-list heaps by GetCommandMemoryUsed: Super Mario Odyssey's
+// 24 for blend, multisample and depth-stencil, instead of 40 for all. Readers take that kind's size from bytes. Games size display-list heaps by GetCommandMemoryUsed: one earlier game's
 // "DisplayList" GPU heap (62 MB, a bump allocator) filled while a kingdom loaded with 40-byte state binds (39% of its bytes), and every display list after that got no memory
 struct p_bind_state { int32_t kind; uint8_t bytes[0x18]; };
 struct p_bind_vattr { int32_t first, n; uint32_t st[16]; };

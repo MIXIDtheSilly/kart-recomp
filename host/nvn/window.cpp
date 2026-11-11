@@ -152,7 +152,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow* w, NVNsyn
     if (s) { ((sync_t*)s)->fenced = 2; ((sync_t*)s)->fence = rp_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync)
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
-// The older API (NVN 53, Super Mario 3D World + Bowser's Fury): the queue waits for the texture on the GPU and no sync object is handed out. The renderer completes in submission order, so later commands already come after earlier presents;
+// The older API (NVN 53, older titles): the queue waits for the texture on the GPU and no sync object is handed out. The renderer completes in submission order, so later commands already come after earlier presents;
 // the same as WindowAcquireTexture without a sync object
 NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue* q, NVNwindow* w, int* idx) {
     (void)q; return h_nvnWindowAcquireTexture(w, nullptr, idx) == NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS ? (NVNqueueAcquireTextureResult)0 : (NVNqueueAcquireTextureResult)1;

@@ -3653,7 +3653,7 @@ index 76d608bbe0..47e08c629b 100644
      /// Turn off those bits and notify the tracker if needed. Call the given function on each turned off range.
      /// @param type            Type of the address
 diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
-index 88d571ae5f..35cb1a341d 100644
+index 88d571ae5f..c593396449 100644
 --- a/src/video_core/dma_pusher.cpp
 +++ b/src/video_core/dma_pusher.cpp
 @@ -4,11 +4,17 @@
@@ -4017,7 +4017,7 @@ index 88d571ae5f..35cb1a341d 100644
 +    // them to host memory right after the dispatch or copy that writes them and submits. The
 +    // front then waits only for the back to run that work and for the GPU to finish the copy, not
 +    // for everything queued and a cache flush (FlushGpuWrittenCommands: ~400 GPU round trips a
-+    // second in a Mario Kart World race, during which the back had nothing to do). Pages
++    // second in a race of the kart game, during which the back had nothing to do). Pages
 +    // FlushGpuWrittenCommands flushed whole and no GPU work wrote since are read from guest
 +    // memory.
 +    if (GpuWrittenCommandsMode() != 1 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
