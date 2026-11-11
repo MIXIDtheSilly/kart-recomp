@@ -1044,6 +1044,7 @@ std::vector<SetSlot> g_set_cache(SetSlots);
 u64 g_set_gen = 1;
 size_t g_set_kept = 0;
 u64 g_set_hits = 0, g_set_made = 0;
+u64 g_binds_total = 0, g_made_total = 0;   // never reset (draw_counts)
 
 VkDescriptorSet set_find(u64 key) {
     for (size_t i = key & (SetSlots - 1);; i = (i + 1) & (SetSlots - 1)) {
@@ -1308,6 +1309,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
     u64 sub_key = key ? key ^ (g_bind_epoch.load(std::memory_order_relaxed) + 1) * 0x9E3779B97F4A7C15ull : 0;
     if (key && !sub_key) sub_key = 1;
     const bool keep = key && set_keep_on();
+    g_binds_total++;
     if (key && !(dump_active() && !dump_brief())) {   // (a dump notes every binding of every draw)
         if (const VkDescriptorSet kept = set_find(sub_key)) {
             g_set_hits++;
@@ -1321,7 +1323,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                 return true;
             }
     }
-    g_set_made++;
+    g_set_made++, g_made_total++;
     if (key && set_miss_stats_on()) {
         auto [it, first] = g_miss_last.try_emplace(sh);
         if (first) g_miss_first++;
@@ -2449,6 +2451,10 @@ std::string checkpoint_desc(u64 marker) {
              static_cast<unsigned long long>(m.b), static_cast<unsigned long long>(m.c), static_cast<unsigned long long>(m.sub),
              static_cast<unsigned long long>(g_mark_n - marker));
     return b;
+}
+
+void draw_counts(u64* stage_binds, u64* sets_made, u64* generations) {
+    *stage_binds = g_binds_total, *sets_made = g_made_total, *generations = g_keep_gens;
 }
 
 void draw_log_stats() {

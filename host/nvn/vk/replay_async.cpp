@@ -110,7 +110,18 @@ void renderer_loop() {
         std::memcpy(before, nvk::g_hitch_ns, sizeof before);
         const u64 t0 = host_ns();
         s.fn();
-        if (const u64 ns = host_ns() - t0; ns >= HitchMs * 1'000'000) log_hitch(ns, before);
+        const u64 step_ns = host_ns() - t0;
+        if (step_ns >= HitchMs * 1'000'000) log_hitch(step_ns, before);
+        TIMELINE("rstep %llu us sub=%d", static_cast<unsigned long long>(step_ns / 1000), s.sub ? 1 : 0);
+        // How busy this thread is (logged every 10 s): the time inside steps against the time waiting for one.
+        {
+            static u64 busy = 0, steps = 0, at = 0;
+            busy += step_ns, steps++;
+            if (const u64 now = t0 + step_ns; now - at > 10'000'000'000ull) {
+                if (at) LOG("nvk: renderer thread: busy %.0f%% (%llu steps)", 100.0 * busy / (now - at), static_cast<unsigned long long>(steps));
+                at = now, busy = steps = 0;
+            }
+        }
         if (s.sub) {
             std::scoped_lock lk{g_q_mu};
             g_subs--;
@@ -138,6 +149,7 @@ void post(std::function<void()> fn, bool sub = false) {
                 const u64 t0 = host_ns();
                 g_room.wait(lk, [] { return g_subs < MaxQueued; });
                 g_stall_ns += host_ns() - t0, g_stall_n++;
+                TIMELINE("room %llu us", static_cast<unsigned long long>((host_ns() - t0) / 1000));
             }
             g_subs++;
             if (const u64 now = host_ns(); now - g_stats_at > 10'000'000'000ull) {
@@ -157,7 +169,10 @@ template <class F> auto call(F f) -> decltype(f()) {
     if (!async_replay() || std::this_thread::get_id() == g_renderer) return f();
     std::packaged_task<decltype(f())()> task(std::move(f));
     auto result = task.get_future();
+    const u64 t0 = g_timeline_on ? host_ns() : 0;
     post([&task] { task(); });
+    result.wait();
+    TIMELINE("rcall %llu us", static_cast<unsigned long long>((host_ns() - t0) / 1000));
     return result.get();
 }
 
@@ -298,6 +313,7 @@ uint64_t rp_sub_commit() {
     if (!async_replay()) return vk_rp_sub_commit();
     const u64 fence = g_issued.load() + 1;
     g_issued.store(fence);
+    TIMELINE("subq fence=%llu", static_cast<unsigned long long>(fence));
     // HOST_NVN_EVENT_ORDER=0: every submission as it comes, whatever its events say
     static const bool ordered = getenv("HOST_NVN_EVENT_ORDER") == nullptr || atoi(getenv("HOST_NVN_EVENT_ORDER")) != 0;
     if (ordered) {

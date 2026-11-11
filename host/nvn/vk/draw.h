@@ -60,5 +60,8 @@ u64 draw_total();
 
 // One log line of draw statistics since the last call.
 void draw_log_stats();
+// Totals so far: descriptor sets bound for a stage, of them made new, generations of kept sets begun (for the timeline:
+// what a submission cost against what it bound).
+void draw_counts(u64* stage_binds, u64* sets_made, u64* generations);
 
 }  // namespace nvk

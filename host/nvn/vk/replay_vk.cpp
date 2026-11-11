@@ -105,6 +105,7 @@ void completion_loop() {
         if (r != VK_SUCCESS) vk_fail(r, "vkWaitSemaphores (completion; device lost?)");
         for (Post& p : s->posts) apply(p);
         s->posts.clear();
+        TIMELINE("gpudone fence=%llu", static_cast<unsigned long long>(s->value));
         std::vector<std::function<void()>> run;
         {
             std::scoped_lock lk{g_mu};
@@ -495,6 +496,7 @@ void flush_partial() {
             }
             std::scoped_lock lk{c.queue_lock};
             check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit (part)");
+            TIMELINE("vkpart");
         });
     }
     if (g_cur->more_used == g_cur->more.size()) {
@@ -762,6 +764,12 @@ uint64_t vk_rp_sub_commit() {
     vkEndCommandBuffer(cb);
     const u64 value = g_submitted.load() + 1;
     g_cur->value = value;
+    if (g_timeline_on) {
+        u64 made, binds, gens;
+        draw_counts(&binds, &made, &gens);
+        TIMELINE("rcommit fence=%llu made=%llu binds=%llu gens=%llu", static_cast<unsigned long long>(value), static_cast<unsigned long long>(made),
+                 static_cast<unsigned long long>(binds), static_cast<unsigned long long>(gens));
+    }
     const VkCommandBuffer pre = draw_sub_commit(value);
     const VkSemaphore sem = timeline();
     // Sparse images' tile binds of this submission go first
@@ -793,6 +801,7 @@ uint64_t vk_rp_sub_commit() {
             }
             std::scoped_lock lk{c.queue_lock};
             check(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+            TIMELINE("vksubmit fence=%llu", static_cast<unsigned long long>(value));
         });
     }
     g_submitted.store(value);
@@ -1004,6 +1013,7 @@ bool rp_wait(uint64_t fence, uint64_t timeout_ns) {
     else ok = g_cv.wait_for(lk, std::chrono::nanoseconds(timeout_ns), ready);
     const u64 t1 = host_ns();
     n_waits++, waited_ns += t1 - t0;
+    TIMELINE("gpuwait %llu us fence=%llu", static_cast<unsigned long long>((t1 - t0) / 1000), static_cast<unsigned long long>(fence));
     if (t1 - stats_at > 10'000'000'000ull) {
         if (stats_at)
             LOG("nvk: game waits for the GPU: %llu (%llu ms in all; %.1f submissions not done at a wait on average)",

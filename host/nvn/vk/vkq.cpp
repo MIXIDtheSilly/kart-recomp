@@ -45,6 +45,8 @@ void consumer_loop() {
     SetThreadDescription(GetCurrentThread(), L"NVN driver");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     u64 t = 0;
+    // How this thread spends its time (logged every 10 s): running entries, spinning on an empty ring, asleep.
+    u64 st_at = host_ns(), st_run = 0, st_spin = 0, st_sleep = 0, st_sleeps = 0, st_entries = 0, st_batches = 0;
     for (;;) {
         u64 h = g_head.load(std::memory_order_acquire);
         if (h == t) {
@@ -54,22 +56,36 @@ void consumer_loop() {
                 _mm_pause();
                 if (++k % 64 == 0 && host_ns() - t0 > SpinNs) break;
             }
+            const u64 t1 = host_ns();
+            st_spin += t1 - t0;
             if (h == t) {
                 g_cons_sleeps.store(1, std::memory_order_seq_cst);
                 h = g_head.load(std::memory_order_seq_cst);
                 if (h == t) WaitOnAddress(&g_head, &t, sizeof t, INFINITE);
                 g_cons_sleeps.store(0, std::memory_order_relaxed);
+                st_sleep += host_ns() - t1, st_sleeps++;
                 continue;
             }
         }
+        const u64 r0 = host_ns();
         for (u32 n = 1; t != h; n++) {
             Hdr* e = reinterpret_cast<Hdr*>(g_ring + (t & (RingBytes - 1)));
             if (e->call) e->call(e + 1);
             t += e->size;
+            st_entries++;
             if (n % 32 == 0 || t == h) {
                 g_tail.store(t, std::memory_order_seq_cst);
                 if (g_prod_sleeps.load(std::memory_order_seq_cst)) WakeByAddressAll(&g_tail);
             }
+        }
+        const u64 r1 = host_ns();
+        st_run += r1 - r0, st_batches++;
+        if (r1 - st_at > 10'000'000'000ull) {
+            const double span = static_cast<double>(r1 - st_at);
+            LOG("nvk: driver thread: running %.0f%%, spinning %.0f%%, asleep %.0f%% (%llu sleeps, %llu batches, %llu entries)", 100.0 * st_run / span,
+                100.0 * st_spin / span, 100.0 * st_sleep / span, static_cast<unsigned long long>(st_sleeps),
+                static_cast<unsigned long long>(st_batches), static_cast<unsigned long long>(st_entries));
+            st_at = r1, st_run = st_spin = st_sleep = st_sleeps = st_entries = st_batches = 0;
         }
     }
 }
