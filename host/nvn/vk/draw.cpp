@@ -946,11 +946,20 @@ bool ensure_content(Image* img, const tex_t* t, bool wait) {
 // Views by texture handle, for the submission being recorded (cleared at draw_sub_begin: an image the game releases is
 // destroyed only after the submissions that may use it, so within one a view stays valid): the draws of a frame bind
 // the same handles again and again. Valid while the handle's registration (TexEntry::gen) and g_bind_epoch are.
+// With kept sets on, a view of an image that needs nothing done per submission (not sparse, no upload pending: what
+// ensure_content would do is nothing) stays for later submissions too ("sticky"): its image is freed only past the
+// generation (defer_past_kept), and the cache is cleared when one retires (retire_gen). A CPU write to the texture bumps
+// g_bind_epoch, so it is uploaded again. HOST_NVN_VIEW_STICKY=0: views for one submission only.
 struct ViewHit {
-    u64 gen = 0, epoch = 0;
+    u64 gen = 0, epoch = 0, sub = 0;
     VkImageView view = VK_NULL_HANDLE;
+    Image* img = nullptr;
+    bool sticky = false;
 };
 std::unordered_map<u64, ViewHit> g_view_cache;   // (renderer thread)
+u64 g_view_sub = 0;   // submissions begun (draw_sub_begin)
+u64 g_view_sticky_hits = 0;
+bool set_keep_on();
 
 VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
     const u64 epoch = g_bind_epoch.load(std::memory_order_relaxed);
@@ -959,8 +968,16 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
     {
         TabLock lk;
         if (id >= g_tex.size() || !g_tex[id].valid) return VK_NULL_HANDLE;
-        if (auto it = g_view_cache.find(ck); it != g_view_cache.end() && it->second.gen == g_tex[id].gen && it->second.epoch == epoch)
-            return it->second.view;
+        if (auto it = g_view_cache.find(ck); it != g_view_cache.end() && it->second.gen == g_tex[id].gen && it->second.epoch == epoch) {
+            ViewHit& h = it->second;
+            if (h.sub == g_view_sub) return h.view;
+            if (h.sticky) {
+                h.img->last_use = nvn::g_frame.load(std::memory_order_relaxed);
+                h.sub = g_view_sub;
+                g_view_sticky_hits++;
+                return h.view;
+            }
+        }
         e = g_tex[id];
     }
     Image* img = image_of(&e.t, pre_cb());
@@ -982,7 +999,14 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage) {
         return placeholder_view(want);
     }
     const VkImageView v = view_of(img, e.has_v ? &e.v : nullptr, false, want);
-    if (!dump_active() && !dump_tracing()) g_view_cache[ck] = {e.gen, epoch, v};
+    if (!dump_active() && !dump_tracing()) {
+        static const bool sticky_on = [] {
+            const char* v = getenv("HOST_NVN_VIEW_STICKY");
+            return !(v && *v == '0');
+        }();
+        const bool sticky = sticky_on && set_keep_on() && !img->sparse && !img->pending && (img->gpu_written || img->uploaded);
+        g_view_cache[ck] = {e.gen, epoch, g_view_sub, v, img, sticky};
+    }
     return v;
 }
 
@@ -1112,6 +1136,7 @@ void retire_gen() {
     g_gen = nullptr;
     g_keep_sets.clear();
     g_keep_res.clear();
+    g_view_cache.clear();   // (its sticky views' images may be freed once this generation is done)
 }
 
 // The generation new kept sets go to (a full one is retired first).
@@ -2062,7 +2087,8 @@ void draw_sub_begin(u64 done) {
     g_written.clear();
     g_set_gen++, g_set_kept = 0, g_subs++;
     kept_sub_begin();
-    g_view_cache.clear();
+    g_view_sub++;
+    if (!set_keep_on()) g_view_cache.clear();
     dyn_reset();
     Device& c = ctx();
     while (!g_arena_busy.empty() && g_arena_busy.front()->value <= done) {
@@ -2096,6 +2122,7 @@ void draw_sub_begin(u64 done) {
         // Destroyed while no generation was current: no kept set may hold them. Many waiting: the current one goes.
         std::unique_lock lk{g_grave_mu};
         if (!g_gen) {
+            if (!g_grave.empty()) g_view_cache.clear();   // (no sticky view may outlive its image)
             for (auto& fn : g_grave) defer(std::move(fn));
             g_grave.clear();
             g_grave_bytes = 0;
@@ -2445,12 +2472,12 @@ void draw_log_stats() {
             g_kept.size(), g_kept_blocks.size() * static_cast<size_t>(KeptBlockSize >> 20), static_cast<unsigned long long>(g_kept_wipes));
     if (set_keep_on())
         LOG("nvk: kept descriptor sets: %llu found again, %llu out of date; %zu kept; generations %llu (%zu retired); this one: %llu sets, "
-            "%zu constant blocks (%llu shared) in %zu MB",
+            "%zu constant blocks (%llu shared) in %zu MB; texture views from earlier submissions %llu",
             static_cast<unsigned long long>(g_keep_hits), static_cast<unsigned long long>(g_keep_stale), g_keep_sets.size(),
             static_cast<unsigned long long>(g_keep_gens), g_gen_retired.size(), static_cast<unsigned long long>(g_gen ? g_gen->sets : 0),
             g_gen ? g_gen->consts.size() : 0, static_cast<unsigned long long>(g_gen ? g_gen->const_hits : 0),
-            g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0);
-    g_keep_hits = g_keep_stale = 0;
+            g_gen ? g_gen->chunks.size() * static_cast<size_t>(ChunkSize >> 20) : 0, static_cast<unsigned long long>(g_view_sticky_hits));
+    g_keep_hits = g_keep_stale = g_view_sticky_hits = 0;
     if (set_miss_stats_on()) {
         std::string m;
         for (int i = 0; i < KG_N; i++)
