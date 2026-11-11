@@ -1,4 +1,4 @@
-// Command recording on the driver thread (vkq.h, HOST_NVN_CMD_PROXY=1). The vkCmd* entry points in namespace vkfn
+// Command recording on the driver thread (vkq.h; HOST_NVN_CMD_PROXY=0: off). The vkCmd* entry points in namespace vkfn
 // become encoders of the same signature: on the renderer thread (the producer) an encoder appends a closure that
 // calls the real function later on the driver thread, with copies of its arguments; on any other thread (present()
 // on the driver thread, upload and warm-up threads) it calls the real function at once. The handles stay the real
@@ -304,7 +304,7 @@ VkResult VKAPI_CALL e_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandP
 bool cmd_proxy_on() {
     static const bool v = [] {
         const char* e = getenv("HOST_NVN_CMD_PROXY");
-        return on() && e && std::strcmp(e, "0") != 0;
+        return on() && (!e || std::strcmp(e, "0") != 0);
     }();
     return v;
 }
@@ -326,7 +326,7 @@ void install_cmd_proxy() {
 #undef VKQ_SET_SCALAR
 #undef VKQ_SET_SYNCED
 #undef VKQ_SET_HAND
-    LOG("nvk: command recording on the driver thread too (HOST_NVN_CMD_PROXY)");
+    LOG("nvk: command recording on the driver thread too (HOST_NVN_CMD_PROXY=0: off)");
 }
 
 }  // namespace nvk::vkq

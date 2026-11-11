@@ -477,7 +477,7 @@ void flush_partial() {
     {
         HitchTimer ht{HI_SUBMIT};
         // (on the driver thread when it is on: everything the submit needs, by value)
-        vkq::run([pre, cb, bind_sem, bind_value] {
+        vkq::run_now([pre, cb, bind_sem, bind_value] {
             Device& c = ctx();
             const VkCommandBuffer cbs[2] = {pre, cb};
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -771,7 +771,7 @@ uint64_t vk_rp_sub_commit() {
         HitchTimer ht{HI_SUBMIT};
         // (on the driver thread when it is on. The completion thread may wait for `value` before it is submitted: a
         // timeline wait for a value not yet submitted just waits.)
-        vkq::run([pre, cb, sem, value, bind_sem, bind_value] {
+        vkq::run_now([pre, cb, sem, value, bind_sem, bind_value] {
             Device& c = ctx();
             const VkCommandBuffer cbs[2] = {pre, cb};
             VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -1040,7 +1040,7 @@ uint64_t vk_rp_present(const tex_t* t, double, const int* crop) {
         if (crop) a.has_crop = true, std::memcpy(a.crop, crop, sizeof a.crop);
     }
     a.ready = g_submitted.load();
-    vkq::run([a] { present(a.image, a.format, a.w, a.h, a.has_crop ? a.crop : nullptr, a.ready); });
+    vkq::run_now([a] { present(a.image, a.format, a.w, a.h, a.has_crop ? a.crop : nullptr, a.ready); });
     return ++n;
 }
 void rp_present_wait(uint64_t) {}

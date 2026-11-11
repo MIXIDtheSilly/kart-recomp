@@ -18,6 +18,7 @@ namespace nvk::vkq {
 
 bool on();       // the switch (read once)
 void attach();   // the calling thread (the renderer) becomes the producer; starts the driver thread
+void flush();    // on the producer: what is appended may run now (run() publishes in batches; run_now() flushes)
 void sync();     // on the producer: back once the driver thread has run everything appended so far (elsewhere: nothing)
 bool idle();     // nothing appended is still waiting to run
 
@@ -25,7 +26,7 @@ namespace detail {
 inline thread_local bool t_producer = false;
 using Call = void (*)(void*);
 void* reserve(size_t bytes, Call call);   // room for a closure of `bytes` in the ring, 16-byte aligned
-void publish();                           // the reserved entry is ready: the driver thread may run it
+void publish();                           // the reserved entry is complete (published to the driver thread in batches)
 void* payload(size_t bytes);              // room in the ring for data the next closure points to (valid until it has run)
 template <class T> void thunk(void* p) {
     T* f = static_cast<T*>(p);
@@ -36,7 +37,7 @@ template <class T> void thunk(void* p) {
 
 inline bool producer() { return detail::t_producer; }
 
-// HOST_NVN_CMD_PROXY=1 (with the driver thread on): command recording goes to the driver thread too (vkq_cmd.cpp).
+// With the driver thread on, command recording goes to it too (vkq_cmd.cpp); HOST_NVN_CMD_PROXY=0: not.
 bool cmd_proxy_on();
 void install_cmd_proxy();   // after vkfn::load_device: the vkCmd* pointers become encoders that append to the ring
 
@@ -59,6 +60,12 @@ template <class F> void run(F&& f) {
     void* p = detail::reserve(sizeof(T), &detail::thunk<T>);
     new (p) T(std::forward<F>(f));
     detail::publish();
+}
+
+// run(f), published at once: for queue operations (a batch would wait for more appends that may not come soon).
+template <class F> void run_now(F&& f) {
+    run(std::forward<F>(f));
+    flush();
 }
 
 }  // namespace nvk::vkq

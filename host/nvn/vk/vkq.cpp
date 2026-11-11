@@ -23,6 +23,10 @@ namespace {
 
 constexpr size_t RingBytes = 32u << 20;   // (stage 1 appends a few entries a frame: never full in practice)
 constexpr u64 SpinNs = 80'000;            // the consumer spins this long on an empty ring before it sleeps
+// The producer publishes its head once this much is appended (and at every queue operation, sync and full ring), and
+// the consumer its tail every 32 entries and when it has caught up: one shared-line write per entry cost the renderer
+// ~10% (the other side's cache line taken back each time).
+constexpr u64 BatchBytes = 8u << 10;
 
 struct Hdr {
     detail::Call call;   // null: skip to the start of the ring
@@ -35,7 +39,7 @@ alignas(64) std::atomic<u64> g_head{0};        // producer
 alignas(64) std::atomic<u64> g_tail{0};        // consumer
 alignas(64) std::atomic<u32> g_cons_sleeps{0};  // the consumer waits on g_head
 alignas(64) std::atomic<u32> g_prod_sleeps{0};  // the producer waits on g_tail
-u64 g_head_local = 0, g_pending = 0;            // producer only
+u64 g_head_local = 0, g_pending = 0, g_tail_seen = 0;   // producer only: published, reserved, last tail read
 
 void consumer_loop() {
     SetThreadDescription(GetCurrentThread(), L"NVN driver");
@@ -58,12 +62,14 @@ void consumer_loop() {
                 continue;
             }
         }
-        while (t != h) {
+        for (u32 n = 1; t != h; n++) {
             Hdr* e = reinterpret_cast<Hdr*>(g_ring + (t & (RingBytes - 1)));
             if (e->call) e->call(e + 1);
             t += e->size;
-            g_tail.store(t, std::memory_order_seq_cst);
-            if (g_prod_sleeps.load(std::memory_order_seq_cst)) WakeByAddressAll(&g_tail);
+            if (n % 32 == 0 || t == h) {
+                g_tail.store(t, std::memory_order_seq_cst);
+                if (g_prod_sleeps.load(std::memory_order_seq_cst)) WakeByAddressAll(&g_tail);
+            }
         }
     }
 }
@@ -112,12 +118,23 @@ void attach() {
     });
 }
 
+void flush() {
+    if (!detail::t_producer || g_pending == g_head_local) return;
+    g_head_local = g_pending;
+    g_head.store(g_pending, std::memory_order_seq_cst);
+    if (g_cons_sleeps.load(std::memory_order_seq_cst)) WakeByAddressSingle(&g_head);
+}
+
 void sync() {
     if (!detail::t_producer) return;
+    flush();
     wait_tail(g_head_local);
 }
 
-bool idle() { return g_tail.load(std::memory_order_acquire) == g_head.load(std::memory_order_acquire); }
+bool idle() {
+    if (detail::t_producer && g_pending != g_head_local) return false;
+    return g_tail.load(std::memory_order_acquire) == g_head.load(std::memory_order_acquire);
+}
 
 namespace detail {
 
@@ -127,7 +144,14 @@ void* reserve(size_t bytes, Call call) {
     u64 h = g_pending;
     size_t pos = static_cast<size_t>(h & (RingBytes - 1));
     const u64 skip = pos + total > RingBytes ? RingBytes - pos : 0;
-    if (h + skip + total - g_tail.load(std::memory_order_acquire) > RingBytes) wait_tail(h + skip + total - RingBytes);
+    if (h + skip + total - g_tail_seen > RingBytes) {
+        g_tail_seen = g_tail.load(std::memory_order_acquire);
+        if (h + skip + total - g_tail_seen > RingBytes) {
+            flush();   // (everything reserved so far is complete: the consumer may run it)
+            wait_tail(h + skip + total - RingBytes);
+            g_tail_seen = g_tail.load(std::memory_order_acquire);
+        }
+    }
     if (skip) {
         Hdr* s = reinterpret_cast<Hdr*>(g_ring + pos);
         s->call = nullptr;
@@ -146,9 +170,7 @@ void noop(void*) {}
 void* payload(size_t bytes) { return reserve(bytes, &noop); }
 
 void publish() {
-    g_head_local = g_pending;
-    g_head.store(g_pending, std::memory_order_seq_cst);
-    if (g_cons_sleeps.load(std::memory_order_seq_cst)) WakeByAddressSingle(&g_head);
+    if (g_pending - g_head_local >= BatchBytes) flush();
 }
 
 }  // namespace detail
