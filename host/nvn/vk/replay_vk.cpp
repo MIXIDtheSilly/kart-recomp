@@ -28,6 +28,8 @@
 #include "replay_int.h"
 #include "sparse.h"
 #include "textures.h"
+
+namespace nvk { extern std::atomic<u32> g_dbg_subs; }
 #include "vkctx.h"
 #include "vkq.h"
 
@@ -144,6 +146,7 @@ Submission* take_submission() {
     }
     if (!s) {
         s = new Submission;
+        nvk::g_dbg_subs++;
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         pci.queueFamilyIndex = c.family;

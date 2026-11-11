@@ -45,6 +45,8 @@
 #include "../../watch.h"
 
 namespace nvk {
+
+extern std::atomic<u32> g_dbg_arenas, g_dbg_gens;
 namespace {
 
 using nvn::prog_t;
@@ -1607,7 +1609,7 @@ SetGen* set_gen() {
     } else {
         retire_gen();
     }
-    if (g_gen_free.empty()) g_gen_free.push_back(new SetGen);
+    if (g_gen_free.empty()) g_gen_free.push_back(new SetGen), g_dbg_gens++;
     g_gen = g_gen_free.back();
     g_gen_free.pop_back();
     g_keep_gens++;
@@ -3147,6 +3149,7 @@ void draw_sub_begin(u64 done) {
     }
     if (g_arena_free.empty()) {
         Arena* a = new Arena;
+        g_dbg_arenas++;
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = c.family;
         check(vkCreateCommandPool(c.dev, &pi, nullptr, &a->cmd_pool), "arena command pool");

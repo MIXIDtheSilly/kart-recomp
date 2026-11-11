@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -321,10 +322,94 @@ static void dump_host_stacks() {
     if (idle) LOG("and %d idle thread-pool threads", idle);
 }
 
+// HOST_WATCH_STEP=1 (debug aid): hardware watchpoints (debug registers, every thread) on the game's frame step
+// ([g_mkw_frame_obj + 0x214], vblanks per frame) and its vblank counter; after 25 s logs each distinct host stack
+// that touched them, which names the recompiled guest functions reading the step.
+namespace stepwatch {
+std::atomic<bool> armed{false};
+constexpr int Max = 1 << 16, Depth = 6;
+u64 hits[Max][Depth + 1];  // [0] = which watchpoint (DR6 bits)
+std::atomic<int> count{0};
+
+bool on_trap(CONTEXT* ctx) {
+    if (!armed.load(std::memory_order_relaxed) || !(ctx->Dr6 & 0xF)) return false;
+    const int i = count.fetch_add(1, std::memory_order_relaxed);
+    if (i < Max) {
+        hits[i][0] = ctx->Dr6 & 0xF;
+        u64 pcs[Depth]{};
+        const int n = walk_host_stack(*ctx, pcs, Depth);
+        for (int k = 0; k < Depth; k++) hits[i][k + 1] = k < n ? pcs[k] : 0;
+    }
+    ctx->Dr6 = 0;
+    return true;
+}
+
+void arm_all(u64 a0, u64 a1, bool on) {
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        const HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (SuspendThread(h) != static_cast<DWORD>(-1)) {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &ctx)) {
+                ctx.Dr0 = on ? a0 : 0;
+                ctx.Dr1 = on ? a1 : 0;
+                // L0, L1; R/W = 11 (read or write), LEN = 11 (4 bytes)
+                ctx.Dr7 = on ? (0x1ull | 0x4ull | (0xFull << 16) | (0xFull << 20)) : 0;
+                SetThreadContext(h, &ctx);
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+}
+
+void start() {
+    if (!std::getenv("HOST_WATCH_STEP")) return;
+    std::thread([] {
+        while (!g_mkw_frame_obj) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const u64 a0 = reinterpret_cast<u64>(hp(g_mkw_frame_obj + 0x214));
+        const u64 a1 = reinterpret_cast<u64>(hp(module_base("main") + 0x33e6ae8));
+        LOG("stepwatch: frame object %#llx, watching for 25 s", static_cast<unsigned long long>(g_mkw_frame_obj));
+        armed = true;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(25);
+        while (std::chrono::steady_clock::now() < end) {  // (threads made later get armed too)
+            arm_all(a0, a1, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        arm_all(0, 0, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        armed = false;
+        const int n = std::min(count.load(), Max);
+        std::map<std::vector<u64>, int> uniq;
+        for (int i = 0; i < n; i++) uniq[std::vector<u64>(hits[i], hits[i] + Depth + 1)]++;
+        LOG("stepwatch: %d accesses, %zu distinct stacks", count.load(), uniq.size());
+        for (const auto& [st, c] : uniq) {
+            std::string line;
+            for (int k = 1; k <= Depth && st[k]; k++) {
+                std::string s = host_symbol(st[k]);
+                if (s.size() > 60) s.resize(60);
+                line += k > 1 ? " < " : " ";
+                line += s;
+            }
+            LOG("stepwatch: %s x%d:%s", st[0] & 1 ? "step" : "counter", c, line.c_str());
+        }
+    }).detach();
+}
+}  // namespace stepwatch
+
 namespace {
 
 LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP && stepwatch::on_trap(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     // The store redirected to backing memory (video::on_cpu_write_fault) has run.
     if (code == EXCEPTION_SINGLE_STEP && video::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code == EXCEPTION_SINGLE_STEP && watch::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -525,6 +610,7 @@ int main(int argc, char** argv) {
         g_mkw_frame_mode = mode == "game" ? -1 : mode == "60" ? 1 : mode == "30" ? 2 : 0;
         LOG("frame mode %s (%d)", mode.c_str(), g_mkw_frame_mode);
     }
+    stepwatch::start();
 
     u64 base = 0x803fd000;  // where the console's loader put rtld for this title
     for (size_t i = 0; i < g_aot_module_count; i++) {

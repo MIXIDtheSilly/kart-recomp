@@ -1,5 +1,13 @@
 #include "textures.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include "sparse.h"
 #include "upload.h"
 #include "hitch.h"
@@ -20,6 +28,8 @@ extern std::atomic<uint64_t> g_frame;   // presents so far (window.cpp)
 }
 
 namespace nvk {
+
+std::atomic<u32> g_dbg_arenas{0}, g_dbg_subs{0}, g_dbg_gens{0};
 namespace {
 
 std::mutex g_lock;
@@ -180,6 +190,34 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
                 }
                 LOG("nvk: images not used for 30 s: %llu, %llu MB (%llu MB of them sparse); biggest: %s", static_cast<unsigned long long>(n),
                     static_cast<unsigned long long>((bytes + sparse) >> 20), static_cast<unsigned long long>(sparse >> 20), top.c_str());
+            }
+            // HOST_NVN_MEM_REPORT=1: VMA's blocks per memory type, the renderer's pooled objects, and the process's write-combined
+            // pages (VRAM mapped through the BAR). Off by default: walking every allocation and the address space stalls the
+            // renderer ~200 ms.
+            static const bool mem_report = getenv("HOST_NVN_MEM_REPORT") != nullptr;
+            if (mem_report) {
+                VmaTotalStatistics st;
+                vmaCalculateStatistics(ctx().vma, &st);
+                const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+                vmaGetMemoryProperties(ctx().vma, &mp);
+                std::string types;
+                for (u32 i = 0; i < mp->memoryTypeCount; i++) {
+                    const VmaStatistics& s = st.memoryType[i].statistics;
+                    if (!s.blockCount) continue;
+                    char b[160];
+                    std::snprintf(b, sizeof b, "%stype %u (heap %u%s): %u blocks %llu MB, %u allocations %llu MB", types.empty() ? "" : "; ", i,
+                                  mp->memoryTypes[i].heapIndex, mp->memoryHeaps[mp->memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " VRAM" : "",
+                                  s.blockCount, static_cast<unsigned long long>(s.blockBytes >> 20), s.allocationCount,
+                                  static_cast<unsigned long long>(s.allocationBytes >> 20));
+                    types += b;
+                }
+                u64 wc = 0, wc_n = 0;
+                MEMORY_BASIC_INFORMATION mi;
+                for (u8* a = nullptr; VirtualQuery(a, &mi, sizeof mi); a = static_cast<u8*>(mi.BaseAddress) + mi.RegionSize)
+                    if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & PAGE_WRITECOMBINE)) wc += mi.RegionSize, wc_n++;
+                LOG("nvk: memory: %s; write-combined %llu MB in %llu regions; arenas %u, submissions %u, set generations %u",
+                    types.c_str(), static_cast<unsigned long long>(wc >> 20), static_cast<unsigned long long>(wc_n),
+                    g_dbg_arenas.load(), g_dbg_subs.load(), g_dbg_gens.load());
             }
             static const bool report = getenv("HOST_NVN_IMAGE_REPORT") != nullptr;
             if (report) {
