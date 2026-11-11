@@ -26,13 +26,31 @@ std::vector<Impl>& impls() {
 struct Entry {
     std::string name;
     Adapter fn = nullptr;
-    std::atomic<u64> calls{0};
+    u32 index = 0;  // into the per-thread call counts
     u64 reported = 0;
 };
 std::mutex g_lock;
 std::deque<Entry> g_entries;
 std::unordered_map<std::string, u64> g_by_name;  // name -> guest-callable address
 thread_local Ctx* t_ctx = nullptr;
+
+// Call counts for the report, one block per calling thread: the game's job threads make millions of
+// NVN calls a second between them, and one shared counter per function bounced its cache line
+// between their cores on every call. Only the owning thread writes a block (relaxed load + store);
+// the report sums them.
+constexpr u32 MaxEntries = 4096;  // as many as there are native thunks
+struct Counts {
+    std::atomic<u64> n[MaxEntries];
+};
+std::vector<Counts*> g_counts;  // under g_lock; blocks live as long as the process
+thread_local Counts* t_counts = nullptr;
+
+Counts* thread_counts() {
+    auto* b = new Counts{};
+    std::scoped_lock lk{g_lock};
+    g_counts.push_back(b);
+    return t_counts = b;
+}
 
 void report_loop() {
     for (;;) {
@@ -42,7 +60,8 @@ void report_loop() {
         {
             std::scoped_lock lk{g_lock};
             for (Entry& e : g_entries) {
-                const u64 n = e.calls.load(std::memory_order_relaxed);
+                u64 n = 0;
+                for (const Counts* b : g_counts) n += b->n[e.index].load(std::memory_order_relaxed);
                 if (n != e.reported) rows.emplace_back(n - e.reported, &e);
                 total += n - e.reported;
                 e.reported = n;
@@ -81,11 +100,14 @@ u64 lookup(const std::string& name) {
         for (const Impl& i : impls()) t.emplace(i.name, i.fn);
         return t;
     }();
+    if (g_entries.size() >= MaxEntries) fatal("nvn: too many functions");
     Entry* e = &g_entries.emplace_back();
     e->name = name;
+    e->index = static_cast<u32>(g_entries.size() - 1);
     if (auto it = table.find(name); it != table.end()) e->fn = it->second;
     const u64 addr = gfx::native_function("nvn:" + name, [e](Ctx* c, const std::string&) {
-        e->calls.fetch_add(1, std::memory_order_relaxed);
+        std::atomic<u64>& n = (t_counts ? t_counts : thread_counts())->n[e->index];
+        n.store(n.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         if (!e->fn) {
             static std::mutex m;
             static std::set<std::string> seen;

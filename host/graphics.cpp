@@ -24,7 +24,6 @@ constexpr size_t MaxThunks = 4096;
 struct Thunk {
     std::string name;
     NativeFn fn;
-    std::atomic<u64> calls{0};
 };
 std::array<Thunk, MaxThunks> g_thunks;
 std::atomic<size_t> g_thunk_count{0};
@@ -33,7 +32,6 @@ std::unordered_map<std::string, u64> g_thunk_by_name;
 
 template <size_t I> void thunk_entry(Ctx* c) {
     Thunk& t = g_thunks[I];
-    t.calls.fetch_add(1, std::memory_order_relaxed);
     t.fn(c, t.name);
 }
 template <size_t... I> constexpr std::array<GuestFn, sizeof...(I)> make_entries(std::index_sequence<I...>) {
