@@ -1,7 +1,8 @@
 // The launcher: the way from a game dump to a running kart.exe, one step per dot at the top.
 //
 //   1 Game          the dump folder (exefs\ and romfs\), its module ids checked, saved as KART_GAME in local.cfg
-//   2 Dependencies  tools\setup_deps.py: Eglantine and plumber-racer-2 at their pinned commits, patched and built
+//   2 Dependencies  the tools the build needs (Visual Studio, Python, the .NET SDK) and the shader translator, built
+//                   from tools\xlate (everything else the host uses is in third_party\)
 //   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
 //                   the first stage whose output is missing
 //   4 Play          host\out\kart.exe on the dump
@@ -11,7 +12,7 @@
 // tools (kart-<version>.exe, KART_GAME_<version>). The choice is kept as LAUNCHER_VERSION in local.cfg, never as
 // KART_VER, which there would switch every build.
 //
-// Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the deps\ defaults.
+// Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the defaults.
 // launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything.
 
 #ifndef UNICODE
@@ -147,11 +148,7 @@ static std::wstring setting(const std::wstring& key) {
         if (key != L"VCVARS" && key != L"CLANG" && v.is_relative()) v = (g_root / v).lexically_normal();
         return v.wstring();
     }
-    if (key == L"EGL") return (g_root / "deps" / "Eglantine").wstring();
-    if (key == L"EGL_BUILD") return (g_root / "deps" / "egl-build").wstring();
-    if (key == L"NVN_REF") return (g_root / "deps" / "plumber-racer-2").wstring();
-    if (key == L"NVN_XLATE")
-        return (fs::path(setting(L"NVN_REF")) / "dm" / "gfx" / "tools" / "dmsh_xlate" / "bin" / "Release" / "net10.0").wstring();
+    if (key == L"NVN_XLATE") return (g_root / "work" / "xlate").wstring();
     if (key == L"VCVARS") return g_vcvars_found;
     return L"";
 }
@@ -343,7 +340,7 @@ struct Row {
 
 struct Tools {
     std::wstring python;   // version, '' when there is no working python
-    bool zstd = false, git = false, dotnet = false;
+    bool zstd = false, dotnet = false, vp9 = false;
 };
 static Tools g_tools;
 
@@ -417,7 +414,8 @@ static void check_tools() {
             if (g_vcvars_found.empty() && path_exists(bat)) g_vcvars_found = bat.wstring();
         }
     }
-    g_tools.git = on_path(L"git.exe");
+    // Microsoft's VP9 Video Extensions (a Store package): Media Foundation decodes the movies with it
+    g_tools.vp9 = !trim(widen(capture(L"powershell -NoProfile -Command \"(Get-AppxPackage Microsoft.VP9VideoExtensions).Version\""))).empty();
     if (on_path(L"dotnet.exe")) {
         const std::string sdks = capture(L"dotnet --list-sdks");
         g_tools.dotnet = sdks.rfind("10.", 0) == 0 || sdks.find("\n10.") != std::string::npos;
@@ -519,20 +517,15 @@ static void refresh() {
     deps.clear();
     const bool vs = !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
     deps.push_back({L"Visual Studio", vs ? L"C++ tools found" : L"install \"Desktop development with C++\"", vs ? ST_OK : ST_BAD});
-    deps.push_back({L"Git", g_tools.git ? L"found" : L"not on PATH", g_tools.git ? ST_OK : ST_BAD});
     deps.push_back({L"Python", g_tools.python.empty() ? L"not on PATH" : g_tools.python, g_tools.python.empty() ? ST_BAD : ST_OK});
     deps.push_back({L"backports.zstd", g_tools.zstd ? L"found" : L"pip install backports.zstd", g_tools.zstd ? ST_OK : ST_BAD});
     deps.push_back({L".NET 10 SDK", g_tools.dotnet ? L"found" : L"not found", g_tools.dotnet ? ST_OK : ST_BAD});
-    const bool egl_src = path_exists(fs::path(setting(L"EGL")) / "src" / "video_core");
-    const bool egl_lib = path_exists(fs::path(setting(L"EGL_BUILD")) / "src" / "video_core" / "video_core.lib");
-    const bool ref = path_exists(fs::path(setting(L"NVN_REF")) / "dm" / "gfx" / "tools" / "dmsh_xlate");
+    deps.push_back({L"VP9 Video Extensions", g_tools.vp9 ? L"found" : L"optional: without it the movies are skipped",
+                    g_tools.vp9 ? ST_OK : ST_OPTIONAL});
     const bool xlate = path_exists(fs::path(setting(L"NVN_XLATE")) / "dmsh_xlate.exe");
-    deps.push_back({L"Eglantine", egl_src ? L"cloned and patched" : L"not fetched", egl_src ? ST_OK : ST_MISSING});
-    deps.push_back({L"Eglantine libraries", egl_lib ? L"built" : L"not built", egl_lib ? ST_OK : ST_MISSING});
-    deps.push_back({L"plumber-racer-2", ref ? L"cloned and patched" : L"not fetched", ref ? ST_OK : ST_MISSING});
     deps.push_back({L"Shader translator", xlate ? L"built" : L"not built", xlate ? ST_OK : ST_MISSING});
-    g_done[1] = egl_src && egl_lib && ref && xlate;
-    g_can_setup = vs && g_tools.git && !g_tools.python.empty() && g_tools.dotnet;
+    g_done[1] = vs && !g_tools.python.empty() && g_tools.zstd && g_tools.dotnet && xlate;
+    g_can_setup = vs && !g_tools.python.empty() && g_tools.dotnet;
 
     auto& build = g_rows[2];
     build.clear();
@@ -648,8 +641,8 @@ static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Bu
 static const wchar_t* STEP_TEXT[4] = {
     L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\. Versions 1.0.0 and 1.8.0 "
     L"work, each built and played on its own (the version buttons above); nothing of the dump is copied anywhere.",
-    L"Eglantine and plumber-racer-2 are cloned at their pinned commits into deps\\, this repository's patches applied, "
-    L"and built: Eglantine's GPU and audio libraries and the shader translator. An hour or more, mostly Eglantine.",
+    L"The tools the build needs, and the shader translator (tools\\xlate, built with the .NET SDK in a minute or two). "
+    L"Nothing is downloaded: the third-party code the host uses is in the repository (third_party\\).",
     L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
     L"linked. The first build takes half an hour or more; later ones redo only what is missing.",
     L"Starts kart.exe on your dump. Pipelines are made ahead of time over the first runs; baking decodes every "
@@ -799,7 +792,7 @@ static void paint_panel(D2D1_RECT_F p) {
         y = draw_rows(g_rows[1], 2, x0, x1, y) + 18;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
-        else x = button(B_SETUP, g_done[1] ? L"Set up again" : L"Set up", x, y, !g_done[1], g_can_setup);
+        else x = button(B_SETUP, g_done[1] ? L"Build the translator again" : L"Build the translator", x, y, !g_done[1], g_can_setup);
         if (!busy && g_done[1]) x = button(B_CONTINUE, L"Continue", x, y, true, true);
         if (!busy && !g_can_setup && g_status.empty())
             text(L"Install what is marked red first.", F_BODY, {x + 4, y, x1, y + 40}, col::muted, T_VCENTER);
@@ -1019,7 +1012,8 @@ static void click(int id) {
         g_status.clear();
         refresh();
     } else if (id == B_SETUP) {
-        start_job(L"Setting up the dependencies", {{L"python tools\\setup_deps.py", root}});
+        start_job(L"Building the shader translator",
+                  {{L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj", root}});
     } else if (id == B_BUILD || id == B_REBUILD) {
         if (id == B_REBUILD &&
             MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes half an hour or more.", L"Rebuild everything",

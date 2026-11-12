@@ -17,7 +17,7 @@ __pycache__/
 /tools/texbake/*.exe
 /tools/texbake/*.obj
 
-# Dependencies fetched and built by tools/setup_deps.py, and local paths (tools/paths.py)
+# Local paths and settings (tools/paths.py); deps/ held the external dependencies before third_party/
 /deps/
 /local.cfg
 

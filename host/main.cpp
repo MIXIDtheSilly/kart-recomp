@@ -25,8 +25,6 @@
 #include "memory.h"
 #include "video.h"
 #include "watch.h"
-#include "common/logging.h"
-#include "common/windows/timer_resolution.h"
 
 namespace fs = std::filesystem;
 
@@ -566,6 +564,28 @@ extern "C" int kart_pgo_nop(void) { return 0; }
 
 std::string host_exe_variant();  // localcfg.cpp
 
+extern "C" {
+NTSYSAPI LONG NTAPI NtQueryTimerResolution(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+NTSYSAPI LONG NTAPI NtSetTimerResolution(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+}
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+
+// Sets the system timer to its finest resolution, kept even while the window is in the background (no power
+// throttling of timers); returns the resolution now in effect, in 100 ns units.
+static ULONG finest_timer_resolution() {
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    state.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof state);
+    ULONG coarsest = 0, finest = 0, current = 0;
+    NtQueryTimerResolution(&coarsest, &finest, &current);
+    NtSetTimerResolution(finest, TRUE, &current);
+    return current;
+}
+
 int main(int argc, char** argv) {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc_start);
@@ -596,14 +616,8 @@ int main(int argc, char** argv) {
     if (argc > 2 && std::strcmp(argv[2], "--bake-textures") == 0) return nvk::bake_textures(game, argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0);
 
     AddVectoredExceptionHandler(0, crash_handler);
-    // The texture codecs and compression wrappers still taken from Eglantine log through its logger
-    // (user/log/eden_log.txt under the exe's folder).
-    Common::Log::Initialize();
-    Common::Log::Start();
-    // As Eden's frontend: the finest host timer resolution (0.5 ms), for the GPU thread's acquire
-    // polling and the game's short timed waits.
-    const auto timer_resolution = Common::Windows::SetCurrentTimerResolutionToMaximum();
-    LOG("host timer resolution %lld us", static_cast<long long>(timer_resolution.count() / 1000));
+    // The finest host timer resolution (0.5 ms), for the renderer's acquire polling and the game's short timed waits.
+    LOG("host timer resolution %lu us", finest_timer_resolution() / 10);
     mem::init();
     video::init();
 

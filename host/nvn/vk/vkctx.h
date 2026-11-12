@@ -8,7 +8,7 @@
 
 #include "../../common.h"
 #include "vkfn.h"
-#include "video_core/vulkan_common/vma.h"
+#include "vma.h"
 
 namespace nvk {
 

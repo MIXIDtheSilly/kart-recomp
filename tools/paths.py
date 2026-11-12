@@ -1,26 +1,19 @@
-"""Where the dependencies, the game dump and the compilers are: one place for the build scripts and tools.
+r"""Where the game dump and the compilers are: one place for the build scripts and tools.
 
 Each setting comes from the environment, else from local.cfg at the repository root (KEY=VALUE lines, # starts
 a comment; the file is not committed), else from the default below.
 
-  EGL        Eglantine source with patches/eglantine.patch applied         (deps/Eglantine)
-  EGL_BUILD  its CMake build folder: video_core.lib, audio_core.lib, ...    (deps/egl-build)
-  NVN_REF    plumber-racer-2 source with patches/plumber-racer-2.patch      (deps/plumber-racer-2)
-             applied: the shader splitter and the shader translator
-  NVN_XLATE  folder of the built shader translator, dmsh_xlate.exe          (under NVN_REF)
   KART_GAME  the game dump: the folder holding exefs/ and romfs/            (none)
              (with KART_VER set, KART_GAME_<KART_VER> comes first)
+  NVN_XLATE  folder the shader translator (dmsh_xlate.exe, from tools/xlate) is built into   (work/xlate)
   VCVARS     Visual Studio's vcvars64.bat                                   (found with vswhere)
-  CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\\Program Files\\LLVM\\bin)
+  CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\Program Files\LLVM\bin)
   KART_VER   another game version, built next to the default one: its out/, gen/ and build/ go to
-             ver/<KART_VER>/ and host\\build.bat links host\\out\\kart-<KART_VER>.exe   (none)
+             ver/<KART_VER>/ and host\build.bat links host\out\kart-<KART_VER>.exe   (none)
              Set it in the environment for that build only: in local.cfg it would switch every build.
 
-tools/setup_deps.py fetches and builds the dependencies at the default places.
-
 From batch files:
-  python tools\\paths.py bat                    KEY=VALUE lines, for `for /f ... do set "%%L"`
-  python tools\\paths.py rsp <template> <out>   the template with every $(KEY) replaced ($(ROOT): the repository)
+  python tools\paths.py bat    KEY=VALUE lines, for `for /f ... do set "%%L"`
 """
 import os
 import subprocess
@@ -28,7 +21,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ["EGL", "EGL_BUILD", "NVN_REF", "NVN_XLATE", "KART_GAME", "VCVARS", "CLANG", "KART_VER"]
+KEYS = ["KART_GAME", "NVN_XLATE", "VCVARS", "CLANG", "KART_VER"]
 
 
 def _local():
@@ -68,14 +61,8 @@ def get(key):
     if local.get(key):
         v = local[key]
         return str((ROOT / v).resolve()) if key != "VCVARS" and key != "CLANG" and not Path(v).is_absolute() else v
-    if key == "EGL":
-        return str(ROOT / "deps" / "Eglantine")
-    if key == "EGL_BUILD":
-        return str(ROOT / "deps" / "egl-build")
-    if key == "NVN_REF":
-        return str(ROOT / "deps" / "plumber-racer-2")
     if key == "NVN_XLATE":
-        return str(Path(get("NVN_REF")) / "dm" / "gfx" / "tools" / "dmsh_xlate" / "bin" / "Release" / "net10.0")
+        return str(ROOT / "work" / "xlate")
     if key == "VCVARS":
         return _find_vcvars()
     if key == "CLANG":
@@ -99,7 +86,7 @@ def art(sub=""):
 
 
 def vcvars_env():
-    """The environment vcvars64.bat sets up (compilers, include and library paths, CMake and Ninja)."""
+    """The environment vcvars64.bat sets up (compilers, include and library paths)."""
     out = subprocess.run(f'cmd /c ""{get("VCVARS")}" >nul && set"', capture_output=True, text=True, errors="replace").stdout
     env = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
     if "INCLUDE" not in env:
@@ -114,13 +101,6 @@ def main():
         # For host\build.bat: where the module glue is, and the exe to link.
         print(f"ART={art()}")
         print(f"KART_EXE=kart{'-' + get('KART_VER') if get('KART_VER') else ''}.exe")
-    elif sys.argv[1:2] == ["rsp"] and len(sys.argv) == 4:
-        text = Path(sys.argv[2]).read_text(encoding="utf-8")
-        text = text.replace("$(ROOT)", str(ROOT))
-        for k in KEYS:
-            text = text.replace(f"$({k})", get(k))
-        Path(sys.argv[3]).parent.mkdir(parents=True, exist_ok=True)
-        Path(sys.argv[3]).write_text(text, encoding="utf-8")
     else:
         for k in KEYS:
             print(f"{k:10} {get(k)}")

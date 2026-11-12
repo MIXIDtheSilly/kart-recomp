@@ -12,8 +12,7 @@
 #include "pools.h"
 #include "replay_int.h"
 #include "textures.h"
-#include "video_core/textures/astc.h"
-#include "video_core/textures/bcn.h"
+#include "codecs.h"
 #include "../../watch.h"
 
 namespace nvk {
@@ -270,14 +269,14 @@ void copy_buffer_texture(VkCommandBuffer cb, const nvn::p_copy_b2t* c, bool to_t
             return;
         }
         std::vector<u8> rgba(static_cast<size_t>(w) * h * depth * 4);
-        Tegra::Texture::ASTC::Decompress(std::span<const u8>(blocks), w, h, depth, static_cast<u32>(bw), static_cast<u32>(bh), std::span<u8>(rgba));
+        codec::astc_decode(std::span<const u8>(blocks), w, h, depth, static_cast<u32>(bw), static_cast<u32>(bh), std::span<u8>(rgba));
         const bool bc1 = img->format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
         const size_t bc = static_cast<size_t>((w + 3) / 4) * ((h + 3) / 4) * depth * (bc1 ? 8 : 16);
         VkBuffer buf;
         void* ptr;
         if (!staging(bc, &buf, &ptr)) return;
-        if (bc1) Tegra::Texture::BCN::CompressBC1(std::span<const u8>(rgba), w, h, depth, std::span<u8>(static_cast<u8*>(ptr), bc));
-        else Tegra::Texture::BCN::CompressBC3(std::span<const u8>(rgba), w, h, depth, std::span<u8>(static_cast<u8*>(ptr), bc));
+        if (bc1) codec::bc1_encode(std::span<const u8>(rgba), w, h, depth, std::span<u8>(static_cast<u8*>(ptr), bc));
+        else codec::bc3_encode(std::span<const u8>(rgba), w, h, depth, std::span<u8>(static_cast<u8*>(ptr), bc));
         bic.bufferRowLength = (w + 3) & ~3u, bic.bufferImageHeight = (h + 3) & ~3u;
         vkCmdCopyBufferToImage(cb, buf, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
         full_barrier(cb);

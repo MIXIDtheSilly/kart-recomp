@@ -1,6 +1,12 @@
 // Vulkan entry points the native NVN renderer uses, loaded at run time (no import library).
 #pragma once
-#include "video_core/vulkan_common/vulkan.h"  // VK_NO_PROTOTYPES, platform defines
+// Headers from third_party/vulkan; no prototypes: every entry point is a pointer loaded below.
+#define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_WIN32_KHR
+#include <vulkan/vulkan.h>
+// windows.h macros that would rename Vulkan's and the renderer's names
+#undef CreateEvent
+#undef CreateSemaphore
 
 #define VKFN_GLOBAL(X)                                                                             \
     X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties) \

@@ -17,8 +17,7 @@
 #include "draw.h"
 #include "hitch.h"
 #include "vkq.h"
-#include "video_core/textures/astc.h"
-#include "video_core/textures/bcn.h"
+#include "codecs.h"
 
 namespace nvn {
 extern std::atomic<uint64_t> g_frame;   // presents so far (window.cpp)
@@ -280,10 +279,10 @@ void convert_now(const SparseImage* s, Job& j) {
         return;
     }
     std::vector<u8> rgba(static_cast<size_t>(j.fw) * j.fh * 4);
-    Tegra::Texture::ASTC::Decompress(std::span<const u8>(lin), j.fw, j.fh, 1, s->bw, s->bh, std::span<u8>(rgba));
+    codec::astc_decode(std::span<const u8>(lin), j.fw, j.fh, 1, s->bw, s->bh, std::span<u8>(rgba));
     j.out.resize(static_cast<size_t>((j.fw + 3) / 4) * ((j.fh + 3) / 4) * (s->bc1 ? 8 : 16));
-    if (s->bc1) Tegra::Texture::BCN::CompressBC1(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
-    else Tegra::Texture::BCN::CompressBC3(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
+    if (s->bc1) codec::bc1_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
+    else codec::bc3_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
 }
 
 void set_region(const SparseImage* s, Job& j, u32 level, u32 layer, VkOffset3D o, VkExtent3D e) {

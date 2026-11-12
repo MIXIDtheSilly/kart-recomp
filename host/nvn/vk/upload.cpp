@@ -24,11 +24,10 @@
 #include "../nvn_int.h"
 #include "../replay.h"
 #include "hitch.h"
-#include "common/cityhash.h"
-#include "common/lz4_compression.h"
-#include "common/zstd_compression.h"
-#include "video_core/textures/astc.h"
-#include "video_core/textures/bcn.h"
+#include "../../cityhash.h"
+#include "lz4.h"
+#include "zstd.h"
+#include "codecs.h"
 
 namespace nvk {
 namespace {
@@ -205,10 +204,10 @@ void convert(const Geom& g, const nvn_texdesc& d, const Untiled& u, Prepared& ou
         const size_t at = staging.size();
         if (astc) {
             rgba.resize(static_cast<size_t>(pt.w) * pt.h * pt.depth * 4);
-            Tegra::Texture::ASTC::Decompress(blocks, pt.w, pt.h, pt.depth, bw, bh, std::span<u8>(rgba));
+            codec::astc_decode(blocks, pt.w, pt.h, pt.depth, bw, bh, std::span<u8>(rgba));
             const size_t bytes = static_cast<size_t>((pt.w + 3) / 4) * ((pt.h + 3) / 4) * pt.depth * 16;
             staging.resize(at + bytes);
-            Tegra::Texture::BCN::CompressBC3(std::span<const u8>(rgba), pt.w, pt.h, pt.depth, std::span<u8>(staging.data() + at, bytes));
+            codec::bc3_encode(std::span<const u8>(rgba), pt.w, pt.h, pt.depth, std::span<u8>(staging.data() + at, bytes));
         } else {
             staging.insert(staging.end(), blocks.begin(), blocks.end());
         }
@@ -235,7 +234,7 @@ bool prepare(const Geom& g, const nvn_texdesc& d, const u8* storage, u64 storage
 // What the prepared data of untiled u depends on (the disk cache's key: the same in every run, as the storage's
 // tiling padding is not in it).
 u64 content_key(const Geom& g, const nvn_texdesc& d, const Untiled& u) {
-    u64 h = Common::CityHash64(reinterpret_cast<const char*>(u.blocks.data()), u.blocks.size());
+    u64 h = CityHash64(reinterpret_cast<const char*>(u.blocks.data()), u.blocks.size());
     for (const u64 v : {static_cast<u64>(g.type), static_cast<u64>(g.aspect), static_cast<u64>(g.width), static_cast<u64>(g.height),
                         static_cast<u64>(g.depth), static_cast<u64>(g.layers), static_cast<u64>(g.levels), static_cast<u64>(d.format)})
         h = (h ^ v) * 0xC2B2AE3D27D4EB4Full + 0x165667B19E3779F9ull;
@@ -326,7 +325,7 @@ u64 cache_max() {
 }
 
 u64 cache_key(const Geom& g, const nvn_texdesc& d, const std::vector<u8>& src) {
-    u64 h = Common::CityHash64(reinterpret_cast<const char*>(src.data()), src.size());
+    u64 h = CityHash64(reinterpret_cast<const char*>(src.data()), src.size());
     for (const u64 v : {static_cast<u64>(g.type), static_cast<u64>(g.width), static_cast<u64>(g.height), static_cast<u64>(g.depth),
                         static_cast<u64>(g.layers), static_cast<u64>(g.levels), static_cast<u64>(d.format), static_cast<u64>(d.flags),
                         static_cast<u64>(d.target), static_cast<u64>(d.stride)})
@@ -476,7 +475,8 @@ bool disk_get(u64 key, Prepared& out, bool* old) {
             std::atomic<bool> good{true};
             const auto unpack = [&](size_t i) {
                 const u64 o = i * piece, n = std::min(piece, h.staging - o);
-                if (Common::Compression::DecompressDataLZ4(out.staging.data() + o, n, packed + off[i], sizes[i]) != static_cast<int>(n))
+                if (LZ4_decompress_safe(reinterpret_cast<const char*>(packed + off[i]), reinterpret_cast<char*>(out.staging.data() + o),
+                                        static_cast<int>(sizes[i]), static_cast<int>(n)) != static_cast<int>(n))
                     good.store(false);
             };
             if (sizes.size() == 1) {
@@ -497,13 +497,22 @@ bool disk_get(u64 key, Prepared& out, bool* old) {
     return ok;
 }
 
+// One LZ4 block; empty if it could not be compressed.
+std::vector<u8> lz4_compress(const u8* src, u64 size) {
+    std::vector<u8> out(static_cast<size_t>(LZ4_compressBound(static_cast<int>(size))));
+    const int n = LZ4_compress_default(reinterpret_cast<const char*>(src), reinterpret_cast<char*>(out.data()), static_cast<int>(size),
+                                       static_cast<int>(out.size()));
+    out.resize(n > 0 ? static_cast<size_t>(n) : 0);
+    return out;
+}
+
 // One prepared upload into the folder; the bytes it takes there, 0 when it could not be written.
 u64 disk_write(u64 key, const Prepared& p) {
     std::vector<std::vector<u8>> chunks;
     std::vector<u32> sizes;
     u64 total = 0;
     for (u64 o = 0; o < p.staging.size(); o += DiskChunk) {
-        chunks.push_back(Common::Compression::CompressDataLZ4(p.staging.data() + o, std::min<u64>(DiskChunk, p.staging.size() - o)));
+        chunks.push_back(lz4_compress(p.staging.data() + o, std::min<u64>(DiskChunk, p.staging.size() - o)));
         if (chunks.back().empty()) return 0;
         sizes.push_back(static_cast<u32>(chunks.back().size()));
         total += chunks.back().size();
@@ -667,7 +676,7 @@ bool upload_async_start(Image* img, const nvn::tex_t* t) {
             // A few threads (HOST_NVN_UPLOAD_WORKERS, default 4): an upload from the disk cache (untile, hash, read,
             // unpack) runs on one thread only, and the game streams hundreds at once in free roam; with one worker they
             // queued for 250 ms on average (1 s worst) and the renderer stood still for the ones a copy needed. A
-            // decode (cache miss) still spreads over the ASTC worker pool (video_core/textures/workers.cpp).
+            // decode (cache miss) still spreads over the transcode threads (codec::parallel_for).
             const char* e = getenv("HOST_NVN_UPLOAD_WORKERS");
             const int n = std::clamp(e ? std::atoi(e) : 4, 1, 16);
             // At normal priority: below it, a worker waited ~30 ms (two scheduler ticks) for a CPU after each file read
@@ -800,6 +809,16 @@ int target_of(u32 dim) {
     }
 }
 
+// One zstd frame that records its size (the game's .zs files); empty if it does not decode.
+std::vector<u8> zstd_decompress(const std::vector<u8>& packed) {
+    const unsigned long long size = ZSTD_getFrameContentSize(packed.data(), packed.size());
+    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN) return {};
+    std::vector<u8> out(static_cast<size_t>(size));
+    const size_t n = ZSTD_decompress(out.data(), out.size(), packed.data(), packed.size());
+    if (ZSTD_isError(n) || n != out.size()) return {};
+    return out;
+}
+
 // The ASTC textures of one .bntx.zs, each as the game would hand it to upload_async_start. write false: only counted.
 void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
     std::vector<u8> packed;
@@ -810,7 +829,7 @@ void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
         std::fclose(f);
         if (!ok) packed.clear();
     }
-    const std::vector<u8> b = packed.empty() ? std::vector<u8>{} : Common::Compression::DecompressDataZSTD(packed);
+    const std::vector<u8> b = packed.empty() ? std::vector<u8>{} : zstd_decompress(packed);
     st.files++;
     u32 count = 0;
     u64 infos = 0;
@@ -897,7 +916,7 @@ int bake_textures(const std::filesystem::path& game, size_t check) {
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     nvn_gob_switch2 = 1;
     const u32 half = std::max(std::thread::hardware_concurrency() / 2, 2u);
-    if (!getenv("EDEN_NX2_TRANSCODE_THREADS")) _putenv_s("EDEN_NX2_TRANSCODE_THREADS", std::to_string(half).c_str());
+    if (!getenv("HOST_TRANSCODE_THREADS")) _putenv_s("HOST_TRANSCODE_THREADS", std::to_string(half).c_str());
     if (disk_dir().empty()) {
         LOG("[RED] bake: the decoded texture cache is turned off (HOST_NVN_TEXCACHE=0)");
         return 1;

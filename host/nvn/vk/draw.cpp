@@ -30,7 +30,7 @@
 #include <vector>
 
 #include "../nvn_int.h"
-#include "common/cityhash.h"
+#include "../../cityhash.h"
 #include "format.h"
 #include "nvn_map.h"
 #include "pools.h"
@@ -351,7 +351,7 @@ VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDe
     u64 key = 0;
     if (g_const_gen) {
         // (a generation's sets share their blocks: most are the same for many sets, the handle and support blocks)
-        key = (pre ? pre : Common::CityHash64(static_cast<const char*>(from), from_n)) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
+        key = (pre ? pre : CityHash64(static_cast<const char*>(from), from_n)) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
         if (const VkDescriptorBufferInfo* hit = g_const_gen->consts.find(key)) {
             g_const_gen->const_hits++;
             return *hit;
@@ -363,7 +363,7 @@ VkDescriptorBufferInfo constants(u32 kind, const void* from, size_t from_n, VkDe
         return r;
     }
     if (g_kept_on) {
-        key = Common::CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
+        key = CityHash64(static_cast<const char*>(from), from_n) ^ ((size << 8 | kind) * 0x9E3779B97F4A7C15ull);
         if (const auto it = g_kept.find(key); it != g_kept.end()) {
             g_kept_hits++;
             return {g_kept_blocks[it->second.block].buf, it->second.off, size};
@@ -712,7 +712,7 @@ struct PipeDesc {
 static_assert(sizeof(PipeDesc) == 80, "PipeDesc has no padding (hashed and stored as bytes)");
 constexpr u32 KeysMagic = 0x4B50564E, KeysVersion = 1;   // "NVPK"
 
-u64 desc_key(const PipeDesc& d) { return Common::CityHash64(reinterpret_cast<const char*>(&d), sizeof d); }
+u64 desc_key(const PipeDesc& d) { return CityHash64(reinterpret_cast<const char*>(&d), sizeof d); }
 
 std::mutex g_warm_mu;
 std::condition_variable g_warm_cv;
@@ -1752,24 +1752,24 @@ u64 tex_digest(const State& s, u32 st) {
     State::Digests& d = s.dig[st];
     if (d.tex_v != s.v_tex[st]) {
         d.tex_v = s.v_tex[st];
-        d.tex = Common::CityHash64WithSeed(reinterpret_cast<const char*>(s.samp[st]), sizeof s.samp[st],
-                                           Common::CityHash64WithSeed(reinterpret_cast<const char*>(s.img[st]), sizeof s.img[st],
-                                                                      Common::CityHash64(reinterpret_cast<const char*>(s.tex[st]), sizeof s.tex[st])));
+        d.tex = CityHash64WithSeed(reinterpret_cast<const char*>(s.samp[st]), sizeof s.samp[st],
+                                           CityHash64WithSeed(reinterpret_cast<const char*>(s.img[st]), sizeof s.img[st],
+                                                                      CityHash64(reinterpret_cast<const char*>(s.tex[st]), sizeof s.tex[st])));
     }
     return d.tex;
 }
 u64 ssbo_digest(const State& s, u32 st) {
     State::Digests& d = s.dig[st];
-    if (d.ssbo_v != s.v_ssbo[st]) d.ssbo_v = s.v_ssbo[st], d.ssbo = Common::CityHash64(reinterpret_cast<const char*>(s.ssbo[st]), sizeof s.ssbo[st]);
+    if (d.ssbo_v != s.v_ssbo[st]) d.ssbo_v = s.v_ssbo[st], d.ssbo = CityHash64(reinterpret_cast<const char*>(s.ssbo[st]), sizeof s.ssbo[st]);
     return d.ssbo;
 }
 u64 ubo16_digest(const State& s, u32 st) {
     State::Digests& d = s.dig[st];
-    if (d.ubo_v != s.v_ubo[st]) d.ubo_v = s.v_ubo[st], d.ubo = Common::CityHash64(reinterpret_cast<const char*>(s.ubo[st]), sizeof(BufB) * 16);
+    if (d.ubo_v != s.v_ubo[st]) d.ubo_v = s.v_ubo[st], d.ubo = CityHash64(reinterpret_cast<const char*>(s.ubo[st]), sizeof(BufB) * 16);
     return d.ubo;
 }
 u64 push_digest(const State& s, int i) {
-    if (s.push_dig_v[i] != s.v_push[i]) s.push_dig_v[i] = s.v_push[i], s.push_dig[i] = Common::CityHash64(reinterpret_cast<const char*>(s.push[i]), NVN_PUSH_SIZE);
+    if (s.push_dig_v[i] != s.v_push[i]) s.push_dig_v[i] = s.v_push[i], s.push_dig[i] = CityHash64(reinterpret_cast<const char*>(s.push[i]), NVN_PUSH_SIZE);
     return s.push_dig[i];
 }
 
@@ -1789,7 +1789,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
         if (used + n > k.size()) k.resize(std::max(k.size() * 2, used + n));
         std::memcpy(k.data() + used, p, n);
         used += n;
-        if (groups) g_key_groups[grp] = g_key_groups[grp] * 0x100000001b3ull ^ Common::CityHash64(static_cast<const char*>(p), n);
+        if (groups) g_key_groups[grp] = g_key_groups[grp] * 0x100000001b3ull ^ CityHash64(static_cast<const char*>(p), n);
     };
     // (g_bind_objects: what the kept sets need; bind_stage adds g_bind_epoch for the submission's cache)
     const u64 head[2] = {reinterpret_cast<u64>(sh), g_bind_objects.load(std::memory_order_relaxed)};
@@ -1871,7 +1871,7 @@ u64 stage_key(const State& s, const Shader* sh, const DrawArgs& da) {
         default: break;
         }
     }
-    const u64 h = Common::CityHash64(reinterpret_cast<const char*>(k.data()), used);
+    const u64 h = CityHash64(reinterpret_cast<const char*>(k.data()), used);
     return h ? h : 1;
 }
 
@@ -2062,7 +2062,7 @@ bool bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay
                                               st == SH_CS ? (static_cast<u64>(da.dispatch[0]) | static_cast<u64>(da.dispatch[1]) << 32)
                                                           : (static_cast<u64>(static_cast<u32>(da.base_vertex)) | static_cast<u64>(static_cast<u32>(da.base_instance)) << 32),
                                               st == SH_CS ? da.dispatch[2] : 0};
-                        pre = Common::CityHash64(reinterpret_cast<const char*>(parts), sizeof parts) | 1;
+                        pre = CityHash64(reinterpret_cast<const char*>(parts), sizeof parts) | 1;
                     }
                     c0 = constants(3, from, fn, C0Size, [&](u8* c) {
                         std::memset(c, 0, C0Size);
@@ -2424,7 +2424,7 @@ void set_vertex_input(VkCommandBuffer cb, const State& s, const Shader* vs, u64*
                 const u64 b[4] = {i, reinterpret_cast<u64>(bufs[i]), offs[i], sizes[i]};
                 k.insert(k.end(), reinterpret_cast<const u8*>(b), reinterpret_cast<const u8*>(b + 4));
             }
-            *digest = Common::CityHash64(reinterpret_cast<const char*>(k.data()), k.size());
+            *digest = CityHash64(reinterpret_cast<const char*>(k.data()), k.size());
         }
     }
 }
