@@ -317,16 +317,46 @@ void create_device(Device& c) {
     ai.pVulkanFunctions = &vf;
     check(vmaCreateAllocator(&ai, &c.vma), "vmaCreateAllocator");
 
+    c.feat.uma = c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    if (const char* e = std::getenv("HOST_NVN_UMA"); e && *e) c.feat.uma = std::strcmp(e, "0") != 0;
+
     std::string list;
     for (const char* e : want) list += std::string(" ") + e;
-    LOG("nvk: %s (Vulkan %u.%u.%u, driver %#x), queue family %u, mesh shaders %d, dynamic state 3 %d, host import %d "
-        "(alignment %llu), sparse images %d (strict %d); extensions:%s",
+    std::string heaps;
+    for (u32 h = 0; h < c.mem_props.memoryHeapCount; h++) {
+        char b[64];
+        std::snprintf(b, sizeof b, "%s%llu MB%s", h ? ", " : "", static_cast<unsigned long long>(c.mem_props.memoryHeaps[h].size >> 20),
+                      c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        heaps += b;
+    }
+    LOG("nvk: %s (Vulkan %u.%u.%u, driver %#x), %s memory (heaps %s), queue family %u, mesh shaders %d, dynamic state 3 %d, "
+        "host import %d (alignment %llu), sparse images %d (strict %d); extensions:%s",
         c.props.deviceName, VK_API_VERSION_MAJOR(c.props.apiVersion), VK_API_VERSION_MINOR(c.props.apiVersion),
-        VK_API_VERSION_PATCH(c.props.apiVersion), c.props.driverVersion, c.family, c.feat.mesh_shader, c.feat.eds3,
-        c.feat.host_import, static_cast<unsigned long long>(c.feat.import_alignment), c.feat.sparse, c.feat.sparse_strict, list.c_str());
+        VK_API_VERSION_PATCH(c.props.apiVersion), c.props.driverVersion, c.feat.uma ? "unified" : "dedicated", heaps.c_str(), c.family,
+        c.feat.mesh_shader, c.feat.eds3, c.feat.host_import, static_cast<unsigned long long>(c.feat.import_alignment), c.feat.sparse,
+        c.feat.sparse_strict, list.c_str());
 }
 
 }  // namespace
+
+void device_budget(u64& used, u64& budget, u64* spare) {
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(ctx().vma, b);
+    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+    vmaGetMemoryProperties(ctx().vma, &mp);
+    const bool all = ctx().feat.uma;
+    used = budget = 0;
+    if (spare) *spare = 0;
+    for (u32 h = 0; h < mp->memoryHeapCount; h++)
+        if (all || (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+            used += b[h].usage, budget += b[h].budget;
+            if (spare) *spare += b[h].statistics.blockBytes - b[h].statistics.allocationBytes;
+        }
+}
+
+VkMemoryPropertyFlags gpu_only_flags() {
+    return ctx().feat.uma ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+}
 
 void init() {
     static std::once_flag once;

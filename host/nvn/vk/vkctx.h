@@ -30,6 +30,10 @@ struct Features {
     bool sparse_strict = false;     // unbound parts of a sparse image read as 0
     bool device_fault = false;      // VK_EXT_device_fault: what the GPU tripped over, logged at device loss
     bool checkpoints = false;       // HOST_NVN_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints markers per draw
+    // Unified memory (an integrated GPU; HOST_NVN_UMA=0/1 overrides): system memory is the GPU's own, so guest memory is
+    // used in place (no device copies of pools), and memory pressure counts every heap, the device-local one being only
+    // the firmware's carve-out.
+    bool uma = false;
     u64 import_alignment = 4096;
 };
 
@@ -46,6 +50,12 @@ struct Device {
     Features feat;
 };
 Device& ctx();
+// Device memory in use and the budget for it (VK_EXT_memory_budget): the device-local heaps, or every heap on unified
+// memory. `spare`: free space inside VMA's blocks (what is released stays in them for the next allocation).
+void device_budget(u64& used, u64& budget, u64* spare = nullptr);
+// The memory property a GPU-only allocation requires: device-local, or nothing on unified memory (where the
+// device-local heap is the small carve-out and system memory is as fast).
+VkMemoryPropertyFlags gpu_only_flags();
 
 // Creates the instance and device (once). Logs the GPU and the features found.
 void init();

@@ -129,20 +129,18 @@ std::atomic<u32> g_owned_n{0};
 
 bool mirror_on() {
     static const bool on = [] {
+        // Off on unified memory: the GPU reads system memory as fast as its own, and the copies only cost bandwidth and
+        // memory (HOST_NVN_POOL_MIRROR=1 has them anyway).
         const char* e = getenv("HOST_NVN_POOL_MIRROR");
-        return nvn::async_replay() && !(e && std::strcmp(e, "0") == 0);   // (everything here runs on the renderer thread)
+        const bool want = e && *e ? std::strcmp(e, "0") != 0 : !ctx().feat.uma;
+        return nvn::async_replay() && want;   // (everything here runs on the renderer thread)
     }();
     return on;
 }
 
 bool memory_to_spare() {
-    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
-    vmaGetHeapBudgets(ctx().vma, b);
-    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
-    vmaGetMemoryProperties(ctx().vma, &mp);
     u64 used = 0, budget = 0;
-    for (u32 h = 0; h < mp->memoryHeapCount; h++)
-        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) used += b[h].usage, budget += b[h].budget;
+    device_budget(used, budget);
     return used * 100 < budget * 85;
 }
 

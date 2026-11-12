@@ -84,7 +84,8 @@ std::atomic<u64> g_bytes{0};   // memory bound to sparse images (tiles and tails
 VmaAllocation alloc_blocks(const SparseImage* s, u64 bytes, VmaAllocationInfo* info) {
     VkMemoryRequirements mr{bytes, s->block, s->memtypes};
     VmaAllocationCreateInfo ai{};
-    ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    ai.requiredFlags = gpu_only_flags();
+    ai.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     VmaAllocation a = VK_NULL_HANDLE;
     if (vmaAllocateMemory(ctx().vma, &mr, &ai, &a, info) != VK_SUCCESS) return VK_NULL_HANDLE;
     g_bytes += info->size;
@@ -568,13 +569,8 @@ void sparse_tick(VkCommandBuffer (*pre)()) {
                 static_cast<unsigned long long>(after_frames / 60), static_cast<unsigned long long>(s->ev->bytes >> 20));
         }
     // Only when the device memory is short (the driver pages it out otherwise, and making room makes allocations slow)
-    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
-    vmaGetHeapBudgets(ctx().vma, b);
-    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
-    vmaGetMemoryProperties(ctx().vma, &mp);
     u64 used = 0, budget = 0;
-    for (u32 h = 0; h < mp->memoryHeapCount; h++)
-        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) used += b[h].usage, budget += b[h].budget;
+    device_budget(used, budget);
     if (used * 5 < budget * 4) return;
     const u64 frame = nvn::g_frame.load();
     for (SparseImage* s : list)

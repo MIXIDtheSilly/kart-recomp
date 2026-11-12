@@ -474,7 +474,8 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
         const VkPhysicalDeviceMemoryProperties* mp = nullptr;
         vmaGetMemoryProperties(ctx().vma, &mp);
         static u32 logged = 0;
-        img->sysmem = !(mp->memoryTypes[ai2.memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // (on unified memory system memory is the GPU's own: not a spill)
+        img->sysmem = !ctx().feat.uma && !(mp->memoryTypes[ai2.memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (img->sysmem) g_sysmem_bytes += ai2.size;
         if (img->sysmem && logged++ < 50)
             LOG("nvk: [WARNING] image %ux%ux%u x%u, %u levels, NVN format %#x (%llu MB) went to system memory (VRAM full)", img->width,
@@ -527,15 +528,9 @@ void image_evict_cold() {
     at = now;
     const u64 frame = nvn::g_frame.load();
     if (frame <= after_frames) return;
-    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
-    vmaGetHeapBudgets(ctx().vma, b);
-    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
-    vmaGetMemoryProperties(ctx().vma, &mp);
     // (free space in the allocator's blocks counts as free: what is released stays in them, and the next allocation takes it)
     u64 used = 0, budget = 0, spare = 0;
-    for (u32 h = 0; h < mp->memoryHeapCount; h++)
-        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-            used += b[h].usage, budget += b[h].budget, spare += b[h].statistics.blockBytes - b[h].statistics.allocationBytes;
+    device_budget(used, budget, &spare);
     used -= std::min(used, spare);
     // Device memory that went to system memory instead (VRAM had no room when it was made: the GPU reads it over PCIe):
     // pressure too, whatever the totals say.
