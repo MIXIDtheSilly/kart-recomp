@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 372" width="820" height="372" role="img" aria-labelledby="t d" font-family="-apple-system, 'Segoe UI', system-ui, sans-serif">
+  <title id="t">Race FPS over time, uncapped</title>
+  <desc id="d">Average frames per second in a scripted race with the frame cap off, RTX 3080, handheld resolution. Emulated GPU about 42 (Nov 9); native renderer about 82 (Nov 10); model pools in video memory 92.6; kept descriptor sets 106.5; kept texture views about 110 (Nov 11); Vulkan driver thread about 128; renderer redundancy skips about 140. The game itself plays at 60.</desc>
+  <style>
+    .surface { fill: #fcfcfb; stroke: #e8e7e3; }
+    .title { fill: #0b0b0b; font-size: 17px; font-weight: 600; }
+    .sub, .axis, .date { fill: #52514e; }
+    .sub { font-size: 12.5px; }
+    .axis { font-size: 11.5px; }
+    .name { fill: #0b0b0b; font-size: 11.5px; font-weight: 500; }
+    .date { font-size: 11px; }
+    .grid { stroke: #e8e7e3; stroke-width: 1; }
+    .base { stroke: #c9c8c2; stroke-width: 1; }
+    .cap { stroke: #8f8e88; stroke-width: 1; }
+    .caplabel { fill: #52514e; font-size: 11.5px; }
+    .line { stroke: #2a78d6; stroke-width: 2.5; fill: none; stroke-linejoin: round; stroke-linecap: round; }
+    .dot { fill: #2a78d6; stroke: #fcfcfb; stroke-width: 2; }
+    .val { fill: #0b0b0b; font-size: 13px; font-weight: 600; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: #2e2e2c; }
+      .title, .name, .val { fill: #f0efec; }
+      .sub, .axis, .date, .caplabel { fill: #c3c2b7; }
+      .grid { stroke: #2e2e2c; }
+      .base { stroke: #4a4a47; }
+      .cap { stroke: #7a7972; }
+      .line { stroke: #3987e5; }
+      .dot { fill: #3987e5; stroke: #1a1a19; }
+    }
+  </style>
+
+  <rect class="surface" x="0.5" y="0.5" width="819" height="371" rx="12"/>
+  <text class="title" x="28" y="38">Race FPS over time</text>
+  <text class="sub" x="28" y="59">Uncapped scripted race, RTX 3080, handheld resolution. The game itself plays at a steady 60.</text>
+
+  <!-- y: 0..160 fps over 290..80 -->
+  <g class="axis" text-anchor="end">
+    <line class="grid" x1="64" x2="792" y1="80" y2="80"/>     <text x="54" y="84">160</text>
+    <line class="grid" x1="64" x2="792" y1="132.5" y2="132.5"/> <text x="54" y="136.5">120</text>
+    <line class="grid" x1="64" x2="792" y1="185" y2="185"/>   <text x="54" y="189">80</text>
+    <line class="grid" x1="64" x2="792" y1="237.5" y2="237.5"/> <text x="54" y="241.5">40</text>
+    <line class="base" x1="64" x2="792" y1="290" y2="290"/>   <text x="54" y="294">0</text>
+  </g>
+
+  <!-- the 60 fps the game runs at -->
+  <line class="cap" x1="64" x2="792" y1="211.25" y2="211.25"/>
+  <text class="caplabel" x="788" y="225" text-anchor="end">60 fps: what you play at</text>
+
+  <polyline class="line" points="100,234.9 210,182.4 320,168.5 430,150.2 540,145.6 650,122 760,106.25"/>
+  <g class="dot">
+    <circle cx="100" cy="234.9" r="5"/>
+    <circle cx="210" cy="182.4" r="5"/>
+    <circle cx="320" cy="168.5" r="5"/>
+    <circle cx="430" cy="150.2" r="5"/>
+    <circle cx="540" cy="145.6" r="5"/>
+    <circle cx="650" cy="122" r="5"/>
+    <circle cx="760" cy="106.25" r="5"/>
+  </g>
+  <g class="val" text-anchor="middle">
+    <text x="100" y="260">~42</text>
+    <text x="210" y="168">~82</text>
+    <text x="430" y="136">106</text>
+    <text x="760" y="92">~140</text>
+  </g>
+
+  <g text-anchor="middle">
+    <text class="name" x="100" y="312">Emulated GPU</text>   <text class="date" x="100" y="328">Nov 9</text>
+    <text class="name" x="210" y="312">Native renderer</text> <text class="date" x="210" y="328">Nov 10</text>
+    <text class="name" x="320" y="312">Pools in VRAM</text>  <text class="date" x="320" y="328">Nov 10</text>
+    <text class="name" x="430" y="312">Kept desc. sets</text> <text class="date" x="430" y="328">Nov 10</text>
+    <text class="name" x="540" y="312">Kept tex views</text> <text class="date" x="540" y="328">Nov 11</text>
+    <text class="name" x="650" y="312">Driver thread</text>  <text class="date" x="650" y="328">Nov 11</text>
+    <text class="name" x="760" y="312">Renderer skips</text> <text class="date" x="760" y="328">Nov 11</text>
+  </g>
+  <text class="date" x="28" y="356">Milestones, not to time scale. Numbers from the commit messages; single runs vary by about ±3 fps.</text>
+</svg>
