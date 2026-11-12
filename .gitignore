@@ -4,6 +4,7 @@
 /out/
 /work/
 /host/out/
+/ver/
 
 # Editor and Python leftovers
 __pycache__/
@@ -11,10 +12,15 @@ __pycache__/
 .vs/
 .vscode/
 
-# Built by tools/texbake/build.bat
+# Built by launcher/build.bat and tools/texbake/build.bat
+/launcher/out/
 /tools/texbake/*.exe
 /tools/texbake/*.obj
 
 # Dependencies fetched and built by tools/setup_deps.py, and local paths (tools/paths.py)
 /deps/
 /local.cfg
+
+# Built by dotnet (tools/nvn_shaders.py builds the shader translator into work/xlate)
+/tools/xlate/**/bin/
+/tools/xlate/**/obj/

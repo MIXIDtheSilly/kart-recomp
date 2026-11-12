@@ -20,6 +20,5 @@ void attach_system_event(Ctx* c, u64 event_type, u32 handle, bool auto_clear);
 void install();       // graphics.cpp
 void install_display();  // graphics.cpp: nn::vi stand-ins only (native NVN)
 void install_nvn();   // nvn.cpp
-void install_nvn_shim();  // nvn_shim.cpp: HOST_NVN_SHIM=1
 
 }  // namespace gfx

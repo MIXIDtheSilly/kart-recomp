@@ -12,6 +12,8 @@
 #include <string>
 #include <unordered_map>
 
+std::string host_exe_variant();  // localcfg.cpp: "1.8.0" for kart-1.8.0.exe, "" for kart.exe
+
 namespace nvk {
 namespace {
 
@@ -40,7 +42,8 @@ std::string shader_dir() {
     p = p.substr(0, p.find_last_of("\\/"));    // ...\host\out
     p = p.substr(0, p.find_last_of("\\/"));    // ...\host
     p = p.substr(0, p.find_last_of("\\/"));    // ...\recomp
-    return p + "\\work\\nvn_shaders";
+    const std::string variant = host_exe_variant();  // kart-<version>.exe: that version's shader tables
+    return p + "\\work\\nvn_shaders" + (variant.empty() ? "" : "-" + variant);
 }
 
 ShStage stage_of(const std::string& s) {

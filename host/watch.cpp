@@ -11,12 +11,169 @@
 
 #include "kernel.h"
 #include "memory.h"
-#include "video.h"
 
 namespace nvn { extern std::atomic<uint64_t> g_frame; }
 
 namespace watch {
 namespace {
+
+// The general-purpose register that addresses the memory operand of the x86 store at `code` and that
+// can be moved without changing what the instruction does (it is not also a data operand), or -1.
+// Recompiled code addresses guest memory as [membase + offset] through ordinary ModRM operands.
+int store_address_register(const u8* code) {
+    int i = 0;
+    bool vex = false;
+    u8 rex = 0;
+    for (;; i++) {
+        const u8 b = code[i];
+        if (b == 0xF0 || b == 0xF2 || b == 0xF3 || b == 0x66 || b == 0x67 || b == 0x2E || b == 0x3E || b == 0x26 ||
+            b == 0x36 || b == 0x64 || b == 0x65)
+            continue;
+        break;
+    }
+    if ((code[i] & 0xF0) == 0x40) rex = code[i++];
+    u8 opcode{};
+    bool two_byte = false;
+    if (code[i] == 0xC5) {  // two-byte VEX: inverted R in bit 7, then the opcode
+        rex = (code[i + 1] & 0x80) ? 0 : 4;
+        opcode = code[i + 2];
+        i += 3;
+        vex = true;
+    } else if (code[i] == 0xC4) {  // three-byte VEX: inverted R, X, B in bits 7-5
+        const u8 b1 = code[i + 1];
+        rex = ((b1 & 0x80) ? 0 : 4) | ((b1 & 0x40) ? 0 : 2) | ((b1 & 0x20) ? 0 : 1);
+        opcode = code[i + 3];
+        i += 4;
+        vex = true;
+    } else if (code[i] == 0x62) {
+        return -1;  // EVEX: not emitted
+    } else if (code[i] == 0x0F) {
+        two_byte = true;
+        i++;
+        if (code[i] == 0x38 || code[i] == 0x3A) i++;
+        opcode = code[i++];
+    } else {
+        opcode = code[i++];
+        // String instructions and moffs moves address memory without a ModRM operand.
+        if ((opcode >= 0xA0 && opcode <= 0xA7) || (opcode >= 0xAA && opcode <= 0xAF)) return -1;
+    }
+    const u8 modrm = code[i];
+    const u32 mod = modrm >> 6;
+    const int reg = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    if (mod == 3) return -1;
+    int base = -1, index = -1;
+    u32 scale = 0;
+    if ((modrm & 7) == 4) {
+        const u8 sib = code[i + 1];
+        scale = sib >> 6;
+        index = ((sib >> 3) & 7) | ((rex & 2) << 2);
+        if (index == 4) index = -1;  // no index
+        base = (sib & 7) | ((rex & 1) << 3);
+        if ((sib & 7) == 5 && mod == 0) base = -1;  // disp32 only
+    } else if ((modrm & 7) == 5 && mod == 0) {
+        return -1;  // RIP-relative
+    } else {
+        base = (modrm & 7) | ((rex & 1) << 3);
+    }
+    // Registers the instruction reads or writes besides the address: the ModRM reg operand of
+    // non-vector forms, RAX for CMPXCHG, RCX for shifts by CL, all of RAX-RDX for CMPXCHG16B.
+    const auto conflicts = [&](int r) {
+        if (r < 0 || r == 4) return true;  // RSP
+        if (!vex && r == reg) return true;
+        if (two_byte && (opcode == 0xB0 || opcode == 0xB1) && r == 0) return true;
+        if (two_byte && opcode == 0xC7 && r <= 3) return true;
+        if (!two_byte && !vex && (opcode == 0xD2 || opcode == 0xD3) && r == 1) return true;
+        return false;
+    };
+    if (!conflicts(base)) return base;
+    if (scale == 0 && !conflicts(index)) return index;
+    return -1;
+}
+
+// The bytes the store at `code` writes to its memory operand, or 0 when the form is not known.
+// Covers what MSVC emits for the recompiled code and the CRT: moves, SSE/AVX stores and extracts,
+// read-modify-write ALU forms, atomics, SETcc.
+u32 store_bytes(const u8* code) {
+    int i = 0;
+    bool opsize = false, rep_f3 = false, rep_f2 = false;
+    for (;; i++) {
+        const u8 b = code[i];
+        if (b == 0x66) opsize = true;
+        else if (b == 0xF3) rep_f3 = true;
+        else if (b == 0xF2) rep_f2 = true;
+        else if (b == 0xF0 || b == 0x67 || b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 || b == 0x65) {
+        } else break;
+    }
+    bool w = false;
+    if ((code[i] & 0xF0) == 0x40) w = (code[i++] & 8) != 0;
+    const u32 word = w ? 8 : (opsize ? 2 : 4);
+    if (code[i] == 0xC5 || code[i] == 0xC4) {
+        u32 map = 1, pp, l;
+        u8 op;
+        if (code[i] == 0xC5) {
+            pp = code[i + 1] & 3;
+            l = (code[i + 1] >> 2) & 1;
+            op = code[i + 2];
+        } else {
+            map = code[i + 1] & 0x1F;
+            w = (code[i + 2] & 0x80) != 0;
+            pp = code[i + 2] & 3;
+            l = (code[i + 2] >> 2) & 1;
+            op = code[i + 3];
+        }
+        const u32 vec = l ? 32 : 16;
+        if (map == 1) {
+            if (op == 0x11) return pp == 2 ? 4 : pp == 3 ? 8 : vec;  // vmovups/vmovss/vmovsd
+            if (op == 0x29 || op == 0x2B || op == 0xE7) return vec;  // vmovaps, vmovntps, vmovntdq
+            if (op == 0x7F && (pp == 1 || pp == 2)) return vec;     // vmovdqa/vmovdqu
+            if (op == 0x7E && pp == 1) return w ? 8 : 4;           // vmovd/vmovq to memory
+            if (op == 0xD6 || op == 0x13 || op == 0x17) return 8;  // vmovq, vmovlps, vmovhps
+        } else if (map == 2) {
+            if (op == 0x2E || op == 0x2F || op == 0x8E) return vec;  // masked stores (upper bound)
+        } else if (map == 3) {
+            if (op == 0x14) return 1;
+            if (op == 0x15) return 2;
+            if (op == 0x16) return w ? 8 : 4;
+            if (op == 0x17) return 4;
+            if (op == 0x19 || op == 0x39) return 16;  // vextractf128/vextracti128
+            if (op == 0x1D) return l ? 16 : 8;        // vcvtps2ph
+        }
+        return 0;
+    }
+    if (code[i] == 0x0F) {
+        const u8 op = code[i + 1];
+        if (op == 0x3A) {
+            const u8 op3 = code[i + 2];
+            if (op3 == 0x14) return 1;
+            if (op3 == 0x15) return 2;
+            if (op3 == 0x16) return w ? 8 : 4;
+            if (op3 == 0x17) return 4;
+            return 0;
+        }
+        if (op == 0x38) return code[i + 2] == 0xF1 ? word : 0;  // movbe
+        if (op == 0x11) return rep_f3 ? 4 : rep_f2 ? 8 : 16;    // movups/movupd/movss/movsd
+        if (op == 0x13 || op == 0x17 || op == 0xD6) return 8;   // movlps, movhps, movq
+        if (op == 0x29 || op == 0x2B || op == 0xE7) return 16;  // movaps, movntps, movntdq
+        if (op == 0x7F) return (opsize || rep_f3) ? 16 : 8;     // movdqa/movdqu, mmx movq
+        if (op == 0x7E && opsize) return w ? 8 : 4;             // movd/movq to memory
+        if (op == 0xC3) return w ? 8 : 4;                       // movnti
+        if (op == 0xB0 || op == 0xC0) return 1;                 // cmpxchg/xadd byte
+        if (op == 0xB1 || op == 0xC1 || op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBA) return word;
+        if (op == 0xC7) return w ? 16 : 8;                      // cmpxchg8b/16b
+        if (op >= 0x90 && op <= 0x9F) return 1;                 // setcc
+        return 0;
+    }
+    switch (code[i]) {
+    case 0x88: case 0xC6: case 0x86: case 0x80: case 0xFE: case 0xC0: case 0xD0: case 0xD2: case 0xF6:
+    case 0x00: case 0x08: case 0x10: case 0x18: case 0x20: case 0x28: case 0x30:
+        return 1;
+    case 0x89: case 0xC7: case 0x87: case 0x81: case 0x83: case 0xFF: case 0xC1: case 0xD1: case 0xD3: case 0xF7:
+    case 0x01: case 0x09: case 0x11: case 0x19: case 0x21: case 0x29: case 0x31:
+        return word;
+    default:
+        return 0;
+    }
+}
 
 struct Range {
     u64 lo, hi;
@@ -265,13 +422,13 @@ bool on_write_fault(u64 guest, void* context) {
     if (!protected_page(page) || t_reg >= 0 || t_unprotected) return false;
     auto* ctx = static_cast<CONTEXT*>(context);
     const u8* code = reinterpret_cast<const u8*>(ctx->Rip);
-    const u32 width = video::store_bytes(code);
+    const u32 width = store_bytes(code);
     const u64 off = guest & (mem::PageSize - 1);
     u8* const backing = mem::backing_ptr(page * mem::PageSize);
     // A store reaching into the next page needs the backing memory to continue there.
     const bool fits = off + std::max<u32>(width, 32) <= mem::PageSize ||
                       mem::backing_ptr((page + 1) * mem::PageSize) == backing + mem::PageSize;
-    const int reg = backing && width && fits ? video::store_address_register(code) : -1;
+    const int reg = backing && width && fits ? store_address_register(code) : -1;
     t_addr = guest;
     t_width = width ? width : 16;
     t_depth = range_of(guest) || range_of(guest + t_width - 1) ? unwind(ctx, t_stack, 10) : 0;

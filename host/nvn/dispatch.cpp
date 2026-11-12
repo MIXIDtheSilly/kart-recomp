@@ -1,6 +1,6 @@
 // Native NVN: the game's NVN lookups (nvnBootstrapLoader, nvnDeviceGetProcAddress) resolve to the
 // implementations registered with the NVN macro; names without one resolve to a stub that logs its
-// first call. HOST_NVN=native turns it on (nvn::install); the sdk's NVN driver then never runs.
+// first call. nvn::install turns it on at startup; the sdk's NVN driver then never runs.
 #include <algorithm>
 #include <atomic>
 #include <deque>

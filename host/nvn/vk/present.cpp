@@ -64,10 +64,11 @@ bool is_srgb(VkFormat f) {
 }
 
 VkPresentModeKHR present_mode() {
+    // Mailbox by default (FIFO where the surface has no mailbox); HOST_PRESENT_MODE=fifo or immediate
     const char* v = std::getenv("HOST_PRESENT_MODE");
-    if (v && std::strcmp(v, "mailbox") == 0) return VK_PRESENT_MODE_MAILBOX_KHR;
+    if (v && std::strcmp(v, "fifo") == 0) return VK_PRESENT_MODE_FIFO_KHR;
     if (v && std::strcmp(v, "immediate") == 0) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    return VK_PRESENT_MODE_FIFO_KHR;
+    return VK_PRESENT_MODE_MAILBOX_KHR;
 }
 
 void destroy_swapchain() {

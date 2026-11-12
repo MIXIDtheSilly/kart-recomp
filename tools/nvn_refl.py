@@ -21,7 +21,9 @@ usage: nvn_refl.py [--out FILE]
 import glob, json, os, struct, sys
 
 RECOMP = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-OUT = os.path.join(RECOMP, 'work', 'nvn_shaders')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths
+OUT = os.path.join(RECOMP, 'work', 'nvn_shaders' + ('-' + paths.get('KART_VER') if paths.get('KART_VER') else ''))
 SPLIT = os.path.join(OUT, 'split')
 
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SAMP_BASE, ROW = 0x20, 0x120, 8, 0x168, 0x568, 8

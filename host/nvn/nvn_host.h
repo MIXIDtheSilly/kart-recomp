@@ -8,7 +8,7 @@
 
 namespace nvn {
 
-void install();                      // HOST_NVN=native: take over nvnBootstrapLoader (dispatch.cpp)
+void install();                      // take over nvnBootstrapLoader (dispatch.cpp)
 u64 lookup(const std::string& name); // guest-callable address of an NVN function (stub if not implemented)
 Ctx* guest_ctx();                    // the guest thread inside the current NVN call
 // Calls a guest function (a callback the game gave NVN) from inside an NVN call; returns x0.

@@ -44,6 +44,8 @@
 #include "hitch.h"
 #include "../../watch.h"
 
+std::string host_exe_variant();  // localcfg.cpp: "1.8.0" for kart-1.8.0.exe, "" for kart.exe
+
 namespace nvk {
 
 extern std::atomic<u32> g_dbg_arenas, g_dbg_gens;
@@ -3068,6 +3070,7 @@ void draw_init() {
     // pipeline cache, kept next to the shaders
     std::vector<char> data;
     if (const char* e = getenv("HOST_NVN_PIPELINE_CACHE")) g_pcache_path = e;
+    else if (const std::string v = host_exe_variant(); !v.empty()) g_pcache_path = "nvn_pipelines-" + v + ".bin";  // another game version's shaders
     else g_pcache_path = "nvn_pipelines.bin";
     {
         std::ifstream f(g_pcache_path, std::ios::binary);

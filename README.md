@@ -230,15 +230,37 @@ Verification so far: 2,481 integer and 997 SIMD leaf functions identical to Unic
 
 ## Building
 
-You need your own dump of the game (its `exefs\` and `romfs\` folders), of the version this was made
-for: module build ids `main` 9e244438c3d8ef1c..., `sdk` 90ebba182862b9ec..., `subsdk0`
-d39a7a3d44530bb6..., `rtld` 35b31ae27e472602... (`out\<module>.json` after step 3). Game patches
-and a few addresses in `host\` are tied to that version.
+You need your own dump of the game (its `exefs\` and `romfs\` folders). Two versions are known:
+
+| version | modules (build id) |
+|---------|--------------------|
+| 1.0.0 | `rtld` 35b31ae2..., `main` 9e244438..., `subsdk0` (nnEcli) d39a7a3d..., `sdk` 90ebba18... |
+| 1.8.0 | `rtld`, `main`, `subsdk0` (movie, new), `subsdk1` (nnEcli), `sdk` (`out\<module>.json` after step 3) |
+
+The tools take the module list from the dump (`out\layout.json`), the game patch (`tools\patches.py`)
+finds its site by its code, and `host\` binds to the sdk through its exports, so another version
+needs the steps below again, not code changes. `tools\hot_<module>_<build id>.txt` lists the
+functions MSVC needs its huge-function optimization for (C4883); for a new version, build once with
+`BUILD_WARN_HUGE=1` and list the functions `build\main_cl.log` names.
+
+A dump in the NUP container format (one file holding the base game, updates and add-ons) unpacks
+with `python tools\nup.py list <file>` / `extract <file> <dump folder>` (newest update by default).
+
+Two versions side by side: with `KART_VER=<version>` in the environment, steps 3-5 write to
+`ver\<version>\{out,gen,build}` and `work\nvn_shaders-<version>`, and `host\build.bat` links
+`host\out\kart-<version>.exe`. That exe takes its dump from `KART_GAME_<version>` in `local.cfg`
+and keeps saves, caches and logs in `host\out\user-<version>` and pipelines in
+`host\out\nvn_pipelines-<version>.bin`. Leave `KART_VER` out of `local.cfg`: there it would switch
+every build.
 
 Requirements: Windows 10/11 x64; Visual Studio 2026 with "Desktop development with C++" (it brings
 CMake and Ninja); Git; Python 3.13 with `pip install backports.zstd` (and `unicorn` for
 `difftest.py`); the .NET 10 SDK (shader translator); a Vulkan 1.3 GPU. Optional: LLVM for
 `BUILD_CC=clang`. Keep the repository in a path without spaces.
+
+The launcher does the steps below for you, one at a time: `launcher\build.bat` (it needs only Visual
+Studio), then `launcher\out\launcher.exe`. It checks the dump's version, writes `local.cfg`, shows what
+is missing and runs the tools with their output in its window. By hand:
 
 ```
 :: 1. Where the dump is (local.cfg is not committed; tools\paths.py lists every setting)

@@ -1,27 +1,130 @@
 #include "memory.h"
 
+#include <windows.h>
+
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
-#include "common/host_memory.h"
-#include "core/device_memory.h"
-
-extern "C" __declspec(dllimport) unsigned long __stdcall DiscardVirtualMemory(void* address, size_t size);
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_COALESCE_PLACEHOLDERS
+#define MEM_COALESCE_PLACEHOLDERS 0x00000001
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
 
 uintptr_t g_membase = 0;
 
 namespace mem {
+namespace {
+
+// ------------------------------------------------------------------ the pool
+// All guest physical memory is one pagefile-backed section, committed up front (only touched pages
+// use RAM). It is mapped whole at g_backing (the backing view: host code and the renderer read
+// guest memory there, never faulting on the guest view's protections) and piece by piece into the
+// guest view at g_membase, where recompiled code addresses guest memory. The guest view is one
+// placeholder reservation (VirtualAlloc2): mapping a range splits a placeholder for it off the free
+// space around it and replaces it with a view of the section; unmapping puts the placeholder back
+// and merges it with the free space on both sides. Every entry of g_mappings is one such view, so
+// the free space between two views is always one placeholder.
+
+using VirtualAlloc2Fn = void*(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, ULONG, void*, ULONG);
+using MapViewOfFile3Fn = void*(WINAPI*)(HANDLE, HANDLE, void*, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+using UnmapViewOfFile2Fn = BOOL(WINAPI*)(HANDLE, void*, ULONG);
+VirtualAlloc2Fn g_VirtualAlloc2 = nullptr;
+MapViewOfFile3Fn g_MapViewOfFile3 = nullptr;
+UnmapViewOfFile2Fn g_UnmapViewOfFile2 = nullptr;
+
+constexpr u64 ViewAlign = 2ull << 20;  // guest address 0 starts a 2 MiB block of the host's
 u64 g_phys_size = 0;
+HANDLE g_section = nullptr;
+u8* g_backing = nullptr;
+u8* g_reserve = nullptr;  // the guest view's reservation: the address space plus ViewAlign
+u8* g_reserve_end = nullptr;
+// One bit per pool page that has held guest data (freed without being discarded): cleared on reuse.
+std::unique_ptr<std::atomic<u64>[]> g_freed;
+
+void load_memory_api() {
+    const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (kernelbase) {
+        g_VirtualAlloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
+        g_MapViewOfFile3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
+        g_UnmapViewOfFile2 = reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
+    }
+    if (!g_VirtualAlloc2 || !g_MapViewOfFile3 || !g_UnmapViewOfFile2)
+        fatal("guest memory needs Windows 10 version 1803 or later (VirtualAlloc2, MapViewOfFile3)");
 }
 
-// The GPU (video_core) reads guest memory through Core::DeviceMemory's backing pool: it is ours.
-namespace Core {
-DeviceMemory::DeviceMemory() : buffer{mem::g_phys_size, mem::AddressSpaceSize} {}
-DeviceMemory::~DeviceMemory() = default;
-}  // namespace Core
+// The section and its backing view. False when the commit doesn't fit in RAM + page file.
+bool create_pool(u64 size) {
+    g_section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, static_cast<DWORD>(size >> 32),
+                                   static_cast<DWORD>(size), nullptr);
+    if (!g_section) return false;
+    g_backing = static_cast<u8*>(MapViewOfFile(g_section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+    if (g_backing) return true;
+    CloseHandle(g_section);
+    g_section = nullptr;
+    return false;
+}
 
-namespace mem {
-namespace {
+void reserve_view() {
+    const u64 size = AddressSpaceSize + ViewAlign;
+    g_reserve = static_cast<u8*>(
+        g_VirtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+    if (!g_reserve) fatal("cannot reserve %llu GiB of address space for guest memory (error %lu)", size >> 30, GetLastError());
+    g_reserve_end = g_reserve + size;
+    g_membase = (reinterpret_cast<uintptr_t>(g_reserve) + ViewAlign - 1) & ~(ViewAlign - 1);
+}
+
+u8* view_ptr(u64 addr) { return reinterpret_cast<u8*>(g_membase) + addr; }
+
+void place_view(u64 addr, u64 phys, u64 size) {
+    if (!g_MapViewOfFile3(g_section, GetCurrentProcess(), view_ptr(addr), phys, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                          nullptr, 0))
+        fatal("mem: mapping guest %#llx (+%#llx) failed (error %lu)", addr, size, GetLastError());
+}
+
+// [at, at + size) becomes a placeholder of its own, split off the one containing it.
+void split_placeholder(u8* at, u64 size) {
+    if (!VirtualFree(at, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+        fatal("mem: splitting a placeholder at %p (+%#llx) failed (error %lu)", at, size, GetLastError());
+}
+
+void unplace_view(u64 addr) {
+    if (!g_UnmapViewOfFile2(GetCurrentProcess(), view_ptr(addr), MEM_PRESERVE_PLACEHOLDER))
+        fatal("mem: unmapping guest %#llx failed (error %lu)", addr, GetLastError());
+}
+
+void mark_freed(u64 phys, u64 size) {
+    for (u64 page = phys / PageSize, last = (phys + size) / PageSize; page < last; ++page)
+        g_freed[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_relaxed);
+}
+
+// Zeroes the pages of a run that held guest data; the others were never written or were discarded
+// (they read zero), and writing them would make RAM resident for memory the guest may never use.
+void clear_freed(u64 phys, u64 size) {
+    const u64 first = phys / PageSize, last = (phys + size) / PageSize;
+    u64 run = last;
+    const auto flush = [&](u64 end) {
+        if (run < end) std::memset(g_backing + run * PageSize, 0, (end - run) * PageSize);
+        run = last;
+    };
+    for (u64 page = first; page < last; ++page) {
+        if ((g_freed[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) {
+            if (run == last) run = page;
+        } else {
+            flush(page);
+        }
+    }
+    flush(last);
+}
 
 struct Block {
     u64 size;
@@ -41,8 +144,6 @@ std::map<u64, Block> g_blocks;      // covers [0, AddressSpaceSize) without gaps
 std::map<u64, Mapping> g_mappings;  // guest address -> physical run (only mapped ranges)
 std::map<u64, u64> g_phys_free;     // free physical runs: offset -> size
 u64 g_heap_size = 0;
-Core::DeviceMemory* g_device = nullptr;
-Common::HostMemory* g_host = nullptr;
 
 // Make `addr` the start of a block.
 void split(u64 addr) {
@@ -79,7 +180,9 @@ template <class F> void update(u64 addr, u64 size, F f) {
     merge_around(addr, addr + size);
 }
 
-// Make `addr` the start of a mapping if a mapping covers it.
+// Make `addr` the start of a mapping if a mapping covers it. A view can't be split in place: it is
+// unmapped, its placeholder split, and both halves mapped again. Another thread touching it meanwhile
+// faults and retries once the memory lock is free (wait_mapped).
 void split_mapping(u64 addr) {
     auto it = g_mappings.upper_bound(addr);
     if (it == g_mappings.begin()) return;
@@ -87,8 +190,41 @@ void split_mapping(u64 addr) {
     if (it->first == addr || addr >= it->first + it->second.size) return;
     const u64 head = addr - it->first;
     Mapping tail{it->second.size - head, it->second.phys + head, it->second.owned};
+    unplace_view(it->first);
+    split_placeholder(view_ptr(it->first), head);
+    place_view(it->first, it->second.phys, head);
+    place_view(addr, tail.phys, tail.size);
     it->second.size = head;
     g_mappings.emplace(addr, tail);
+}
+
+// The free placeholder a view at [addr, addr + size) is or would be in: from the end of the view
+// before it (or the reservation's start) to the start of the view after it (or the reservation's
+// end). `next` is the first mapping after it.
+std::pair<u8*, u8*> free_space(std::map<u64, Mapping>::iterator next, std::map<u64, Mapping>::iterator prev_end) {
+    u8* lo = g_reserve;
+    if (prev_end != g_mappings.begin()) {
+        const auto prev = std::prev(prev_end);
+        lo = view_ptr(prev->first + prev->second.size);
+    }
+    return {lo, next == g_mappings.end() ? g_reserve_end : view_ptr(next->first)};
+}
+
+// Maps a view of [phys, phys + size) at guest `addr` (nothing mapped there).
+void map_one(u64 addr, u64 phys, u64 size) {
+    const auto next = g_mappings.lower_bound(addr);
+    const auto [lo, hi] = free_space(next, next);
+    if (lo != view_ptr(addr) || hi != view_ptr(addr + size)) split_placeholder(view_ptr(addr), size);
+    place_view(addr, phys, size);
+}
+
+// Unmaps one view and merges its placeholder with the free space around it.
+void unmap_one(std::map<u64, Mapping>::iterator it) {
+    unplace_view(it->first);
+    const auto [lo, hi] = free_space(std::next(it), it);
+    if (lo == view_ptr(it->first) && hi == view_ptr(it->first + it->second.size)) return;
+    if (!VirtualFree(lo, hi - lo, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+        fatal("mem: merging placeholders at %p (+%#llx) failed (error %lu)", lo, static_cast<u64>(hi - lo), GetLastError());
 }
 
 // Freed physical pages leave RAM: until the pool hands them out again only the backing view maps
@@ -103,14 +239,14 @@ bool discard_run(u64 phys, u64 size) {
     // then it must read zero.
     static const bool keep = [] {
         if (const char* v = std::getenv("HOST_KEEP_FREED"); v && v[0] == '1') return true;
-        u8* const page = g_host->BackingBasePointer() + g_phys_size - PageSize;
+        u8* const page = g_backing + g_phys_size - PageSize;
         std::memset(page, 0xAB, PageSize);
         bool zero = DiscardVirtualMemory(page, PageSize) == 0;
         for (u64 i = 0; zero && i < PageSize; ++i) zero = page[i] == 0;
         if (!zero) LOG("mem: discarded pages do not read zero; freed guest memory stays resident");
         return !zero;
     }();
-    if (keep || DiscardVirtualMemory(g_host->BackingBasePointer() + phys, size) != 0) return false;
+    if (keep || DiscardVirtualMemory(g_backing + phys, size) != 0) return false;
     const u64 before = g_discarded;
     g_discarded += size;
     if ((before >> 30) != (g_discarded >> 30)) LOG("mem: %llu MiB of freed guest memory returned to the system so far", g_discarded >> 20);
@@ -118,7 +254,7 @@ bool discard_run(u64 phys, u64 size) {
 }
 
 void free_run(u64 phys, u64 size) {
-    if (!discard_run(phys, size)) g_host->MarkBackingFreed(phys, size);
+    if (!discard_run(phys, size)) mark_freed(phys, size);
     auto next = g_phys_free.lower_bound(phys);
     if (next != g_phys_free.begin()) {
         auto prev = std::prev(next);
@@ -145,7 +281,7 @@ void unmap_view(u64 addr, u64 size) {
     split_mapping(addr);
     split_mapping(addr + size);
     for (auto it = g_mappings.lower_bound(addr); it != g_mappings.end() && it->first < addr + size;) {
-        g_host->Unmap(it->first, it->second.size, false);
+        unmap_one(it);
         if (it->second.owned) free_run(it->second.phys, it->second.size);
         it = g_mappings.erase(it);
     }
@@ -154,16 +290,13 @@ void unmap_view(u64 addr, u64 size) {
 void map_view(u64 addr, const std::vector<PhysRun>& runs, bool owned) {
     unmap_view(addr, [&] { u64 s = 0; for (auto& r : runs) s += r.size; return s; }());
     for (const PhysRun& r : runs) {
-        g_host->Map(addr, r.phys, r.size, Common::MemoryPermission::ReadWrite, false);
+        map_one(addr, r.phys, r.size);
         g_mappings.emplace(addr, Mapping{r.size, r.phys, owned});
         addr += r.size;
     }
 }
 
 }  // namespace
-
-Common::HostMemory& host_memory() { return *g_host; }
-Core::DeviceMemory& device_memory() { return *g_device; }
 
 void init() {
     // The pool is committed up front (a pagefile-backed section) but only touched pages use RAM.
@@ -174,21 +307,20 @@ void init() {
     // past the pool's last GiB the GPU's sparse and GPU-only memory goes without backing.
     std::vector<u64> sizes{24, 20, 16, 14, 12};
     if (const char* v = std::getenv("HOST_PHYS_GIB")) sizes = {std::strtoull(v, nullptr, 0)};
+    load_memory_api();
     for (const u64 gib : sizes) {
         g_phys_size = gib << 30;
-        g_device = new Core::DeviceMemory();
-        if (g_device->buffer.VirtualBasePointer()) break;
-        delete g_device;
-        g_device = nullptr;
+        if (create_pool(g_phys_size)) break;
+        g_phys_size = 0;
         LOG("guest memory pool: %llu GiB doesn't fit in RAM + page file", gib);
     }
-    if (!g_device)
+    if (!g_phys_size)
         fatal("cannot reserve guest memory: even %llu GiB doesn't fit in RAM + page file. Free memory or "
               "enlarge the page file (System > About > Advanced system settings > Performance > Virtual memory).",
               sizes.back());
     LOG("guest memory pool: %llu GiB", g_phys_size >> 30);
-    g_host = &g_device->buffer;
-    g_membase = reinterpret_cast<uintptr_t>(g_host->VirtualBasePointer());
+    reserve_view();
+    g_freed = std::make_unique<std::atomic<u64>[]>(g_phys_size / PageSize / 64);
     g_phys_free.emplace(0, g_phys_size);
     g_blocks.emplace(0, Block{AddressSpaceSize, Free, None, 0});
 }
@@ -210,7 +342,7 @@ std::vector<PhysRun> phys_alloc(u64 size) {
         left -= take;
     }
     if (left) fatal("out of guest physical memory allocating %#llx bytes (raise HOST_PHYS_GIB)", size);
-    for (const PhysRun& r : runs) g_host->ClearBackingRegion(r.phys, r.size, 0);
+    for (const PhysRun& r : runs) clear_freed(r.phys, r.size);
     return runs;
 }
 
@@ -226,7 +358,7 @@ u64 phys_free_bytes() {
     return total;
 }
 
-u8* phys_ptr(u64 phys) { return g_host->BackingBasePointer() + phys; }
+u8* phys_ptr(u64 phys) { return g_backing + phys; }
 u64 phys_pool_bytes() { return g_phys_size; }
 
 std::vector<RemapListener> g_remap_listeners;
@@ -325,19 +457,20 @@ bool wait_mapped(u64 addr) {
 
 void protect_view(u64 addr, u64 size, bool read, bool write) {
     std::scoped_lock lk{g_lock};
-    Common::MemoryPermission perm{};
-    if (read) perm |= Common::MemoryPermission::Read;
-    if (write) perm |= Common::MemoryPermission::Write;
+    const DWORD protection = write ? PAGE_READWRITE : read ? PAGE_READONLY : PAGE_NOACCESS;
+    // One call per view: VirtualProtect doesn't cross views.
     auto it = g_mappings.upper_bound(addr);
     if (it != g_mappings.begin()) --it;
     for (; it != g_mappings.end() && it->first < addr + size; ++it) {
         const u64 lo = std::max(addr, it->first), hi = std::min(addr + size, it->first + it->second.size);
-        if (lo < hi) g_host->Protect(lo, hi - lo, perm);
+        DWORD old = 0;
+        if (lo < hi && !VirtualProtect(view_ptr(lo), hi - lo, protection, &old))
+            LOG("mem: protecting guest %#llx (+%#llx) failed (error %lu)", lo, hi - lo, GetLastError());
     }
 }
 
 // Permissions are bookkeeping only: host code reads guest memory through the view whatever the
-// guest's permission, and the view's host protection belongs to the GPU's write tracking.
+// guest's permission, and the view's host protection belongs to the debug write watch (watch.cpp).
 void set_perm(u64 addr, u64 size, u32 perm) {
     std::scoped_lock lk{g_lock};
     update(addr, size, [&](Block& b) { b.perm = perm; });

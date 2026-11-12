@@ -1,15 +1,13 @@
-// Guest memory: physical pages from one backing pool (Common::HostMemory, the same object the GPU
-// reads through), mapped into the 512 GiB fastmem view at g_membase. Also the kernel's view of the
-// address space (memory state, permission and attribute per block) for svcQueryMemory and friends.
+// Guest memory: physical pages from one backing pool (a pagefile-backed section, also mapped whole
+// as the backing view), mapped into the 512 GiB fastmem view at g_membase. Also the kernel's view
+// of the address space (memory state, permission and attribute per block) for svcQueryMemory and
+// friends.
 #pragma once
 #include <map>
 #include <mutex>
 #include <vector>
 
 #include "common.h"
-
-namespace Common { class HostMemory; }
-namespace Core { class DeviceMemory; }
 
 namespace mem {
 
@@ -42,8 +40,6 @@ struct PhysRun {
 };
 
 void init();
-Common::HostMemory& host_memory();
-Core::DeviceMemory& device_memory();  // the pool as video_core sees it
 
 // Map fresh zeroed memory.
 void map(u64 addr, u64 size, u32 state, u32 perm);
@@ -52,19 +48,20 @@ void map_phys(u64 addr, const std::vector<PhysRun>& runs, u32 state, u32 perm);
 // Unmap; physical memory that map() allocated for the range is freed.
 void unmap(u64 addr, u64 size);
 // Called after map(), map_phys() and unmap() change what backs [addr, addr + size), outside the
-// memory lock: the GPU's mappings of guest memory follow the CPU's (GPU address == CPU address).
+// memory lock: the renderer's mappings of guest memory follow the CPU's (GPU address == CPU address).
 using RemapListener = void (*)(u64 addr, u64 size);
 void add_remap_listener(RemapListener listener);
 
 // Physical memory behind [addr, addr + size), in address order (unmapped pages are skipped).
 std::vector<PhysRun> phys_runs(u64 addr, u64 size);
-// Host pointer to the backing of a guest page (the GPU's view), or nullptr if unmapped.
+// Guest pages mapping the same physical page as `addr` (itself included); `others` gets up to four.
 u32 alias_count(u64 addr, std::vector<u64>* others);
+// Host pointer to the backing of a guest page (the backing view), or nullptr if unmapped.
 u8* backing_ptr(u64 addr);
 // Whether a guest page is mapped, after any map or unmap in progress on another thread has finished
 // (partly unmapping a view briefly unmaps all of it on Windows: a fault there is retried).
 bool wait_mapped(u64 addr);
-// Host protection of the mapped parts of a range in the view (the GPU's CPU-write tracking).
+// Host protection of the mapped parts of a range in the view (the debug write watch, watch.cpp).
 void protect_view(u64 addr, u64 size, bool read, bool write);
 
 // Physical pages that outlive any one mapping (shared memory).

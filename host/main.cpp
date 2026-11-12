@@ -410,8 +410,6 @@ namespace {
 LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_SINGLE_STEP && stepwatch::on_trap(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
-    // The store redirected to backing memory (video::on_cpu_write_fault) has run.
-    if (code == EXCEPTION_SINGLE_STEP && video::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code == EXCEPTION_SINGLE_STEP && watch::on_single_step(ep->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != 0xC0000409) {
@@ -424,16 +422,6 @@ LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     // A store into a watched guest buffer (HOST_WATCH_SSBO).
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[0] == 1 && guest < mem::AddressSpaceSize &&
         watch::on_write_fault(guest, ep->ContextRecord)) {
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    // A guest access to GPU-written memory the CPU has not read yet: download it, then retry.
-    if (code == EXCEPTION_ACCESS_VIOLATION && guest < mem::AddressSpaceSize &&
-        video::on_read_trap(guest, ep->ExceptionRecord->ExceptionInformation[0] == 1)) {
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    // A guest write to a page the GPU caches: drop the GPU's copy, then retry the store.
-    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[0] == 1 &&
-        guest < mem::AddressSpaceSize && video::on_cpu_write_fault(guest, ep->ContextRecord)) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     // A page another thread is remapping (Windows unmaps a whole view to unmap part of it, then maps
@@ -576,36 +564,21 @@ extern "C" int __llvm_profile_write_file(void);
 extern "C" int kart_pgo_nop(void) { return 0; }
 #pragma comment(linker, "/alternatename:__llvm_profile_write_file=kart_pgo_nop")
 
+std::string host_exe_variant();  // localcfg.cpp
+
 int main(int argc, char** argv) {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc_start);
     timeBeginPeriod(1);
     SetConsoleOutputCP(CP_UTF8);
 
-    // The game dump (the folder holding exefs\ and romfs\): the first argument, else KART_GAME from the environment,
-    // else from local.cfg at the repository root (host\out\kart.exe -> ..\..), as the build tools read it
+    // The game dump (the folder holding exefs\ and romfs\): the first argument, else KART_GAME from the environment
+    // or local.cfg (localcfg.cpp)
     fs::path game;
     if (argc > 1) {
         game = argv[1];
     } else if (const char* e = getenv("KART_GAME"); e && *e) {
         game = e;
-    } else {
-        wchar_t exe[MAX_PATH];
-        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        const fs::path root = fs::path(std::wstring(exe, n)).parent_path().parent_path().parent_path();
-        std::ifstream cfg(root / "local.cfg");
-        for (std::string line; std::getline(cfg, line);) {
-            line = line.substr(0, line.find('#'));
-            const size_t eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            const auto trim = [](std::string s) {
-                const size_t a = s.find_first_not_of(" \t\r\""), b = s.find_last_not_of(" \t\r\"");
-                return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-            };
-            if (trim(line.substr(0, eq)) != "KART_GAME") continue;
-            const fs::path v = fs::u8path(trim(line.substr(eq + 1)));
-            game = v.is_absolute() ? v : root / v;
-        }
     }
     if (game.empty()) {
         fprintf(stderr, "usage: kart.exe <game dump folder, holding exefs\\ and romfs\\> [--bake-textures [n]]\n"
@@ -613,7 +586,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     g_config.game_dir = game;
-    g_config.user_dir = fs::current_path() / "user";
+    // kart-<version>.exe (another game version) keeps its saves, caches and logs apart: user-<version>.
+    const std::string variant = host_exe_variant();
+    g_config.user_dir = fs::current_path() / (variant.empty() ? std::string("user") : "user-" + variant);
     fs::create_directories(g_config.user_dir);
     g_log_file = _wfopen((g_config.user_dir / "host.log").c_str(), L"w");
     LOG("game %s", game.string().c_str());
@@ -621,7 +596,8 @@ int main(int argc, char** argv) {
     if (argc > 2 && std::strcmp(argv[2], "--bake-textures") == 0) return nvk::bake_textures(game, argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0);
 
     AddVectoredExceptionHandler(0, crash_handler);
-    // video_core logs through Eglantine's logger (user/log/eden_log.txt under the exe's folder).
+    // The texture codecs and compression wrappers still taken from Eglantine log through its logger
+    // (user/log/eden_log.txt under the exe's folder).
     Common::Log::Initialize();
     Common::Log::Start();
     // As Eden's frontend: the finest host timer resolution (0.5 ms), for the GPU thread's acquire
@@ -657,7 +633,6 @@ int main(int argc, char** argv) {
     const u64 stack_size = 0x100000;
     const u64 stack = mem::StackBase + 0x4000;
     mem::map(stack, stack_size, mem::Stack, mem::RW);
-    video::start();
     kern::start_main_thread(g_loaded[0].base, stack + stack_size, stack_size);
 
     // HOST_DUMP_AFTER=<s>: log every guest thread's state after that many seconds (stalls).

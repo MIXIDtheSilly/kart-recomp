@@ -1,0 +1,7 @@
+# The game profile the shader splitter reads (game.py): only the keys shader_split.py uses.
+
+title_id	0400C3F00006E000
+program_id	0400C3F00006E000
+modules	main subsdk0 sdk
+shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
+shader_note	the game's shaders

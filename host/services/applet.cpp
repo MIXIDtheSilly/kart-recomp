@@ -1,8 +1,11 @@
 // am (appletOE): the application's view of the applet manager.
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 
 #include "../ipc.h"
+
+std::string host_exe_variant();  // localcfg.cpp: "1.8.0" for kart-1.8.0.exe, "" for kart.exe
 
 namespace ipc {
 namespace {
@@ -17,7 +20,12 @@ struct AppletState {
     std::deque<u32> messages;
     kern::ServiceEvent message_event;
     kern::ServiceEvent gpu_error_event, suspended_tick_event, launch_param_event;
-    bool docked = std::getenv("HOST_HANDHELD") == nullptr;   // HOST_HANDHELD=1: the game runs as undocked (lower resolution)
+    kern::ServiceEvent operation_mode_refresh_event;  // never signalled: the operation mode does not change
+    // Handheld (undocked, lower resolution) by default; HOST_HANDHELD=0: docked
+    bool docked = [] {
+        const char* v = std::getenv("HOST_HANDHELD");
+        return v && std::strcmp(v, "0") == 0;
+    }();
 
     void push(u32 msg) {
         std::scoped_lock lk{lock};
@@ -114,11 +122,18 @@ struct ApplicationFunctions : Service {
         });
         on(21, [](Request& r) { r.push<u64>(0x53552D6E65ull); });  // GetDesiredLanguage: "en-US"
         on(23, [](Request& r) {                                   // GetDisplayVersion
+            // The game version kart-<version>.exe was built for, else 1.0.0 (the default build's)
+            const std::string ver = host_exe_variant();
             char v[16] = "1.0.0";
+            if (!ver.empty() && ver.size() < sizeof v && ver.find_first_not_of("0123456789.") == std::string::npos)
+                std::strncpy(v, ver.c_str(), sizeof v - 1);
             r.push_bytes(v, 16);
         });
         on(40, [](Request& r) { r.push<u8>(0); });  // NotifyRunning
         on(130, [](Request& r) { r.out_copy.push_back(applet().gpu_error_event.new_handle()); });
+        // GetOperationModeRefreshEvent (Eglantine's name, guessed). 1.8.0 asks for it at boot and waits on it with the
+        // other applet events: without a handle it waited on handle 0 in a loop and never drew a frame.
+        on(210, [](Request& r) { r.out_copy.push_back(applet().operation_mode_refresh_event.new_handle()); });
         on(321, [](Request&) {});
     }
     bool popped_user = false;

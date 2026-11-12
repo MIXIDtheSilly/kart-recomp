@@ -63,17 +63,15 @@ u64 sdk_export(const char* name) {
 
 void host_install_overrides() {
     LOG("sdk exports: %zu", sdk_exports().size());
-    // HOST_HLE_GRAPHICS=1: the old native nv::/nn::vi/NVN stand-ins (no GPU). By default the
-    // SDK's own graphics boot, vi and NVN driver run against the native graphics services.
+    // HOST_HLE_GRAPHICS=1: the old native nv::/nn::vi/NVN stand-ins (no GPU).
     if (const char* v = std::getenv("HOST_HLE_GRAPHICS"); v && v[0] == '1') {
         override_sdk("_ZN2nn2gs3sdk18BootGraphicsSystemEPvm", boot_graphics_system);
         gfx::install();
-    } else if (const char* n = std::getenv("HOST_NVN"); n && std::strcmp(n, "native") == 0) {
-        // Native NVN: no driver; nn::vi gets the stand-ins. The console graphics boot and nv:: still
-        // run: nn::codec::video (the race intro movies) decodes through their gsv session.
-        gfx::install_display();
-        nvn::install();
-    } else if (const char* s = std::getenv("HOST_NVN_SHIM"); s && s[0] == '1') {
-        gfx::install_nvn_shim();
+        return;
     }
+    // NVN is the host's (nvn/, on Vulkan): the SDK's NVN driver never runs; nn::vi gets the
+    // stand-ins. The console graphics boot and nv:: still run: nn::codec::video (the race intro
+    // movies) decodes through their gsv session.
+    gfx::install_display();
+    nvn::install();
 }

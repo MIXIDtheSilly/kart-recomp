@@ -1,81 +1,95 @@
-// audren: Eden's audio renderer (audio_core.lib) runs the game's voices, mixes and effects and plays
-// the result through cubeb, paced by the output stream. The host provides the few kernel members
-// audio_core calls: its rendered event, the process (only for guest memory) and the transfer
-// memory's address.
+// audren: the audio renderer (audio_core/, adapted from Eden) runs the game's voices, mixes and
+// effects and plays the result through WASAPI, paced by the output stream. This file is its host
+// side: guest memory, the clock, logging, and the rendered event.
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 
 #include "audio_core/audio_core.h"
 #include "audio_core/audio_render_manager.h"
 #include "audio_core/common/audio_renderer_parameter.h"
 #include "audio_core/renderer/audio_renderer.h"
-#include "core/core.h"
-#include "core/core_timing.h"
-#include "core/hle/kernel/k_event.h"
-#include "core/hle/kernel/k_process.h"
-#include "core/hle/kernel/k_transfer_memory.h"
 
 #include "../ipc.h"
-#include "../video.h"
+#include "../memory.h"
 
-// ------------------------------------------------------------------ the emulator core, as audio_core sees it
+// ------------------------------------------------------------------ audio_core/host.h, defined by the host
+
+namespace AudioCore {
 
 namespace {
-
-// Stand-ins for audio_core's kernel objects. It calls only out-of-line members on them (defined
-// below) and the inline KProcess::GetMemory / KTransferMemory::GetSourceAddress: the process is
-// zeroed memory whose embedded Core::Memory::Memory is the host's (its members ignore `this`), the
-// transfer memory holds its address in every word, so the field reads it wherever it lies.
-struct RenderedEvent {
-    alignas(Kernel::KEvent) unsigned char object[sizeof(Kernel::KEvent)]{};
-    kern::ServiceEvent event;
-    Kernel::KEvent* get() { return reinterpret_cast<Kernel::KEvent*>(object); }
-};
-
-Kernel::KProcess* fake_process() {
-    alignas(Kernel::KProcess) static unsigned char process[sizeof(Kernel::KProcess)]{};
-    return reinterpret_cast<Kernel::KProcess*>(process);
-}
-
-struct TransferMemory {
-    alignas(Kernel::KTransferMemory) u64 words[(sizeof(Kernel::KTransferMemory) + 7) / 8];
-    explicit TransferMemory(u64 address) { std::fill(std::begin(words), std::end(words), address); }
-    Kernel::KTransferMemory* get() { return reinterpret_cast<Kernel::KTransferMemory*>(words); }
-};
-
 const auto g_start = std::chrono::steady_clock::now();
 
+template <class F> void for_each_page(u64 addr, std::size_t size, F&& f) {
+    while (size) {
+        const u64 chunk = std::min<u64>(size, mem::PageSize - (addr & (mem::PageSize - 1)));
+        f(mem::backing_ptr(addr), chunk);
+        addr += chunk;
+        size -= chunk;
+    }
+}
 }  // namespace
 
-Result Kernel::KEvent::Signal(KernelCore&) {
-    reinterpret_cast<RenderedEvent*>(this)->event.signal();
-    return ResultSuccess;
-}
-
-Result Kernel::KEvent::Clear(KernelCore&) {
-    reinterpret_cast<RenderedEvent*>(this)->event.clear();
-    return ResultSuccess;
-}
-
-// Never destroyed: its sink and ADSP threads would block process exit.
-::AudioCore::AudioCore& Core::System::AudioCore() {
-    static auto* core = new ::AudioCore::AudioCore(*this);
-    return *core;
-}
-
-Kernel::KernelCore& Core::System::Kernel() {
-    alignas(16) static unsigned char kernel[16]{};  // only passed back to the members above
-    return *reinterpret_cast<Kernel::KernelCore*>(kernel);
-}
-
-std::chrono::nanoseconds Core::Timing::CoreTiming::GetGlobalTimeNs() const noexcept {
+std::chrono::nanoseconds Clock::GetGlobalTimeNs() const {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_start);
 }
 
-std::chrono::microseconds Core::Timing::CoreTiming::GetGlobalTimeUs() const noexcept {
-    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start);
+void LogMessage(LogLevel level, std::string_view text) {
+    static constexpr const char* names[] = {"debug", "info", "warning", "error", "critical"};
+    LOG("audio %s: %.*s", names[static_cast<int>(level)], static_cast<int>(text.size()), text.data());
 }
+
+void AssertFailed(const char* what, const char* file, int line) { fatal("audio: assert %s at %s:%d", what, file, line); }
+
+// Reads go through the physical pool, so they never fault on pages the renderer write-protected.
+bool GuestMemory::ReadBlockUnsafe(u64 address, void* dest, std::size_t size) {
+    u8* out = static_cast<u8*>(dest);
+    for_each_page(address, size, [&](const u8* p, u64 n) {
+        if (p) std::memcpy(out, p, n);
+        else std::memset(out, 0, n);
+        out += n;
+    });
+    return true;
+}
+
+bool GuestMemory::WriteBlockUnsafe(u64 address, const void* src, std::size_t size) {
+    const u8* in = static_cast<const u8*>(src);
+    for_each_page(address, size, [&](u8* p, u64 n) {
+        if (p) std::memcpy(p, in, n);
+        in += n;
+    });
+    return true;
+}
+
+bool GuestMemory::ZeroBlock(u64 address, std::size_t size) {
+    for_each_page(address, size, [](u8* p, u64 n) {
+        if (p) std::memset(p, 0, n);
+    });
+    return true;
+}
+
+u8* GuestMemory::GetSpan(u64 address, std::size_t size) {
+    const auto runs = mem::phys_runs(address, size);
+    if (runs.size() != 1 || runs[0].size < size) return nullptr;
+    return mem::phys_ptr(runs[0].phys);
+}
+
+}  // namespace AudioCore
+
+namespace {
+
+// The game's "frame rendered" event.
+struct RenderedEvent final : AudioCore::HostEvent {
+    kern::ServiceEvent event;
+    void Signal() override { event.signal(); }
+    void Clear() override { event.clear(); }
+};
+
+AudioCore::HostProcess g_process;
+
+}  // namespace
 
 namespace ipc {
 namespace {
@@ -83,15 +97,15 @@ namespace {
 using Params = AudioCore::AudioRendererParameterInternal;
 
 std::shared_ptr<AudioCore::Renderer::Manager> manager() {
-    static auto m = std::make_shared<AudioCore::Renderer::Manager>(video::system());
+    static auto m = std::make_shared<AudioCore::Renderer::Manager>(AudioCore::GetHostSystem());
     return m;
 }
 
 struct AudioRenderer : Service {
     AudioRenderer(const Params& params, u64 tmem_address, u64 tmem_size, u64 aruid, s32 session_id)
-        : Service("IAudioRenderer"), impl(video::system(), *manager(), rendered.get()) {
-        TransferMemory tmem{tmem_address};
-        const auto res = impl.Initialize(params, tmem.get(), tmem_size, fake_process(), aruid, session_id);
+        : Service("IAudioRenderer"), impl(AudioCore::GetHostSystem(), *manager(), &rendered) {
+        AudioCore::HostTransferMemory tmem{tmem_address};
+        const auto res = impl.Initialize(params, &tmem, tmem_size, &g_process, aruid, session_id);
         LOG("audren: session %d: %u Hz, %u samples, %u voices, %u mixes, %u sinks, rev %u: %#x", session_id,
             params.sample_rate, params.sample_count, params.voices, params.mixes, params.sinks,
             ((params.revision >> 24) & 0xff) - '0', res.raw);
