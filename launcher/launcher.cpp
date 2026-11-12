@@ -13,7 +13,8 @@
 // KART_VER, which there would switch every build.
 //
 // Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the defaults.
-// launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything.
+// launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything, in Instrument
+// Sans and DM Mono from launcher\fonts\ (SIL OFL, the licences beside them; Segoe UI and Consolas when they are missing).
 
 #ifndef UNICODE
 #define UNICODE
@@ -23,7 +24,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <d2d1.h>
-#include <dwrite.h>
+#include <dwrite_3.h>
 #include <dwmapi.h>
 #include <shobjidl.h>
 
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "d2d1.lib")
@@ -336,6 +338,7 @@ enum { ST_MISSING, ST_OK, ST_BAD, ST_OPTIONAL };
 struct Row {
     std::wstring name, detail;
     int st;
+    std::wstring code;   // a build id or a version, set in the mono face before the detail
 };
 
 struct Tools {
@@ -499,8 +502,8 @@ static void refresh() {
             else if (id.empty()) r = {m.name, L"not a module (NSO) file", ST_BAD};
             else if (id != m.id && dumped >= 0 && dumped != g_ver)
                 r = {m.name, L"this dump is version " + std::wstring(VERSIONS[dumped].name) + L": pick it at the top right", ST_BAD};
-            else if (id != m.id) r = {m.name, L"another version: " + widen(id.substr(0, 16)), ST_BAD};
-            else r = {m.name, widen(id.substr(0, 16)) + L"  matches", ST_OK};
+            else if (id != m.id) r = {m.name, L"another version", ST_BAD, widen(id.substr(0, 16))};
+            else r = {m.name, L"matches", ST_OK, widen(id.substr(0, 16))};
         }
         game_ok &= r.st == ST_OK;
         game.push_back(r);
@@ -517,7 +520,8 @@ static void refresh() {
     deps.clear();
     const bool vs = !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
     deps.push_back({L"Visual Studio", vs ? L"C++ tools found" : L"install \"Desktop development with C++\"", vs ? ST_OK : ST_BAD});
-    deps.push_back({L"Python", g_tools.python.empty() ? L"not on PATH" : g_tools.python, g_tools.python.empty() ? ST_BAD : ST_OK});
+    if (g_tools.python.empty()) deps.push_back({L"Python", L"not on PATH", ST_BAD});
+    else deps.push_back({L"Python", L"", ST_OK, g_tools.python});
     deps.push_back({L"backports.zstd", g_tools.zstd ? L"found" : L"pip install backports.zstd", g_tools.zstd ? ST_OK : ST_BAD});
     deps.push_back({L".NET 10 SDK", g_tools.dotnet ? L"found" : L"not found", g_tools.dotnet ? ST_OK : ST_BAD});
     deps.push_back({L"VP9 Video Extensions", g_tools.vp9 ? L"found" : L"optional: without it the movies are skipped",
@@ -557,29 +561,75 @@ static void refresh() {
 // ---------------------------------------------------------------------------------------------------------------
 // Drawing
 
+// Dark grey and white: neutral greys, white for what is done and the main action, so red stays the one colour of what
+// is wrong. One radius scale: the panel 12, the log 8, buttons and fields 6.
 namespace col {
-constexpr uint32_t bg = 0x16181C, panel = 0x22252B, raised = 0x1A1C20, line = 0x353A42, dot = 0x353A42, dot_hover = 0x434953;
-constexpr uint32_t text = 0xE8EAED, muted = 0x8D949E, dim = 0x5C636D, blue = 0x3B82F6, blue_hover = 0x5A97F8, blue_down = 0x2F6ED6;
-constexpr uint32_t blue_text = 0x7FB0FA, red = 0xEF5350, btn = 0x30343C, btn_hover = 0x3A3F48, btn_down = 0x2A2D34, btn_off = 0x272A30;
-constexpr uint32_t white = 0xFFFFFF, log = 0xB9BFC7;
+constexpr uint32_t bg = 0x161718, panel = 0x1F2022, inset = 0x161718, line = 0x333538, line_strong = 0x45484C;
+constexpr uint32_t text = 0xEDEDED, muted = 0x95989C, dim = 0x5E6165, accent = 0xF2F2F2, accent_hover = 0xD6D6D7;
+constexpr uint32_t accent_ink = 0x161718, red = 0xEB6F62, log = 0xB4B6B9, btn_hover = 0x26282A, btn_off = 0x1C1D1F;
+constexpr uint32_t dot_hover = 0x2A2C2F;
 }
+constexpr float R_PANEL = 12, R_LOG = 8, R_CTRL = 6;
 
 static ID2D1Factory* g_d2d;
 static IDWriteFactory* g_dw;
+static IDWriteFontCollection* g_fonts;   // launcher\fonts\, or null when it is missing (the system's fonts)
 static ID2D1HwndRenderTarget* g_rt;
 static ID2D1SolidColorBrush* g_brush;
 static ID2D1StrokeStyle* g_round;
 static float g_dpi = 96;
+static float g_alpha = 1;                // what is drawn now fades in with the step it belongs to
 
 enum { F_TITLE, F_BODY, F_SMALL, F_LABEL, F_MONO, F_DOT, F_BUTTON, F_COUNT };
 static IDWriteTextFormat* g_fmt[F_COUNT];
 static IDWriteInlineObject* g_ellipsis[F_COUNT];
+static float g_track[F_COUNT];           // letter spacing in DIPs (the title is set a little tight)
 
 enum { T_LEFT = 0, T_CENTER = 1, T_RIGHT = 2, T_VCENTER = 4, T_WRAP = 8 };
 
+static uint32_t mix(uint32_t a, uint32_t b, float t) {
+    const auto ch = [&](int s) {
+        const float x = (float)((a >> s) & 255), y = (float)((b >> s) & 255);
+        return (uint32_t)(x + (y - x) * t + 0.5f) << s;
+    };
+    return ch(16) | ch(8) | ch(0);
+}
+
 static ID2D1SolidColorBrush* brush(uint32_t rgb) {
-    g_brush->SetColor(D2D1::ColorF(rgb));
+    g_brush->SetColor(D2D1::ColorF(rgb, g_alpha));
     return g_brush;
+}
+
+static void load_fonts() {
+    IDWriteFactory5* f5 = nullptr;
+    if (FAILED(g_dw->QueryInterface(__uuidof(IDWriteFactory5), (void**)&f5))) return;
+    IDWriteFontSetBuilder1* b = nullptr;
+    if (SUCCEEDED(f5->CreateFontSetBuilder(&b))) {
+        bool any = false;
+        std::error_code ec;
+        for (fs::directory_iterator it(g_root / "launcher" / "fonts", ec), end; !ec && it != end; it.increment(ec)) {
+            if (lower(it->path().extension().wstring()) != L".ttf") continue;
+            IDWriteFontFile* ff = nullptr;
+            if (SUCCEEDED(f5->CreateFontFileReference(it->path().c_str(), nullptr, &ff))) {
+                any |= SUCCEEDED(b->AddFontFile(ff));   // a variable font adds its named instances
+                ff->Release();
+            }
+        }
+        IDWriteFontSet* set = nullptr;
+        if (any && SUCCEEDED(b->CreateFontSet(&set))) {
+            IDWriteFontCollection1* c = nullptr;
+            if (SUCCEEDED(f5->CreateFontCollectionFromFontSet(set, &c))) g_fonts = c;
+            set->Release();
+        }
+        b->Release();
+    }
+    f5->Release();
+}
+
+static bool has_family(const wchar_t* name) {
+    UINT32 i;
+    BOOL found = FALSE;
+    return g_fonts && SUCCEEDED(g_fonts->FindFamilyName(name, &i, &found)) && found;
 }
 
 static void set_format(int f, int flags) {
@@ -591,17 +641,37 @@ static void set_format(int f, int flags) {
     fm->SetTrimming(&tr, flags & T_WRAP ? nullptr : g_ellipsis[f]);
 }
 
+// A layout of <s> with the format's letter spacing (only a format with spacing needs one)
+static IDWriteTextLayout* make_layout(const std::wstring& s, int f, float w, float h, int flags) {
+    set_format(f, flags);
+    IDWriteTextLayout* tl = nullptr;
+    if (FAILED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), g_fmt[f], w, h, &tl))) return nullptr;
+    if (g_track[f]) {
+        IDWriteTextLayout1* t1 = nullptr;
+        if (SUCCEEDED(tl->QueryInterface(__uuidof(IDWriteTextLayout1), (void**)&t1))) {
+            t1->SetCharacterSpacing(g_track[f] / 2, g_track[f] / 2, 0, {0, (UINT32)s.size()});
+            t1->Release();
+        }
+    }
+    return tl;
+}
+
 static void text(const std::wstring& s, int f, D2D1_RECT_F r, uint32_t color, int flags = 0) {
     if (s.empty() || r.right <= r.left) return;
-    set_format(f, flags);
-    g_rt->DrawText(s.c_str(), (UINT32)s.size(), g_fmt[f], r, brush(color), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    if (!g_track[f]) {
+        set_format(f, flags);
+        g_rt->DrawText(s.c_str(), (UINT32)s.size(), g_fmt[f], r, brush(color), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        return;
+    }
+    if (IDWriteTextLayout* tl = make_layout(s, f, r.right - r.left, r.bottom - r.top, flags)) {
+        g_rt->DrawTextLayout({r.left, r.top}, tl, brush(color), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        tl->Release();
+    }
 }
 
 static D2D1_SIZE_F measure(const std::wstring& s, int f, float maxw, int flags = 0) {
-    set_format(f, flags);
-    IDWriteTextLayout* tl = nullptr;
     D2D1_SIZE_F sz{0, 0};
-    if (SUCCEEDED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), g_fmt[f], maxw, 10000, &tl))) {
+    if (IDWriteTextLayout* tl = make_layout(s, f, maxw, 10000, flags)) {
         DWRITE_TEXT_METRICS m;
         tl->GetMetrics(&m);
         sz = {m.widthIncludingTrailingWhitespace, m.height};
@@ -614,15 +684,25 @@ static void fill_round(D2D1_RECT_F r, float radius, uint32_t color) {
     g_rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush(color));
 }
 
+// A 1px line just inside <r>
+static void stroke_round(D2D1_RECT_F r, float radius, uint32_t color) {
+    const D2D1_RECT_F in{r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f};
+    g_rt->DrawRoundedRectangle(D2D1::RoundedRect(in, radius - 0.5f, radius - 0.5f), brush(color), 1);
+}
+
 static void fill_circle(float x, float y, float r, uint32_t color) {
     g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), r, r), brush(color));
+}
+
+static void stroke_circle(float x, float y, float r, uint32_t color, float width) {
+    g_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), r, r), brush(color), width);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_VER = 50, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_VER = 50, B_DOT = 100,
 };
 struct Hit {
     int id;
@@ -635,12 +715,15 @@ static int g_log_scroll = 0;   // lines up from the end (0: following the output
 static std::wstring g_job_name, g_status;
 static uint32_t g_status_color = col::muted;
 static ULONGLONG g_job_start = 0;
+static std::wstring g_nup_dest;    // the folder a .nup is being unpacked into (saved as the dump once that finishes)
+static bool g_unpack_log = false;  // the Game step shows the unpacking's status and output
 
 static const wchar_t* STEP_NAMES[4] = {L"Game", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TEXT[4] = {
-    L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\. Versions 1.0.0 and 1.8.0 "
-    L"work, each built and played on its own (the version buttons above); nothing of the dump is copied anywhere.",
+    L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\, or a .nup file of it, which "
+    L"is unpacked into a folder you choose. Versions 1.0.0 and 1.8.0 work, each built and played on its own (the "
+    L"version buttons above).",
     L"The tools the build needs, and the shader translator (tools\\xlate, built with the .NET SDK in a minute or two). "
     L"Nothing is downloaded: the third-party code the host uses is in the repository (third_party\\).",
     L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
@@ -653,18 +736,104 @@ static void redraw() {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Motion: every control answers the pointer. Hover: the fill steps and a button rises 1px (150ms in, 120ms out);
+// press: it sinks to 1px below rest and scales to .985 (90ms). A new step's content rises 6px into place as it fades
+// in (200ms). Windows' "Animation effects" off: every state is reached at once.
+
+struct Anim {
+    float hov = 0, press = 0;   // 0..1, linear in time; ease() shapes them
+};
+static std::map<int, Anim> g_anim;
+static bool g_motion = true, g_moving = false;
+static ULONGLONG g_frame_ms = 0, g_step_ms = 0;
+static int g_shown_step = -1;
+constexpr UINT_PTR TIMER_JOB = 1, TIMER_ANIM = 2;
+
+static float ease(float p) {   // an ease-out close to cubic-bezier(.2, .8, .2, 1)
+    p = std::clamp(p, 0.f, 1.f);
+    return 1 - (1 - p) * (1 - p) * (1 - p);
+}
+
+static Anim anim(int id) {
+    const auto it = g_anim.find(id);
+    return it == g_anim.end() ? Anim{} : it->second;
+}
+
+// Moves every control toward its state; true while something is still on its way
+static bool step_anims() {
+    const ULONGLONG now = GetTickCount64();
+    const float dt = g_moving ? (float)std::min<ULONGLONG>(now - g_frame_ms, 50) : 16.f;
+    g_frame_ms = now;
+    if (g_hover != B_NONE) g_anim[g_hover];
+    if (g_pressed != B_NONE) g_anim[g_pressed];
+    bool moving = false;
+    const auto go = [&](float& v, float to, float in_ms, float out_ms) {
+        if (!g_motion) v = to;
+        else if (to > v) v = std::min(to, v + dt / in_ms);
+        else v = std::max(to, v - dt / out_ms);
+        moving |= v != to;
+    };
+    for (auto it = g_anim.begin(); it != g_anim.end();) {
+        const int id = it->first;
+        go(it->second.hov, id == g_hover ? 1.f : 0.f, 150, 120);
+        go(it->second.press, id == g_hover && id == g_pressed ? 1.f : 0.f, 90, 90);
+        if (it->second.hov == 0 && it->second.press == 0 && id != g_hover) it = g_anim.erase(it);
+        else ++it;
+    }
+    if (g_step != g_shown_step) {
+        g_step_ms = g_shown_step < 0 ? 0 : now;   // the window's first paint does not fade
+        g_shown_step = g_step;
+    }
+    moving |= g_motion && g_step_ms && now - g_step_ms < 200;
+    return moving;
+}
+
+// Draws with a control's hover rise and press sink around <r>'s centre
+struct Lift {
+    D2D1_MATRIX_3X2_F old;
+    Lift(D2D1_RECT_F r, const Anim& a, float rise = 1) {
+        g_rt->GetTransform(&old);
+        const float h = ease(a.hov), p = ease(a.press), s = 1 - 0.015f * p;
+        const float dy = -rise * h * (1 - p) + p;
+        g_rt->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {(r.left + r.right) / 2, (r.top + r.bottom) / 2}) *
+                           D2D1::Matrix3x2F::Translation(0, dy) * old);
+    }
+    ~Lift() { g_rt->SetTransform(old); }
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Drawing
+
+static float button_width(const std::wstring& label) {
+    return std::max(112.f, measure(label, F_BUTTON, 1000).width + 40);
+}
+
 static float button(int id, const std::wstring& label, float x, float y, bool primary, bool enabled) {
-    const float w = std::max(120.f, measure(label, F_BUTTON, 1000).width + 44);
+    const float w = button_width(label);
     const D2D1_RECT_F r{x, y, x + w, y + 40};
-    const bool hov = g_hover == id, down = hov && g_pressed == id;
-    uint32_t bg, fg = primary ? col::white : col::text;
-    if (!enabled) bg = col::btn_off, fg = col::dim;
-    else if (primary) bg = down ? col::blue_down : hov ? col::blue_hover : col::blue;
-    else bg = down ? col::btn_down : hov ? col::btn_hover : col::btn;
-    fill_round(r, 8, bg);
-    text(label, F_BUTTON, r, fg, T_CENTER | T_VCENTER);
     if (enabled) g_hits.push_back({id, r});
+    const Anim a = enabled ? anim(id) : Anim{};
+    const float h = ease(a.hov);
+    Lift lift(r, a);
+    if (!enabled) {
+        fill_round(r, R_CTRL, col::btn_off);
+        text(label, F_BUTTON, r, col::dim, T_CENTER | T_VCENTER);
+    } else if (primary) {
+        fill_round(r, R_CTRL, mix(col::accent, col::accent_hover, h));
+        text(label, F_BUTTON, r, col::accent_ink, T_CENTER | T_VCENTER);
+    } else {
+        fill_round(r, R_CTRL, mix(col::inset, col::btn_hover, h));
+        stroke_round(r, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
+        text(label, F_BUTTON, r, col::text, T_CENTER | T_VCENTER);
+    }
     return x + w + 12;
+}
+
+static void marker(float x, float y, int st) {
+    if (st == ST_OK) fill_circle(x, y, 4.5f, col::accent);
+    else if (st == ST_BAD) fill_circle(x, y, 4.5f, col::red);
+    else stroke_circle(x, y, 4, st == ST_OPTIONAL ? col::line_strong : col::muted, 1.25f);
 }
 
 static float draw_rows(const std::vector<Row>& rows, int cols, float x0, float x1, float y) {
@@ -674,18 +843,21 @@ static float draw_rows(const std::vector<Row>& rows, int cols, float x0, float x
     for (size_t i = 0; i < rows.size(); i++) {
         const auto& r = rows[i];
         const float x = x0 + (i / per) * (colw + gap), yy = y + (i % per) * rh;
-        const uint32_t dotc = r.st == ST_OK ? col::blue : r.st == ST_BAD ? col::red : col::line;
-        fill_circle(x + 5, yy + rh / 2, 4.5f, dotc);
+        marker(x + 5, yy + rh / 2, r.st);
         text(r.name, F_BODY, {x + 20, yy, x + 20 + namew, yy + rh}, r.st == ST_OPTIONAL ? col::muted : col::text, T_VCENTER);
-        text(r.detail, F_SMALL, {x + 20 + namew + 8, yy, x + colw, yy + rh},
-             r.st == ST_BAD ? col::red : col::muted, T_VCENTER);
+        float dx = x + 20 + namew + 8;
+        if (!r.code.empty()) {
+            text(r.code, F_MONO, {dx, yy, x + colw, yy + rh}, r.st == ST_BAD ? col::red : col::text, T_VCENTER);
+            dx += measure(r.code, F_MONO, 1000).width + 10;
+        }
+        text(r.detail, F_SMALL, {dx, yy, x + colw, yy + rh}, r.st == ST_BAD ? col::red : col::muted, T_VCENTER);
     }
     return y + per * rh;
 }
 
 static void draw_status(float x, float x1, float y) {
     if (g_running) {
-        fill_circle(x + 5, y + 20, 4.5f, col::blue);
+        fill_circle(x + 5, y + 20, 4.5f, col::accent);
         text(g_job_name + L"   " + clock_text(GetTickCount64() - g_job_start), F_BODY, {x + 18, y, x1, y + 40}, col::text, T_VCENTER);
     } else {
         text(g_status, F_BODY, {x, y, x1, y + 40}, g_status_color, T_VCENTER);
@@ -694,8 +866,9 @@ static void draw_status(float x, float x1, float y) {
 
 static void draw_log(D2D1_RECT_F r) {
     g_log_rect = r;
-    fill_round(r, 10, col::raised);
-    const float pad = 14, lh = 18;
+    fill_round(r, R_LOG, col::inset);
+    stroke_round(r, R_LOG, col::line);
+    const float pad = 16, lh = 19;
     const D2D1_RECT_F in{r.left + pad, r.top + pad - 2, r.right - pad, r.bottom - pad + 2};
     std::lock_guard lk(g_mx);
     const int vis = std::max(1, (int)((in.bottom - in.top) / lh));
@@ -711,17 +884,17 @@ static void draw_log(D2D1_RECT_F r) {
         const std::wstring& l = g_log[i];
         const std::wstring lo = lower(l);
         uint32_t c = col::log;
-        if (l.rfind(L"> ", 0) == 0) c = col::blue_text;
+        if (l.rfind(L"> ", 0) == 0) c = col::accent;
         else if (lo.find(L"error") != std::wstring::npos || lo.find(L"failed") != std::wstring::npos) c = col::red;
         text(l, F_MONO, {in.left, in.top + k * lh, in.right, in.top + (k + 1) * lh}, c);
     }
     g_rt->PopAxisAlignedClip();
 }
 
-static void draw_check(float x, float y) {
-    auto* b = brush(col::white);
-    g_rt->DrawLine({x - 7, y + 0.5f}, {x - 2.5f, y + 5}, b, 2.6f, g_round);
-    g_rt->DrawLine({x - 2.5f, y + 5}, {x + 7.5f, y - 5.5f}, b, 2.6f, g_round);
+static void draw_check(float x, float y, uint32_t color) {
+    auto* b = brush(color);
+    g_rt->DrawLine({x - 6.5f, y + 0.5f}, {x - 2.2f, y + 4.8f}, b, 2.4f, g_round);
+    g_rt->DrawLine({x - 2.2f, y + 4.8f}, {x + 7, y - 5}, b, 2.4f, g_round);
 }
 
 static void draw_play_icon(float x, float y, uint32_t color) {
@@ -739,53 +912,72 @@ static void draw_play_icon(float x, float y, uint32_t color) {
     g->Release();
 }
 
-// The game version: one button each, right-aligned in the title row; returns where they start
+// The game version: one segmented control, right-aligned in the title row; returns where it starts
 static float draw_versions(float x1, float y, bool enabled) {
-    float x = x1;
-    for (int i = VERSION_COUNT - 1; i >= 0; i--) {
-        const std::wstring label = VERSIONS[i].name;
-        const float w = measure(label, F_SMALL, 200).width + 28;
-        x -= w;
-        const D2D1_RECT_F r{x, y + 4, x + w, y + 30};
-        const bool sel = i == g_ver, hov = !sel && enabled && g_hover == B_VER + i;
-        fill_round(r, 13, sel ? col::blue : hov ? col::btn_hover : col::btn);
-        text(label, F_SMALL, r, sel ? col::white : enabled ? col::text : col::dim, T_CENTER | T_VCENTER);
-        if (enabled && !sel) g_hits.push_back({B_VER + i, r});
-        x -= 8;
+    float seg[VERSION_COUNT], total = 6;
+    for (int i = 0; i < VERSION_COUNT; i++) total += seg[i] = measure(VERSIONS[i].name, F_LABEL, 200).width + 26;
+    const D2D1_RECT_F box{x1 - total, y + 1, x1, y + 33};
+    fill_round(box, R_CTRL, col::inset);
+    stroke_round(box, R_CTRL, col::line);
+    float x = box.left + 3;
+    for (int i = 0; i < VERSION_COUNT; i++) {
+        const D2D1_RECT_F r{x, box.top + 3, x + seg[i], box.bottom - 3};
+        const bool sel = i == g_ver;
+        if (sel) {
+            fill_round(r, R_CTRL - 2, col::accent);
+            text(VERSIONS[i].name, F_LABEL, r, col::accent_ink, T_CENTER | T_VCENTER);
+        } else {
+            const float h = enabled ? ease(anim(B_VER + i).hov) : 0;
+            if (h > 0) fill_round(r, R_CTRL - 2, mix(col::inset, col::btn_hover, h));
+            text(VERSIONS[i].name, F_LABEL, r, enabled ? mix(col::muted, col::text, h) : col::dim, T_CENTER | T_VCENTER);
+            if (enabled) g_hits.push_back({B_VER + i, r});
+        }
+        x += seg[i];
     }
     const float lw = measure(L"Game version", F_SMALL, 200).width;
-    text(L"Game version", F_SMALL, {x - lw - 4, y + 4, x, y + 30}, col::muted, T_RIGHT | T_VCENTER);
-    return x - lw - 16;
+    text(L"Game version", F_SMALL, {box.left - lw - 12, box.top, box.left - 10, box.bottom}, col::muted, T_RIGHT | T_VCENTER);
+    return box.left - lw - 24;
 }
 
-static void paint_panel(D2D1_RECT_F p) {
-    fill_round(p, 22, col::panel);
+static void paint_steps(D2D1_RECT_F p) {
     const float x0 = p.left + 36, x1 = p.right - 36;
     float y = p.top + 30;
     const float tx1 = draw_versions(x1, y, !g_running);
-    text(STEP_TITLES[g_step], F_TITLE, {x0, y, tx1, y + 34}, col::text);
-    y += 40;
+    text(STEP_TITLES[g_step], F_TITLE, {x0, y - 1, tx1, y + 35}, col::text);
+    y += 42;
     const float dh = measure(STEP_TEXT[g_step], F_BODY, x1 - x0, T_WRAP).height;
     text(STEP_TEXT[g_step], F_BODY, {x0, y, x1, y + dh + 4}, col::muted, T_WRAP);
-    y += dh + 24;
+    y += dh + 26;
 
     const bool busy = g_running;
     switch (g_step) {
     case 0: {
-        text(L"Game folder", F_SMALL, {x0, y, x1, y + 18}, col::muted);
+        text(L"Game folder", F_LABEL, {x0, y, x1, y + 18}, col::muted);
         y += 24;
-        const D2D1_RECT_F box{x0, y, x1 - 136, y + 40};
-        fill_round(box, 8, col::raised);
-        text(g_game.empty() ? L"Not chosen yet" : g_game, F_BODY, {box.left + 14, box.top, box.right - 14, box.bottom},
-             g_game.empty() ? col::dim : col::text, T_VCENTER);
-        button(B_BROWSE, L"Browse\u2026", x1 - 124, y, g_game.empty(), !busy);
+        const float bw = button_width(L"Browse…"), nw = button_width(L"Open .nup…");
+        const D2D1_RECT_F box{x0, y, x1 - bw - nw - 24, y + 40};
+        fill_round(box, R_CTRL, col::inset);
+        stroke_round(box, R_CTRL, col::line);
+        const std::wstring shown = busy && !g_nup_dest.empty() ? g_nup_dest : g_game;
+        text(shown.empty() ? L"Not chosen yet" : shown, F_BODY, {box.left + 14, box.top, box.right - 14, box.bottom},
+             shown.empty() ? col::dim : col::text, T_VCENTER);
+        button(B_NUP, L"Open .nup…", x1 - bw - nw - 12, y, false, !busy);
+        button(B_BROWSE, L"Browse…", x1 - bw, y, g_game.empty(), !busy);
         y += 60;
         y = draw_rows(g_rows[0], 1, x0, x1, y);
         if (!env_var(game_key().c_str()).empty()) {
             text(game_key() + L" is set in the environment: it is used instead of local.cfg.", F_SMALL, {x0, y + 8, x1, y + 28}, col::muted);
             y += 28;
         }
-        if (g_done[0]) button(B_CONTINUE, L"Continue", x0, y + 18, true, true);
+        if (g_unpack_log || busy) {   // a .nup being unpacked (or just done): its status and output
+            y += 18;
+            float x = x0;
+            if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
+            else if (g_done[0]) x = button(B_CONTINUE, L"Continue", x, y, true, true);
+            draw_status(x + 4, x1, y);
+            y += 56;
+            draw_log({x0, y, x1, p.bottom - 30});
+        } else if (g_done[0]) button(B_CONTINUE, L"Continue", x0, y + 18, true, true);
         break;
     }
     case 1: {
@@ -805,7 +997,7 @@ static void paint_panel(D2D1_RECT_F p) {
         y = draw_rows(g_rows[2], 2, x0, x1, y);
         const std::wstring mp = env_var(L"BUILD_MP");
         text(L"Up to " + mp + L" compiler processes at once (BUILD_MP in local.cfg or the environment)", F_SMALL,
-             {x0, y + 6, x1, y + 26}, col::dim);
+             {x0, y + 6, x1, y + 26}, col::muted);
         y += 40;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -828,7 +1020,7 @@ static void paint_panel(D2D1_RECT_F p) {
         std::wstring settings;
         for (const auto& [k, v] : game_env()) settings += (settings.empty() ? L"" : L"   ") + k + L"=" + v;
         text(L"Settings: " + (settings.empty() ? std::wstring(L"the defaults") : settings) + L"   (HOST_* lines in local.cfg)", F_SMALL,
-             {x0, y + 6, x1, y + 26}, col::dim);
+             {x0, y + 6, x1, y + 26}, col::muted);
         y += 40;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -844,6 +1036,20 @@ static void paint_panel(D2D1_RECT_F p) {
     }
 }
 
+// The panel, its content rising into place when the step has just changed
+static void paint_panel(D2D1_RECT_F p) {
+    fill_round(p, R_PANEL, col::panel);
+    stroke_round(p, R_PANEL, col::line);
+    const float t = g_motion && g_step_ms ? ease((GetTickCount64() - g_step_ms) / 200.f) : 1;
+    D2D1_MATRIX_3X2_F old;
+    g_rt->GetTransform(&old);
+    g_rt->SetTransform(D2D1::Matrix3x2F::Translation(0, (1 - t) * 6) * old);
+    g_alpha = t;
+    paint_steps(p);
+    g_alpha = 1;
+    g_rt->SetTransform(old);
+}
+
 static void paint() {
     if (!g_rt) {
         RECT rc;
@@ -853,33 +1059,43 @@ static void paint() {
             return;
         g_rt->CreateSolidColorBrush(D2D1::ColorF(0), &g_brush);
     }
+    const bool moving = step_anims();
     g_rt->BeginDraw();
     g_rt->Clear(D2D1::ColorF(col::bg));
     g_hits.clear();
     g_log_rect = {};
     const D2D1_SIZE_F sz = g_rt->GetSize();
-    const float m = 32, r = 20, cy = 58;
+    const float m = 32, r = 18, cy = 58;
 
-    // The steps: dots on a line, the finished ones blue
+    // The steps: dots on a line, the finished ones white
     float cx[4];
     for (int i = 0; i < 4; i++) cx[i] = m + 46 + (sz.width - 2 * m - 92) * i / 3.f;
     for (int i = 0; i < 3; i++)
-        g_rt->FillRectangle({cx[i], cy - 1.5f, cx[i + 1], cy + 1.5f}, brush(g_done[i] && g_done[i + 1] ? col::blue : col::line));
+        g_rt->FillRectangle({cx[i] + r, cy - 1, cx[i + 1] - r, cy + 1}, brush(g_done[i] && g_done[i + 1] ? col::accent : col::line));
     for (int i = 0; i < 4; i++) {
-        const bool sel = i == g_step, hov = g_hover == B_DOT + i;
-        if (sel) {
-            fill_circle(cx[i], cy, r + 9, col::bg);
-            g_rt->DrawEllipse(D2D1::Ellipse({cx[i], cy}, r + 5, r + 5), brush(col::blue), 2);
+        const D2D1_RECT_F hit{cx[i] - r - 8, cy - r - 8, cx[i] + r + 8, cy + r + 30};
+        g_hits.push_back({B_DOT + i, hit});
+        const bool sel = i == g_step;
+        const Anim a = anim(B_DOT + i);
+        const float h = ease(a.hov);
+        if (sel) stroke_circle(cx[i], cy, r + 5, col::accent, 1.5f);
+        {
+            Lift lift({cx[i] - r, cy - r, cx[i] + r, cy + r}, a, 0);
+            if (g_done[i] || sel) {
+                fill_circle(cx[i], cy, r, mix(col::accent, col::accent_hover, h));
+                if (g_done[i] && i == 3) draw_play_icon(cx[i] + 1, cy, col::accent_ink);
+                else if (g_done[i]) draw_check(cx[i], cy, col::accent_ink);
+                else text(std::to_wstring(i + 1), F_DOT, {cx[i] - r, cy - r, cx[i] + r, cy + r}, col::accent_ink, T_CENTER | T_VCENTER);
+            } else {
+                fill_circle(cx[i], cy, r, mix(col::panel, col::dot_hover, h));
+                stroke_circle(cx[i], cy, r - 0.5f, col::line_strong, 1);
+                text(std::to_wstring(i + 1), F_DOT, {cx[i] - r, cy - r, cx[i] + r, cy + r}, mix(col::muted, col::text, h), T_CENTER | T_VCENTER);
+            }
         }
-        fill_circle(cx[i], cy, r, g_done[i] || sel ? (hov ? col::blue_hover : col::blue) : (hov ? col::dot_hover : col::dot));
-        if (g_done[i] && i == 3) draw_play_icon(cx[i] + 1, cy, col::white);
-        else if (g_done[i]) draw_check(cx[i], cy);
-        else text(std::to_wstring(i + 1), F_DOT, {cx[i] - r, cy - r, cx[i] + r, cy + r}, sel ? col::white : col::muted, T_CENTER | T_VCENTER);
-        text(STEP_NAMES[i], F_LABEL, {cx[i] - 70, cy + r + 10, cx[i] + 70, cy + r + 30}, sel ? col::text : col::muted, T_CENTER);
-        g_hits.push_back({B_DOT + i, {cx[i] - r - 8, cy - r - 8, cx[i] + r + 8, cy + r + 30}});
+        text(STEP_NAMES[i], F_LABEL, {cx[i] - 70, cy + r + 12, cx[i] + 70, cy + r + 32}, sel ? col::text : mix(col::muted, col::text, h), T_CENTER);
     }
 
-    paint_panel({m, cy + r + 46, sz.width - m, sz.height - m});
+    paint_panel({m, cy + r + 48, sz.width - m, sz.height - m});
 
     if (g_rt->EndDraw() == D2DERR_RECREATE_TARGET) {
         g_brush->Release();
@@ -888,6 +1104,10 @@ static void paint() {
         g_rt = nullptr;
         redraw();
     }
+    // The next frame while something moves; the timer stops once everything rests
+    g_moving = moving;
+    if (moving) SetTimer(g_hwnd, TIMER_ANIM, 15, nullptr);
+    else KillTimer(g_hwnd, TIMER_ANIM);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -906,7 +1126,7 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
     g_job_name = name;
     g_job_start = GetTickCount64();
     g_status.clear();
-    SetTimer(g_hwnd, 1, 500, nullptr);
+    SetTimer(g_hwnd, TIMER_JOB, 500, nullptr);
     std::thread([cmds = std::move(cmds)] {
         DWORD code = 0;
         for (const auto& c : cmds) {
@@ -926,19 +1146,29 @@ static void stop_job() {
 
 static void job_done(DWORD code, bool cancelled) {
     g_running = false;
-    KillTimer(g_hwnd, 1);
+    KillTimer(g_hwnd, TIMER_JOB);
     const std::wstring took = clock_text(GetTickCount64() - g_job_start);
     if (cancelled) {
         g_status = L"Stopped after " + took;
         g_status_color = col::muted;
     } else if (code == 0) {
         g_status = L"Finished in " + took;
-        g_status_color = col::blue_text;
+        g_status_color = col::accent;
     } else {
         wchar_t c[32];
         swprintf(c, 32, code > 0xFFFF ? L"0x%08X" : L"%u", code);
         g_status = L"Failed (exit code " + std::wstring(c) + L") after " + took;
         g_status_color = col::red;
+    }
+    // A .nup unpacked: its folder is the dump now, of the version it holds (the output stays in view)
+    if (const std::wstring dest = std::exchange(g_nup_dest, std::wstring()); !dest.empty() && !cancelled && code == 0) {
+        if (const int v = dump_version(dest); v >= 0 && v != g_ver) {
+            g_ver = v;
+            apply_version();
+            save_setting(L"LAUNCHER_VERSION", ver().name);
+        }
+        if (!save_setting(game_key(), dest)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+        g_status = L"Unpacked in " + took + L" into " + dest;
     }
     const int step = g_step;
     refresh();
@@ -994,8 +1224,92 @@ static void browse() {
     // A dump of another known version switches to it, and is saved as that version's dump
     if (const int v = dump_version(picked); v >= 0 && v != g_ver) select_version(v);
     if (!save_setting(game_key(), picked)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+    g_unpack_log = false;
     refresh();
     redraw();
+}
+
+// A file or folder dialog; '' when cancelled
+static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start) {
+    IFileOpenDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
+    DWORD o = 0;
+    d->GetOptions(&o);
+    d->SetOptions(o | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+    d->SetTitle(title);
+    if (!folder) {
+        const COMDLG_FILTERSPEC types[] = {{L"NUP game container (*.nup)", L"*.nup"}, {L"All files", L"*.*"}};
+        d->SetFileTypes(2, types);
+    }
+    if (!start.empty()) {
+        IShellItem* si = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&si)))) {
+            d->SetFolder(si);
+            si->Release();
+        }
+    }
+    std::wstring picked;
+    if (SUCCEEDED(d->Show(g_hwnd))) {
+        IShellItem* it = nullptr;
+        if (SUCCEEDED(d->GetResult(&it))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                picked = p;
+                CoTaskMemFree(p);
+            }
+            it->Release();
+        }
+    }
+    d->Release();
+    return picked;
+}
+
+// A .nup (one file holding the game, its updates and add-ons): tools\nup.py says which version it holds, and unpacks it
+// (the newest update over the base, as Eglantine boots it) into a folder named after that version in a folder the user
+// picks. Unpacking again into the same folder only writes what is missing.
+static void open_nup() {
+    const std::wstring file = pick(false, L"The game as a .nup file", fs::path(g_game).parent_path().wstring());
+    if (file.empty()) return;
+    const std::wstring nup_py = L"python \"" + (g_root / "tools" / "nup.py").wstring() + L"\"";
+    DWORD code;
+    const std::string out = capture(nup_py + L" info \"" + file + L"\"", &code);
+    std::wstring version;
+    unsigned long long bytes = 0;
+    for (size_t a = 0, b; a < out.size(); a = b + 1) {
+        b = out.find('\n', a);
+        if (b == std::string::npos) b = out.size();
+        const std::wstring l = trim(widen(out.substr(a, b - a)));
+        if (l.rfind(L"version ", 0) == 0) version = l.substr(8);
+        else if (l.rfind(L"bytes ", 0) == 0) bytes = _wcstoui64(l.c_str() + 6, nullptr, 10);
+    }
+    if (code != 0 || version.empty()) {
+        std::wstring why = trim(decode_output(out));
+        if (why.size() > 600) why = L"…" + why.substr(why.size() - 600);
+        MessageBoxW(g_hwnd, (L"tools\\nup.py could not read this file.\n\n" + why).c_str(), L"Open .nup", MB_ICONERROR);
+        return;
+    }
+    const bool known = std::any_of(std::begin(VERSIONS), std::end(VERSIONS), [&](const Version& v) { return version == v.name; });
+    if (!known && MessageBoxW(g_hwnd, (L"This .nup holds version " + version + L", which is not one this recompilation is made "
+                                       L"for (1.0.0 and 1.8.0). Unpack it anyway?").c_str(),
+                              L"Open .nup", MB_YESNO | MB_ICONWARNING) != IDYES)
+        return;
+    const std::wstring title = L"Where to unpack version " + version + L" (a folder \"" + version + L"\" is made in it)";
+    const std::wstring parent = pick(true, title.c_str(), fs::path(file).parent_path().wstring());
+    if (parent.empty()) return;
+    fs::path dest = parent;
+    if (lower(dest.filename().wstring()) != lower(version)) dest /= version;
+    // Room for it: the files still to write, less what an earlier unpacking there already wrote (roughly)
+    ULARGE_INTEGER room{};
+    if (GetDiskFreeSpaceExW(parent.c_str(), &room, nullptr, nullptr) && !path_exists(dest / "romfs") &&
+        room.QuadPart < bytes + (1ull << 30)) {
+        wchar_t msg[256];
+        swprintf(msg, 256, L"Version %s needs %.1f GB, and only %.1f GB are free there. Unpack anyway?", version.c_str(),
+                 bytes / 1e9, room.QuadPart / 1e9);
+        if (MessageBoxW(g_hwnd, msg, L"Open .nup", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    }
+    g_nup_dest = dest.wstring();
+    g_unpack_log = true;
+    start_job(L"Unpacking version " + version, {{nup_py + L" extract \"" + file + L"\" \"" + g_nup_dest + L"\"", g_root.wstring()}});
 }
 
 static void click(int id) {
@@ -1007,6 +1321,8 @@ static void click(int id) {
         select_version(id - B_VER);
     } else if (id == B_BROWSE) {
         browse();
+    } else if (id == B_NUP) {
+        open_nup();
     } else if (id == B_CONTINUE) {
         g_step = std::min(3, g_step + 1);
         g_status.clear();
@@ -1060,6 +1376,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_dpi = (float)GetDpiForWindow(hwnd);
         const BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof dark);
+        [[fallthrough]];
+    }
+    case WM_SETTINGCHANGE: {
+        BOOL anim = TRUE;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
+        g_motion = anim != FALSE;
         return 0;
     }
     case WM_ERASEBKGND:
@@ -1162,19 +1484,27 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static void create_formats() {
+    // Instrument Sans at 400 for text and 500 for headings, buttons and labels; DM Mono for output and build ids
+    load_fonts();
+    const bool own_sans = has_family(L"Instrument Sans"), own_mono = has_family(L"DM Mono");
+    const wchar_t* sans = own_sans ? L"Instrument Sans" : L"Segoe UI";
+    const wchar_t* mono = own_mono ? L"DM Mono" : L"Consolas";
+    const DWRITE_FONT_WEIGHT head = own_sans ? DWRITE_FONT_WEIGHT_MEDIUM : DWRITE_FONT_WEIGHT_SEMI_BOLD;
     struct F {
         const wchar_t* family;
         DWRITE_FONT_WEIGHT weight;
-        float size;
+        float size, track;
     } fs_[F_COUNT] = {
-        {L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 24}, {L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 14},
-        {L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 12.5f}, {L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.5f},
-        {L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, 12.5f}, {L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15},
-        {L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 14},
+        {sans, head, 26, own_sans ? -0.7f : 0}, {sans, DWRITE_FONT_WEIGHT_NORMAL, 14, 0},
+        {sans, DWRITE_FONT_WEIGHT_NORMAL, 12.5f, 0}, {sans, head, 12.5f, 0},
+        {mono, DWRITE_FONT_WEIGHT_NORMAL, 12.5f, 0}, {sans, head, 15, 0},
+        {sans, head, 14, 0},
     };
     for (int i = 0; i < F_COUNT; i++) {
-        g_dw->CreateTextFormat(fs_[i].family, nullptr, fs_[i].weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fs_[i].size,
-                               L"en-us", &g_fmt[i]);
+        const bool own = fs_[i].family == sans ? own_sans : own_mono;
+        g_dw->CreateTextFormat(fs_[i].family, own ? g_fonts : nullptr, fs_[i].weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                               fs_[i].size, L"en-us", &g_fmt[i]);
+        g_track[i] = fs_[i].track;
         g_dw->CreateEllipsisTrimmingSign(g_fmt[i], &g_ellipsis[i]);
     }
     const D2D1_STROKE_STYLE_PROPERTIES sp{D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND};
