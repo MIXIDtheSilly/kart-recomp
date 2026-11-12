@@ -5,9 +5,12 @@ Format as read by Eden/Eglantine forks (file_sys/nup_container.cpp): 0x80-byte s
 raw or zstd extents.
 
   python tools/nup.py list FILE.nup              packages and their top-level contents
-  python tools/nup.py extract FILE.nup OUT [-p N] write package N (default: newest update, else base)
-                                                   as OUT/exefs + OUT/romfs; files already present with
-                                                   the right size are skipped (re-runnable)
+  python tools/nup.py info FILE.nup              the game's version, size and packages (for the launcher)
+  python tools/nup.py extract FILE.nup OUT [-p N] write the game as OUT/exefs + OUT/romfs: as Eglantine boots
+                                                   it, the newest update over the base (Nup.game); with -p only
+                                                   package N. Files already present with the right size are
+                                                   skipped (re-runnable); exefs files of another version are
+                                                   removed
 """
 import argparse
 import hashlib
@@ -16,6 +19,22 @@ import struct
 import sys
 
 KINDS = {0: "base", 1: "update", 2: "addon"}
+
+
+def _zstd_decompress(data, size):
+    """Python 3.14's compression.zstd, else backports.zstd (what the other tools and the launcher check for), else
+    the zstandard package."""
+    try:
+        from compression import zstd
+    except ImportError:
+        try:
+            from backports import zstd
+        except ImportError:
+            zstd = None
+    if zstd:
+        return zstd.decompress(data)
+    import zstandard
+    return zstandard.ZstdDecompressor().decompress(data, max_output_size=size)
 NO_DIR = 0xFFFFFFFF
 
 
@@ -96,8 +115,7 @@ class Nup:
             return b""
         data = self._read(eoff, esize)
         if codec == 1:
-            import zstandard
-            data = zstandard.ZstdDecompressor().decompress(data, max_output_size=size)
+            data = _zstd_decompress(data, size)
         if len(data) != size:
             raise IOError("short read: " + self.files[fi][0])
         return data
@@ -107,6 +125,29 @@ class Nup:
         if ups:
             return max(ups, key=lambda i: self.packages[i]["version"])
         return next(i for i, p in enumerate(self.packages) if p["kind"] == "base")
+
+    def game(self):
+        """The game as Eglantine's NUP loader boots it: ExeFS whole from the newest update when it has one, else
+        from the base; RomFS the base's with the update's files over it (a standalone update carries the complete
+        tree, so the overlay changes nothing). Returns (display version, {"exefs/<path>" or "romfs/<path>": file
+        index}, the packages used)."""
+        base = next((i for i, p in enumerate(self.packages) if p["kind"] == "base"), None)
+        ups = [i for i, p in enumerate(self.packages) if p["kind"] == "update"]
+        upd = max(ups, key=lambda i: self.packages[i]["version"]) if ups else None
+        used = [i for i in (base, upd) if i is not None]
+        if not used:
+            raise ValueError("no base or update package")
+        files = {}
+        exefs_from = upd if upd is not None and self.packages[upd]["exefs"] != NO_DIR else base
+        if exefs_from is not None and self.packages[exefs_from]["exefs"] != NO_DIR:
+            for path, fi in self.walk(self.packages[exefs_from]["exefs"]):
+                files["exefs/" + path] = fi
+        for i in used:   # base first, the update over it
+            if self.packages[i]["romfs"] != NO_DIR:
+                for path, fi in self.walk(self.packages[i]["romfs"]):
+                    files["romfs/" + path] = fi
+        top = self.packages[used[-1]]
+        return top["meta"].get("display_version", "v%d" % top["version"]), files, used
 
 
 def cmd_list(nup):
@@ -128,19 +169,43 @@ def cmd_list(nup):
                     print("      %-12s %10d" % (path, nup.files[fi][1]))
 
 
+def cmd_info(nup):
+    """Machine-readable, for the launcher: the game's version and size as extract writes it."""
+    ver, files, used = nup.game()
+    print("version", ver)
+    print("bytes", sum(nup.files[fi][1] for fi in files.values()))
+    print("files", len(files))
+    print("packages", " ".join("%d:%s" % (i, nup.packages[i]["kind"]) for i in used))
+
+
 def cmd_extract(nup, out, pkg, verify):
-    p = nup.packages[pkg]
-    print("extracting [%d] %s v%d -> %s" % (pkg, p["kind"], p["version"], out))
+    if pkg is None:
+        ver, files, used = nup.game()
+        print("extracting version %s (%s) -> %s" % (
+            ver, " + ".join("[%d] %s" % (i, nup.packages[i]["kind"]) for i in used), out), flush=True)
+    else:
+        p = nup.packages[pkg]
+        print("extracting [%d] %s v%d -> %s" % (pkg, p["kind"], p["version"], out), flush=True)
+        files = {part + "/" + path: fi for part in ("exefs", "romfs") if p[part] != NO_DIR
+                 for path, fi in nup.walk(p[part])}
+    # Every file in exefs\ is loaded as a module: none may stay from another version
+    exefs = os.path.join(out, "exefs")
+    if os.path.isdir(exefs):
+        keep = {k[len("exefs/"):].lower() for k in files if k.startswith("exefs/")}
+        for name in os.listdir(exefs):
+            if name.lower() not in keep and os.path.isfile(os.path.join(exefs, name)):
+                os.remove(os.path.join(exefs, name))
+                print("  removed exefs/%s (not in this version)" % name)
+    total = sum(nup.files[fi][1] for fi in files.values())
     done = skipped = 0
-    for part in ("exefs", "romfs"):
-        if p[part] == NO_DIR:
-            continue
-        for path, fi in nup.walk(p[part]):
-            dst = os.path.join(out, part, *path.split("/"))
-            size = nup.files[fi][1]
-            if os.path.exists(dst) and os.path.getsize(dst) == size:
-                skipped += 1
-                continue
+    seen = 0
+    shown = -1
+    for path, fi in sorted(files.items()):
+        dst = os.path.join(out, *path.split("/"))
+        size = nup.files[fi][1]
+        if os.path.exists(dst) and os.path.getsize(dst) == size:
+            skipped += 1
+        else:
             data = nup.read_file(fi)
             if verify and hashlib.sha256(data).digest() != nup.files[fi][4]:
                 raise IOError("SHA-256 mismatch: " + path)
@@ -149,8 +214,11 @@ def cmd_extract(nup, out, pkg, verify):
                 f.write(data)
             os.replace(dst + ".part", dst)
             done += 1
-            if done % 500 == 0:
-                print("  %d files written" % done, flush=True)
+        seen += size
+        pct = seen * 100 // max(total, 1)
+        if pct != shown and pct % 2 == 0:
+            shown = pct
+            print("  %3d%%  %.1f of %.1f GB" % (pct, seen / 1e9, total / 1e9), flush=True)
     print("done: %d written, %d already present" % (done, skipped))
 
 
@@ -158,6 +226,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("list")
+    a.add_argument("nup")
+    a = sub.add_parser("info")
     a.add_argument("nup")
     a = sub.add_parser("extract")
     a.add_argument("nup")
@@ -168,9 +238,10 @@ def main():
     nup = Nup(args.nup)
     if args.cmd == "list":
         cmd_list(nup)
+    elif args.cmd == "info":
+        cmd_info(nup)
     else:
-        pkg = nup.default_package() if args.package is None else args.package
-        cmd_extract(nup, args.out, pkg, not args.no_verify)
+        cmd_extract(nup, args.out, args.package, not args.no_verify)
 
 
 if __name__ == "__main__":
