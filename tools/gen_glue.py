@@ -1,17 +1,18 @@
 """Generate gen/aot_modules.cpp: the module descriptors that tie the recompiled libraries together.
 
-Usage: python gen_glue.py [module ...]   (default: rtld main subsdk0 sdk)
+Usage: python gen_glue.py [module ...]   (default: every module nso.py unpacked, out/layout.json)
 """
 import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-MODULES = ["rtld", "main", "subsdk0", "sdk"]
+import paths
+
+ROOT = paths.art()  # holds out/, gen/ and build/ (ver/<KART_VER>/ for another game version)
 
 
 def main():
-    mods = sys.argv[1:] or MODULES
+    mods = sys.argv[1:] or [m["name"] for m in json.loads((ROOT / "out" / "layout.json").read_text())]
     lines = ['#include "aot_modules.h"', ""]
     rows = []
     for m in mods:
@@ -33,6 +34,8 @@ def main():
     lines.append("}")
     out = ROOT / "gen" / "aot_modules.cpp"
     out.write_text("\n".join(lines) + "\n")
+    # The module libraries host/build.bat links (1.8.0 has one module more than 1.0.0).
+    (ROOT / "gen" / "aot_libs.rsp").write_text("".join(f'"{ROOT / "build" / m}.lib"\n' for m in mods))
     print(f"wrote {out} ({len(mods)} modules)")
 
 

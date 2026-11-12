@@ -128,6 +128,12 @@ void install_vi() {
     ov("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", [](Ctx* c) { st<u16>(c->x[0], 203); ret(c); });
     ov("_ZN2nn2vi52SetLayerNextHdrStandardContentLuminanceRangeMetadataEPNS0_5LayerEtt", [](Ctx* c) { ret(c); });
     ov("_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", [](Ctx* c) { ret(c); });
+    // Called by 1.8.0 each frame. The SDK's own versions go through the layer object, and the stand-in layer token has
+    // none: the call branched to address 0. 1.0.0's sdk does not have them, so they are only overridden where present.
+    auto ov_if = [](const char* name, GuestFn fn) { if (const u64 a = sdk_export(name)) host_override(a, fn); };
+    ov_if("_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15HdrContentGamutE", [](Ctx* c) { ret(c); });
+    ov_if("_ZN2nn2vi39SetLayerNextHdrToSdrToneMappingMetadataEPNS0_5LayerENS0_14HdrToneMappingE", [](Ctx* c) { ret(c); });
+    ov_if("_ZN2nn2vi39SetLayerNextHdrAdjustableBezierMetadataEPNS0_5LayerEfff", [](Ctx* c) { ret(c); });
     ov("_ZN2nn2vi28SetLayerExtendedSwapIntervalEPNS0_5LayerEii", [](Ctx* c) { ret(c); });
     ov("_ZN2nn2vi30ClearLayerExtendedSwapIntervalEPNS0_5LayerE", [](Ctx* c) { ret(c); });
 }

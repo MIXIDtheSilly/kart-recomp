@@ -276,6 +276,24 @@ struct Friend : Service {
     }
 };
 
+// ------------------------------------------------------------------ chat:u: GameChat (Switch 2), opened by 1.8.0 at boot
+
+// The session chat:u 0 hands out. Command 1 returns an event the game waits on: never signalled (as Eglantine's
+// IChatSession). Other commands answer as unknown ones do.
+struct ChatSession : Service {
+    ChatSession() : Service("IChatSession") {
+        on(1, [this](Request& r) { r.out_copy.push_back(event.new_handle()); });
+    }
+    kern::ServiceEvent event;
+};
+
+// Without a session object from command 0 the sdk's chat client read through a null pointer at boot.
+struct Chat : Service {
+    Chat() : Service("chat:u") {
+        on(0, [](Request& r) { r.push_object(std::make_shared<ChatSession>()); });
+    }
+};
+
 }  // namespace
 
 void register_misc() {
@@ -295,6 +313,7 @@ void register_misc() {
     for (const char* n : {"friend:u", "friend:a"}) {
         register_service(n, [n] { return std::make_shared<Friend>(n); });
     }
+    register_service("chat:u", [] { return std::make_shared<Chat>(); });
 }
 
 }  // namespace ipc

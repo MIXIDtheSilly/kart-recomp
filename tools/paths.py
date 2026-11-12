@@ -9,8 +9,12 @@ a comment; the file is not committed), else from the default below.
              applied: the shader splitter and the shader translator
   NVN_XLATE  folder of the built shader translator, dmsh_xlate.exe          (under NVN_REF)
   KART_GAME  the game dump: the folder holding exefs/ and romfs/            (none)
+             (with KART_VER set, KART_GAME_<KART_VER> comes first)
   VCVARS     Visual Studio's vcvars64.bat                                   (found with vswhere)
   CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\\Program Files\\LLVM\\bin)
+  KART_VER   another game version, built next to the default one: its out/, gen/ and build/ go to
+             ver/<KART_VER>/ and host\\build.bat links host\\out\\kart-<KART_VER>.exe   (none)
+             Set it in the environment for that build only: in local.cfg it would switch every build.
 
 tools/setup_deps.py fetches and builds the dependencies at the default places.
 
@@ -24,7 +28,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ["EGL", "EGL_BUILD", "NVN_REF", "NVN_XLATE", "KART_GAME", "VCVARS", "CLANG"]
+KEYS = ["EGL", "EGL_BUILD", "NVN_REF", "NVN_XLATE", "KART_GAME", "VCVARS", "CLANG", "KART_VER"]
 
 
 def _local():
@@ -53,6 +57,11 @@ def _find_vcvars():
 
 def get(key):
     """The setting's value ('' when there is none)."""
+    if key == "KART_GAME" and get("KART_VER"):
+        v = get("KART_VER")
+        g = os.environ.get("KART_GAME_" + v) or _local().get("KART_GAME_" + v)
+        if g:
+            return g if Path(g).is_absolute() else str((ROOT / g).resolve())
     if os.environ.get(key):
         return os.environ[key]
     local = _local()
@@ -82,6 +91,13 @@ def game(sub=""):
     return str(Path(g) / sub) if sub else g
 
 
+def art(sub=""):
+    """Where the files made from the game go (out/, gen/, build/): the repository, or ver/<KART_VER>/."""
+    v = get("KART_VER")
+    base = ROOT / "ver" / v if v else ROOT
+    return base / sub if sub else base
+
+
 def vcvars_env():
     """The environment vcvars64.bat sets up (compilers, include and library paths, CMake and Ninja)."""
     out = subprocess.run(f'cmd /c ""{get("VCVARS")}" >nul && set"', capture_output=True, text=True, errors="replace").stdout
@@ -95,6 +111,9 @@ def main():
     if sys.argv[1:2] == ["bat"]:
         for k in KEYS:
             print(f"{k}={get(k)}")
+        # For host\build.bat: where the module glue is, and the exe to link.
+        print(f"ART={art()}")
+        print(f"KART_EXE=kart{'-' + get('KART_VER') if get('KART_VER') else ''}.exe")
     elif sys.argv[1:2] == ["rsp"] and len(sys.argv) == 4:
         text = Path(sys.argv[2]).read_text(encoding="utf-8")
         text = text.replace("$(ROOT)", str(ROOT))

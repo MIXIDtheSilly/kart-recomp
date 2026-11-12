@@ -234,6 +234,14 @@ def main():
     starts = sorted(fde_funcs)
     ends = [s + fde_funcs[s] for s in starts]
     pointers = pointer_targets(info, img, t0, t1)
+    # Lazily bound imports (no BIND_NOW): until rtld binds a JUMP_SLOT, its GOT word holds the PLT header's address
+    # (PLT0, which calls rtld's resolver), so the first call through a slot lands there. Nothing branches to PLT0
+    # directly; in 1.0.0's main it started a function by chance, in 1.8.0's it was taken into the padding before it.
+    for r in info["relocations"]:
+        if r["type"] == "JUMP_SLOT":
+            v = struct.unpack_from("<Q", img, r["offset"])[0]
+            if t0 <= v < t1:
+                pointers.add(v)
 
     def inside_fde(c):
         i = bisect.bisect_right(starts, c) - 1

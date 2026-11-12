@@ -265,8 +265,14 @@ u32 send_sync_request(u32 handle, u64 msg_addr) {
     const Parsed p = parse(w, r);
     const u8* raw = reinterpret_cast<const u8*>(w);
 
-    if (p.type == 2 || p.type == 15) {  // Close (CMIF) / TIPC close: the client closes the handle next
+    if (p.type == 2) {  // Close (CMIF): the client closes the handle next
         return ResultOk;
+    }
+    if (p.type == 15) {
+        // TIPC close: the server drops the session without a reply, so the client's request ends with "session
+        // closed" (2001-0123), and the SDK checks exactly that before closing its handle: nn::codec's video decoder
+        // service, destroyed at the end of each of 1.8.0's movies, aborted on 0.
+        return 0xf601;
     }
     if (p.type >= 16) {  // TIPC
         r.tipc = true;

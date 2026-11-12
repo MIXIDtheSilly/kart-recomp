@@ -106,6 +106,7 @@ struct ServiceEvent {
     void signal() { signal_event(ev->readable.get()); }
     void clear() { clear_event(ev->readable.get()); }
     u32 new_handle() { return add_handle(ev->readable); }
+    u32 new_writable_handle() { return add_handle(ev); }  // for an event the guest signals (svcSignalEvent)
 };
 
 // Process startup.
