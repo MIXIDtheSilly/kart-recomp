@@ -39,6 +39,7 @@ struct Image {
     std::unordered_map<u64, VkImageView> views;
     struct SparseImage* sparse = nullptr;  // a sparse-residency image (sparse.h), shared by the textures over its storage
     u64 last_use = 0;           // frame (nvn::g_frame) it was last viewed for a draw, copy or target
+    std::shared_ptr<struct CpuWatch> cpu_watch;  // storage the CPU writes unannounced (a linear texture): see cpu_writes_poll
 };
 
 // The image of texture t, created when first asked for; `cb` gets the layout transition of a new image
@@ -51,6 +52,11 @@ void image_release(u64 serial);
 void image_evict_cold();
 // A memory pool [lo, hi) is gone: parked images over it go.
 void image_pool_gone(u64 lo, u64 hi);
+// Linear textures in CPU-accessible memory are written in place by the CPU, announced by nothing (the game's font
+// cache: an R8 1024x8192 linear texture in CPU-uncached memory, glyphs added as text needs them; uploaded once, the
+// text lacked every glyph added after that). A thread hashes the storage of those drawn lately, once a frame at most;
+// this, once a submission (renderer thread), has the ones it found changed uploaded again. True if any.
+bool cpu_writes_poll();
 
 // Changes whenever a guest address or texture content may resolve to something else than before (textures written by
 // the CPU, pools made or gone, sparse tiles remapped): draw.cpp keeps descriptor sets made under one value. (Texture and

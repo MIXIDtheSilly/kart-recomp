@@ -15,19 +15,113 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <string>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include "../abi.h"
+#include "../../cityhash.h"
+#include "../../memory.h"
 
 namespace nvn {
 extern std::atomic<uint64_t> g_frame;   // presents so far (window.cpp)
 }
 
 namespace nvk {
+
+// ------------------------------------------------------------------ CPU writes to linear textures (cpu_writes_poll)
+struct CpuWatch {
+    u64 addr = 0, size = 0;             // the storage
+    u64 hash = 0;                       // at the last look (the hashing thread's, as `looked`)
+    bool looked = false;
+    std::atomic<bool> busy{false};      // queued or being hashed
+    std::atomic<bool> changed{false};   // found changed since the renderer last took it
+    u64 queued_frame = ~0ull;           // (renderer thread)
+};
+
+namespace {
+
+std::mutex g_watch_mu;   // g_watched
+std::vector<Image*> g_watched;
+std::mutex g_hash_mu;    // g_hash_q
+std::condition_variable g_hash_cv;
+std::deque<std::shared_ptr<CpuWatch>> g_hash_q;
+
+// The storage as it is now, read through the backing view (a range unmapped meanwhile does not fault): each physical run
+// hashed, with where it is.
+u64 storage_hash(u64 addr, u64 size) {
+    u64 h = size;
+    for (const mem::PhysRun& r : mem::phys_runs(addr, size))
+        h = (h ^ CityHash64WithSeed(reinterpret_cast<const char*>(mem::phys_ptr(r.phys)), r.size, r.phys)) * 0x9E3779B97F4A7C15ull;
+    return h;
+}
+
+void hash_thread() {
+    SetThreadDescription(GetCurrentThread(), L"nvk cpu writes");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        std::shared_ptr<CpuWatch> w;
+        {
+            std::unique_lock lk{g_hash_mu};
+            g_hash_cv.wait(lk, [] { return !g_hash_q.empty(); });
+            w = std::move(g_hash_q.front());
+            g_hash_q.pop_front();
+        }
+        const u64 h = storage_hash(w->addr, w->size);
+        // The first look counts as a change too: the CPU may have written between the first upload and it.
+        if (!w->looked || h != w->hash) w->changed.store(true, std::memory_order_release);
+        w->hash = h, w->looked = true;
+        w->busy.store(false, std::memory_order_release);
+    }
+}
+
+void watch_add(Image* img, const nvn::tex_t* t) {
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) || !t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+        nvn::sparse_pool(t->pool))
+        return;
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(hash_thread).detach(); });
+    img->cpu_watch = std::make_shared<CpuWatch>();
+    img->cpu_watch->addr = nvn::ga(t->mem), img->cpu_watch->size = t->L.size;
+    std::scoped_lock lk{g_watch_mu};
+    g_watched.push_back(img);
+}
+
+void watch_remove(Image* img) {
+    if (!img->cpu_watch) return;
+    std::scoped_lock lk{g_watch_mu};
+    if (auto it = std::find(g_watched.begin(), g_watched.end(), img); it != g_watched.end()) {
+        *it = g_watched.back();
+        g_watched.pop_back();
+    }
+}
+
+}  // namespace
+
+bool cpu_writes_poll() {
+    const u64 frame = nvn::g_frame.load(std::memory_order_relaxed);
+    bool any = false;
+    std::scoped_lock lk{g_watch_mu};
+    for (Image* img : g_watched) {
+        if (img->gpu_written) continue;   // its content is the GPU's now, not the storage's
+        CpuWatch& w = *img->cpu_watch;
+        if (w.changed.exchange(false, std::memory_order_acquire) && img->uploaded) img->uploaded = false, any = true;
+        // Only those drawn in the last second, once a frame at most.
+        if (img->last_use + 60 < frame || w.queued_frame == frame || w.busy.exchange(true, std::memory_order_acq_rel)) continue;
+        w.queued_frame = frame;
+        {
+            std::scoped_lock q{g_hash_mu};
+            g_hash_q.push_back(img->cpu_watch);
+        }
+        g_hash_cv.notify_one();
+    }
+    return any;
+}
 
 std::atomic<u32> g_dbg_arenas{0}, g_dbg_subs{0}, g_dbg_gens{0};
 namespace {
@@ -67,6 +161,7 @@ u64 shape_key(const nvn::tex_t* t) {
 }
 
 void destroy(Image* img) {
+    watch_remove(img);
     upload_async_cancel(img);
     const u64 bytes = alloc_size(img->alloc);
     bytes_of_kind(img) -= bytes;
@@ -387,6 +482,7 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     }
     img->mem = nvn::ga(t->mem);
     if (const u64 key = shape_key(t); key && g_shared.emplace(key, img).second) img->shape = key;
+    watch_add(img, t);
     return img;
 }
 

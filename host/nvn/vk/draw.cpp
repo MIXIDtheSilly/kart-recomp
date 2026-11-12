@@ -3102,6 +3102,7 @@ u32 draw_written_word(volatile void* host) {
 
 void draw_sub_begin(u64 done) {
     draw_init();
+    if (cpu_writes_poll()) bind_epoch_bump(false);   // (content: kept descriptor sets stay)
     g_written.clear();
     g_set_gen++, g_set_kept = 0, g_subs++;
     kept_sub_begin();
