@@ -22,7 +22,11 @@ FIXES = ['87c52decaf1a8e68', 'c3e3a664e970c1bc']
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'work', 'nvn_shaders'))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import paths   # work/nvn_shaders-<KART_VER> for another game version, as nvn_shaders.py writes it
+    ver = paths.get('KART_VER')
+    ap.add_argument('--dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'work',
+                                                  'nvn_shaders' + ('-' + ver if ver else '')))
     ap.add_argument('--min-bytes', type=int, default=150000)
     ap.add_argument('--all', action='store_true')
     a = ap.parse_args()

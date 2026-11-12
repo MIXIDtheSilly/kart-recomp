@@ -282,6 +282,7 @@ struct VideoSession : Service {
     u32 width = 0, height = 0;
     u32 handed = 0;  // output images handed out (registered or released) so far
     u64 frames_out = 0;
+    u64 last_pts = 0;  // of the newest frame written
     std::deque<Input> inputs;
     std::deque<Decoded> decoded;
     std::deque<u32> free_images;  // in the order the client acquires them
@@ -458,6 +459,7 @@ struct VideoSession : Service {
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 outputs.push_back({image, w, h, frame.pts, frame.end});
+                last_pts = frame.pts;
                 sync::increment(syncpoint);
                 ++frames_out;
                 if (frames_out == 1 || frames_out % 600 == 0 || frame.end)
@@ -482,10 +484,18 @@ struct VideoSession : Service {
                 decoded.push_back({std::move(p), pts, false});
             }
             if (input.end) {
-                // The client stops at the frame marked end of stream; give it one even when the
-                // last input held no picture.
-                if (decoded.empty()) decoded.push_back({std::nullopt, input.pts, true});
-                else decoded.back().end = true;
+                // The client stops at the frame marked end of stream. Media Foundation often hands out
+                // the last picture before the (empty) end-of-stream input comes, so the newest frame the
+                // client has not fetched yet (213) is marked, written or not. Only when it has fetched
+                // them all does it get an empty frame, with the last frame's time: the input's own pts is
+                // ~0, and an extra frame with it made the 1.8.0 movie module abort (once in 5 runs).
+                if (!decoded.empty()) decoded.back().end = true;
+                else if (!outputs.empty()) {
+                    outputs.back().end = true;
+                    LOG("%s frame %llu marked end of stream (the decoder had nothing left)", name.c_str(), frames_out);
+                } else {
+                    decoded.push_back({std::nullopt, input.pts == ~0ull ? last_pts : input.pts, true});
+                }
             }
         }
     }

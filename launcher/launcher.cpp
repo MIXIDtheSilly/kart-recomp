@@ -2,9 +2,14 @@
 //
 //   1 Game          the dump folder (exefs\ and romfs\), its module ids checked, saved as KART_GAME in local.cfg
 //   2 Dependencies  tools\setup_deps.py: Eglantine and plumber-racer-2 at their pinned commits, patched and built
-//   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, nvn_shaders.py and host\build.bat, from
+//   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
 //                   the first stage whose output is missing
 //   4 Play          host\out\kart.exe on the dump
+//
+// The game version (buttons at the top right of every step) picks what each step reads and writes: 1.0.0 builds into
+// the repository itself (kart.exe, KART_GAME), another version into ver\<version>\ with KART_VER=<version> set for the
+// tools (kart-<version>.exe, KART_GAME_<version>). The choice is kept as LAUNCHER_VERSION in local.cfg, never as
+// KART_VER, which there would switch every build.
 //
 // Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the deps\ defaults.
 // launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything.
@@ -151,20 +156,20 @@ static std::wstring setting(const std::wstring& key) {
     return L"";
 }
 
-// KART_GAME=<dir> in local.cfg, the other lines kept
-static bool save_game_setting(const std::wstring& dir) {
+// <key>=<value> in local.cfg, the other lines kept
+static bool save_setting(const std::wstring& key, const std::wstring& value) {
     auto lines = read_lines(g_root / "local.cfg");
     bool found = false;
     for (auto& l : lines) {
         std::wstring w = widen(l);
         w = w.substr(0, w.find(L'#'));
         const size_t eq = w.find(L'=');
-        if (eq != std::wstring::npos && trim(w.substr(0, eq)) == L"KART_GAME") {
-            l = "KART_GAME=" + narrow(dir);
+        if (eq != std::wstring::npos && trim(w.substr(0, eq)) == key) {
+            l = narrow(key) + "=" + narrow(value);
             found = true;
         }
     }
-    if (!found) lines.push_back("KART_GAME=" + narrow(dir));
+    if (!found) lines.push_back(narrow(key) + "=" + narrow(value));
     std::ofstream o(g_root / "local.cfg", std::ios::binary | std::ios::trunc);
     for (const auto& l : lines) o << l << "\r\n";
     return o.good();
@@ -342,15 +347,40 @@ struct Tools {
 };
 static Tools g_tools;
 
-static const wchar_t* MODULES[] = {L"main", L"sdk", L"subsdk0", L"rtld"};
-// The game version this is made for: each module's build id (the NSO header's module id)
-static const char* MODULE_IDS[] = {
-    "9e244438c3d8ef1c703a6a85ef99c4f000000000000000000000000000000000",
-    "90ebba182862b9ecdc21fcb87b99901224fb8f72000000000000000000000000",
-    "d39a7a3d44530bb61b35690e5b0383d51f86ff05000000000000000000000000",
-    "35b31ae27e4726024edd493321d26bea1a2de891000000000000000000000000",
+// The game versions this is made for: each module's build id (the NSO header's module id), in lifting order
+struct Module {
+    const wchar_t* name;
+    const char* id;
 };
-static const wchar_t* LIFT_ORDER[] = {L"rtld", L"main", L"subsdk0", L"sdk"};
+struct Version {
+    const wchar_t* name;
+    std::vector<Module> modules;
+};
+static const Version VERSIONS[] = {
+    {L"1.0.0",
+     {{L"rtld", "35b31ae27e4726024edd493321d26bea1a2de891000000000000000000000000"},
+      {L"main", "9e244438c3d8ef1c703a6a85ef99c4f000000000000000000000000000000000"},
+      {L"subsdk0", "d39a7a3d44530bb61b35690e5b0383d51f86ff05000000000000000000000000"},
+      {L"sdk", "90ebba182862b9ecdc21fcb87b99901224fb8f72000000000000000000000000"}}},
+    {L"1.8.0",
+     {{L"rtld", "8f204349ed459e84bf56bbc32bd4c9c30b431aaa000000000000000000000000"},
+      {L"main", "d00e4f399e411d0613aa8d26b1c02fef00000000000000000000000000000000"},
+      {L"subsdk0", "746302f49f095cfca3d2188423c2bd77f9c7bd71000000000000000000000000"},
+      {L"subsdk1", "8dec9c0b1bed821364e77b10a07b9a287e3dab0a000000000000000000000000"},
+      {L"sdk", "7a68b13d88183767fb9c7babffe89f3d368752e2000000000000000000000000"}}},
+};
+constexpr int VERSION_COUNT = (int)(sizeof VERSIONS / sizeof VERSIONS[0]);
+static int g_ver = 0;   // the chosen one; the first builds into the repository itself
+
+static const Version& ver() { return VERSIONS[g_ver]; }
+static std::wstring ver_suffix() { return g_ver ? L"-" + std::wstring(ver().name) : L""; }
+// Where the tools write the modules (out\, build\, gen\): tools\paths.py art()
+static fs::path art() { return g_ver ? g_root / "ver" / ver().name : g_root; }
+static std::wstring game_key() { return g_ver ? L"KART_GAME_" + std::wstring(ver().name) : L"KART_GAME"; }
+static std::wstring exe_name() { return L"kart" + ver_suffix() + L".exe"; }
+static fs::path shader_dir() { return g_root / "work" / (L"nvn_shaders" + ver_suffix()); }
+// The tools see the chosen version through KART_VER (they inherit the launcher's environment)
+static void apply_version() { SetEnvironmentVariableW(L"KART_VER", g_ver ? ver().name : nullptr); }
 
 static std::string module_id(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -363,6 +393,15 @@ static std::string module_id(const fs::path& p) {
         s += hex[(uint8_t)h[i] & 15];
     }
     return s;
+}
+
+// The version of the dump in <dir>, by main's build id; -1 when it is none of them
+static int dump_version(const fs::path& dir) {
+    const std::string id = module_id(dir / "exefs" / "main");
+    for (int v = 0; v < VERSION_COUNT; v++)
+        for (const auto& m : VERSIONS[v].modules)
+            if (std::wstring(m.name) == L"main" && id == m.id) return v;
+    return -1;
 }
 
 static void check_tools() {
@@ -396,39 +435,48 @@ static void check_tools() {
 }
 
 struct Stage {
-    const wchar_t* name;
+    std::wstring name;
     std::function<bool()> done;
     std::function<std::vector<Cmd>()> cmds;
 };
 
-static std::wstring g_game;   // KART_GAME
+static std::wstring g_game;   // KART_GAME (KART_GAME_<version> for another version)
 
+// For the chosen version: the tools write to art() and shader_dir() through KART_VER (apply_version)
 static std::vector<Stage> stages() {
     const std::wstring root = g_root.wstring();
-    const auto all = [](auto&& f) {
-        for (auto m : LIFT_ORDER)
-            if (!f(m)) return false;
+    const fs::path a = art(), sh = shader_dir(), exe = g_root / "host" / "out" / exe_name();
+    const std::wstring out = L"\"" + (a / "out").wstring() + L"\"";
+    const std::vector<Module> mods = ver().modules;
+    const auto all = [mods](const fs::path& dir, const wchar_t* ext) {
+        for (const auto& m : mods)
+            if (!path_exists(dir / (std::wstring(m.name) + ext))) return false;
         return true;
     };
     return {
-        {L"Unpack the modules", [=] { return all([](auto m) { return path_exists(g_root / "out" / (std::wstring(m) + L".json")); }); },
-         [=] { return std::vector<Cmd>{{L"python tools\\nso.py \"" + g_game + L"\\exefs\" out", root}}; }},
-        {L"Find the functions", [=] { return all([](auto m) { return path_exists(g_root / "out" / (std::wstring(m) + L".funcs.json")); }); },
+        {L"Unpack the modules", [=] { return all(a / "out", L".json"); },
+         [=] { return std::vector<Cmd>{{L"python tools\\nso.py \"" + g_game + L"\\exefs\" " + out, root}}; }},
+        {L"Find the functions", [=] { return all(a / "out", L".funcs.json"); },
          [=] {
              std::vector<Cmd> v;
-             for (auto m : LIFT_ORDER) {
-                 v.push_back({L"python tools\\scan.py out " + std::wstring(m), root});
-                 v.push_back({L"python tools\\funcs.py out " + std::wstring(m), root});
+             for (const auto& m : mods) {
+                 v.push_back({L"python tools\\scan.py " + out + L" " + m.name, root});
+                 v.push_back({L"python tools\\funcs.py " + out + L" " + m.name, root});
              }
              return v;
          }},
-        {L"Lift and compile", [=] { return all([](auto m) { return path_exists(g_root / "build" / (std::wstring(m) + L".lib")); }); },
+        {L"Lift and compile", [=] { return all(a / "build", L".lib"); },
          [=] { return std::vector<Cmd>{{L"python tools\\build_all.py", root}}; }},
-        {L"Module glue", [] { return path_exists(g_root / "gen" / "aot_modules.cpp"); },
+        {L"Module glue", [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
          [=] { return std::vector<Cmd>{{L"python tools\\gen_glue.py", root}}; }},
-        {L"Translate the shaders", [] { return any_file(g_root / "work" / "nvn_shaders", L"*.spv"); },
-         [=] { return std::vector<Cmd>{{L"python tools\\nvn_shaders.py", root}}; }},
-        {L"Link kart.exe", [] { return path_exists(g_root / "host" / "out" / "kart.exe"); },
+        // The translation, then the renderer's reflection table (nothing is drawn without it), the mesh shaders'
+        // per-vertex variants and the shaders the NVIDIA driver miscompiles as they are
+        {L"Translate the shaders", [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv"); },
+         [=] {
+             return std::vector<Cmd>{{L"python tools\\nvn_shaders.py", root}, {L"python tools\\nvn_refl.py", root},
+                                     {L"python tools\\nvn_mesh.py --flat", root}, {L"python tools\\nvn_spvfix.py --all", root}};
+         }},
+        {L"Link " + exe_name(), [=] { return path_exists(exe); },
          [=] { return std::vector<Cmd>{{L"cmd /c build.bat", (g_root / "host").wstring()}}; }},
     };
 }
@@ -438,20 +486,23 @@ static bool g_done[4];
 static bool g_can_setup, g_can_build;
 
 static void refresh() {
-    g_game = setting(L"KART_GAME");
+    g_game = setting(game_key());
 
     auto& game = g_rows[0];
     game.clear();
     bool game_ok = !g_game.empty();
-    for (int i = 0; i < 4; i++) {
-        Row r{MODULES[i], L"", ST_MISSING};
+    const int dumped = g_game.empty() ? -1 : dump_version(g_game);
+    for (const auto& m : ver().modules) {
+        Row r{m.name, L"", ST_MISSING};
         if (!g_game.empty()) {
-            const fs::path p = fs::path(g_game) / "exefs" / MODULES[i];
+            const fs::path p = fs::path(g_game) / "exefs" / m.name;
             const std::string id = path_exists(p) ? module_id(p) : "";
-            if (!path_exists(p)) r = {MODULES[i], L"not found in exefs\\", ST_BAD};
-            else if (id.empty()) r = {MODULES[i], L"not a module (NSO) file", ST_BAD};
-            else if (id != MODULE_IDS[i]) r = {MODULES[i], L"another version: " + widen(id.substr(0, 16)), ST_BAD};
-            else r = {MODULES[i], widen(id.substr(0, 16)) + L"  matches", ST_OK};
+            if (!path_exists(p)) r = {m.name, L"not found in exefs\\", ST_BAD};
+            else if (id.empty()) r = {m.name, L"not a module (NSO) file", ST_BAD};
+            else if (id != m.id && dumped >= 0 && dumped != g_ver)
+                r = {m.name, L"this dump is version " + std::wstring(VERSIONS[dumped].name) + L": pick it at the top right", ST_BAD};
+            else if (id != m.id) r = {m.name, L"another version: " + widen(id.substr(0, 16)), ST_BAD};
+            else r = {m.name, widen(id.substr(0, 16)) + L"  matches", ST_OK};
         }
         game_ok &= r.st == ST_OK;
         game.push_back(r);
@@ -496,8 +547,8 @@ static void refresh() {
 
     auto& play = g_rows[3];
     play.clear();
-    const bool kart = path_exists(g_root / "host" / "out" / "kart.exe");
-    play.push_back({L"kart.exe", kart ? L"built" : L"not built yet", kart ? ST_OK : ST_MISSING});
+    const bool kart = path_exists(g_root / "host" / "out" / exe_name());
+    play.push_back({exe_name(), kart ? L"built" : L"not built yet", kart ? ST_OK : ST_MISSING});
     play.push_back({L"Game dump", g_done[0] ? L"checked" : L"not set", g_done[0] ? ST_OK : ST_MISSING});
     fs::path texdir = g_root / "work" / "nvn_texcache";
     if (const auto t = env_var(L"HOST_NVN_TEXCACHE"); !t.empty()) texdir = t;
@@ -505,7 +556,7 @@ static void refresh() {
         if (k == L"HOST_NVN_TEXCACHE") texdir = v;
     const bool tex = any_file(texdir, L"*.bc");
     play.push_back({L"Texture cache", tex ? L"filled" : L"fills as you play, or bake it", tex ? ST_OK : ST_OPTIONAL});
-    const bool pipes = path_exists(g_root / "host" / "out" / "nvn_pipelines.bin");
+    const bool pipes = path_exists(g_root / "host" / "out" / (L"nvn_pipelines" + ver_suffix() + L".bin"));
     play.push_back({L"Pipeline cache", pipes ? L"there" : L"made over the first runs", pipes ? ST_OK : ST_OPTIONAL});
     g_done[3] = kart && g_done[0];
 }
@@ -578,7 +629,7 @@ static void fill_circle(float x, float y, float r, uint32_t color) {
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_VER = 50, B_DOT = 100,
 };
 struct Hit {
     int id;
@@ -595,8 +646,8 @@ static ULONGLONG g_job_start = 0;
 static const wchar_t* STEP_NAMES[4] = {L"Game", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TEXT[4] = {
-    L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\. Its version has to be the "
-    L"one this recompilation was made for; nothing of it is copied anywhere.",
+    L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\. Versions 1.0.0 and 1.8.0 "
+    L"work, each built and played on its own (the version buttons above); nothing of the dump is copied anywhere.",
     L"Eglantine and plumber-racer-2 are cloned at their pinned commits into deps\\, this repository's patches applied, "
     L"and built: Eglantine's GPU and audio libraries and the shader translator. An hour or more, mostly Eglantine.",
     L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
@@ -695,11 +746,31 @@ static void draw_play_icon(float x, float y, uint32_t color) {
     g->Release();
 }
 
+// The game version: one button each, right-aligned in the title row; returns where they start
+static float draw_versions(float x1, float y, bool enabled) {
+    float x = x1;
+    for (int i = VERSION_COUNT - 1; i >= 0; i--) {
+        const std::wstring label = VERSIONS[i].name;
+        const float w = measure(label, F_SMALL, 200).width + 28;
+        x -= w;
+        const D2D1_RECT_F r{x, y + 4, x + w, y + 30};
+        const bool sel = i == g_ver, hov = !sel && enabled && g_hover == B_VER + i;
+        fill_round(r, 13, sel ? col::blue : hov ? col::btn_hover : col::btn);
+        text(label, F_SMALL, r, sel ? col::white : enabled ? col::text : col::dim, T_CENTER | T_VCENTER);
+        if (enabled && !sel) g_hits.push_back({B_VER + i, r});
+        x -= 8;
+    }
+    const float lw = measure(L"Game version", F_SMALL, 200).width;
+    text(L"Game version", F_SMALL, {x - lw - 4, y + 4, x, y + 30}, col::muted, T_RIGHT | T_VCENTER);
+    return x - lw - 16;
+}
+
 static void paint_panel(D2D1_RECT_F p) {
     fill_round(p, 22, col::panel);
     const float x0 = p.left + 36, x1 = p.right - 36;
     float y = p.top + 30;
-    text(STEP_TITLES[g_step], F_TITLE, {x0, y, x1, y + 34}, col::text);
+    const float tx1 = draw_versions(x1, y, !g_running);
+    text(STEP_TITLES[g_step], F_TITLE, {x0, y, tx1, y + 34}, col::text);
     y += 40;
     const float dh = measure(STEP_TEXT[g_step], F_BODY, x1 - x0, T_WRAP).height;
     text(STEP_TEXT[g_step], F_BODY, {x0, y, x1, y + dh + 4}, col::muted, T_WRAP);
@@ -717,8 +788,8 @@ static void paint_panel(D2D1_RECT_F p) {
         button(B_BROWSE, L"Browse\u2026", x1 - 124, y, g_game.empty(), !busy);
         y += 60;
         y = draw_rows(g_rows[0], 1, x0, x1, y);
-        if (!env_var(L"KART_GAME").empty()) {
-            text(L"KART_GAME is set in the environment: it is used instead of local.cfg.", F_SMALL, {x0, y + 8, x1, y + 28}, col::muted);
+        if (!env_var(game_key().c_str()).empty()) {
+            text(game_key() + L" is set in the environment: it is used instead of local.cfg.", F_SMALL, {x0, y + 8, x1, y + 28}, col::muted);
             y += 28;
         }
         if (g_done[0]) button(B_CONTINUE, L"Continue", x0, y + 18, true, true);
@@ -882,6 +953,19 @@ static void job_done(DWORD code, bool cancelled) {
     redraw();
 }
 
+static void select_version(int v) {
+    g_ver = v;
+    apply_version();
+    save_setting(L"LAUNCHER_VERSION", ver().name);
+    g_status.clear();
+    {
+        std::lock_guard lk(g_mx);
+        g_log.clear();
+        g_log_added = 0;
+    }
+    refresh();
+}
+
 static void browse() {
     IFileOpenDialog* d = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
@@ -914,7 +998,9 @@ static void browse() {
     const fs::path pp = picked;
     const std::wstring leaf = lower(pp.filename().wstring());
     if ((leaf == L"exefs" || leaf == L"romfs") && !path_exists(pp / "exefs")) picked = pp.parent_path().wstring();
-    if (!save_game_setting(picked)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+    // A dump of another known version switches to it, and is saved as that version's dump
+    if (const int v = dump_version(picked); v >= 0 && v != g_ver) select_version(v);
+    if (!save_setting(game_key(), picked)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
     refresh();
     redraw();
 }
@@ -924,6 +1010,8 @@ static void click(int id) {
     if (id >= B_DOT) {
         g_step = id - B_DOT;
         refresh();
+    } else if (id >= B_VER && id < B_VER + VERSION_COUNT) {
+        select_version(id - B_VER);
     } else if (id == B_BROWSE) {
         browse();
     } else if (id == B_CONTINUE) {
@@ -950,7 +1038,7 @@ static void click(int id) {
             for (auto& c : st[i].cmds()) cmds.push_back(c);
         start_job(id == B_BUILD ? L"Building" : L"Rebuilding everything", cmds);
     } else if (id == B_PLAY || id == B_BAKE) {
-        const std::wstring exe = (g_root / "host" / "out" / "kart.exe").wstring();
+        const std::wstring exe = (g_root / "host" / "out" / exe_name()).wstring();
         start_job(id == B_PLAY ? L"Playing" : L"Baking textures",
                   {{L"\"" + exe + L"\" \"" + g_game + L"\"" + (id == B_BAKE ? L" --bake-textures" : L""), (g_root / "host" / "out").wstring()}});
     } else if (id == B_STOP) {
@@ -1124,6 +1212,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         std::wstring mp = local_cfg()[L"BUILD_MP"];
         if (mp.empty()) mp = std::to_wstring(std::max(1u, std::thread::hardware_concurrency() / 2));
         SetEnvironmentVariableW(L"BUILD_MP", mp.c_str());
+    }
+
+    // The game version: KART_VER in the environment, else the one chosen last time
+    {
+        std::wstring want = env_var(L"KART_VER");
+        if (want.empty()) want = local_cfg()[L"LAUNCHER_VERSION"];
+        for (int v = 0; v < VERSION_COUNT; v++)
+            if (want == VERSIONS[v].name) g_ver = v;
+        apply_version();
     }
 
     check_tools();
