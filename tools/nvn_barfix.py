@@ -19,7 +19,9 @@ usage: nvn_barfix.py [--dir DIR] [--force] [--only KEY]
 """
 import argparse, concurrent.futures, json, os, struct, subprocess, sys
 
-BIN = os.environ.get('VULKAN_BIN', r'C:\VulkanSDK\1.4.363.0\Bin')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths
+BIN = paths.get('VULKAN_BIN')   # third_party\spirv\bin (VULKAN_BIN overrides)
 EXE = lambda n: os.path.join(BIN, n + '.exe')
 
 OpTypeBool, OpTypePointer, OpConstantTrue, OpConstantFalse, OpUndef = 20, 32, 41, 42, 1
@@ -292,11 +294,14 @@ def main():
 
     counts = {}
     with concurrent.futures.ThreadPoolExecutor(max(1, (os.cpu_count() or 4) // 2)) as pool:
-        for kind, msg in pool.map(one, srcs):
+        for i, (kind, msg) in enumerate(pool.map(one, srcs)):
             counts[kind] = counts.get(kind, 0) + 1
             if msg: print(msg)
+            if i % 25 == 0 or i + 1 == len(srcs):
+                paths.progress(i + 1, len(srcs), 'compute shaders for Intel GPUs (barriers)')
     print(', '.join(f'{v} {k}' for k, v in sorted(counts.items())))
-    return 1 if counts.get('failed') else 0
+    # A shader that could not be rewritten is not fatal: on Intel the renderer drops its barriers instead
+    return 1 if counts.get('failed') and a.only else 0
 
 
 if __name__ == '__main__':

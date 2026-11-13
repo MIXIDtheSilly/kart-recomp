@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import a64  # noqa: E402
+import paths  # noqa: E402
 import patches  # noqa: E402
 
 try:
@@ -724,6 +725,8 @@ def main():
             hotc.flush()
         if idx % 20000 == 0 and idx:
             print(f"  {idx:,}/{len(funcs):,}", flush=True)
+        if idx % 1000 == 0:
+            paths.progress(idx, len(funcs), f"{a.module}: lifting functions to C++")
     normal.flush()
     hotc.flush()
     if not a.stats_only and not a.only:

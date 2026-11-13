@@ -35,6 +35,10 @@ struct Features {
     // used in place (no device copies of pools), and memory pressure counts every heap, the device-local one being only
     // the firmware's carve-out.
     bool uma = false;
+    // Imports are scarce (unified memory, or a host heap under 12 GiB: a 16 GB PC's NVIDIA driver gives 8 GB, which the
+    // up-front imports filled, issue #4): pools are imported at first use and in small windows (pools.cpp).
+    // HOST_NVN_LEAN_IMPORTS=0/1 overrides.
+    bool lean_imports = false;
     u64 import_alignment = 4096;
 };
 

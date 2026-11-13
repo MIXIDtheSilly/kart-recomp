@@ -40,7 +40,7 @@ def records(d):
 def c1_of_all():
     """key -> c1 bytes (the control section's +0x40 / +0x44 range of the code area, dmsh_ampere.c1_segment)"""
     out, packs = {}, {}
-    for line in open(os.path.join(SPLIT, 'shader_map.tsv')):
+    for line in open(os.path.join(SPLIT, 'shader_map.tsv'), encoding='utf-8', errors='replace'):
         if line.startswith('#') or line.startswith('package'): continue
         f = line.rstrip('\n').split('\t')
         if len(f) < 4: continue

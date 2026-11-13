@@ -1,10 +1,11 @@
 // The launcher: the way from a game dump to a running kart.exe, one step per dot at the top.
 //
 //   1 Game          the dump folder (exefs\ and romfs\), its module ids checked, saved as KART_GAME in local.cfg
-//   2 Dependencies  the tools the build needs (Visual Studio, Python, the .NET SDK) and the shader translator, built
-//                   from tools\xlate (everything else the host uses is in third_party\)
+//   2 Dependencies  the tools the build needs (Visual Studio, Python, the .NET SDK); Set up installs the Python packages
+//                   (tools\deps.py) and builds the shader translator from tools\xlate and its packages\ (the SPIR-V
+//                   tools and everything else the host uses are in third_party\)
 //   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
-//                   the first stage whose output is missing
+//                   the first stage whose output is missing; the tools' @@progress lines are drawn as a bar
 //   4 Play          host\out\kart.exe on the dump
 //
 // The game version (buttons at the top right of every step) picks what each step reads and writes: 1.0.0 builds into
@@ -243,7 +244,19 @@ static std::string capture(const std::wstring& cmdline, DWORD* exit_code = nullp
 
 struct Cmd {
     std::wstring line, cwd;
+    std::wstring stage;     // the build stage it belongs to (shown while it runs), '' for none
+    int stage_i = 0, stage_n = 0;
 };
+
+// What the running job is at: its stage, and the last "@@progress <done> <total> <what>" line a tool printed
+// (tools\paths.py progress(), with KART_PROGRESS=1), drawn as a bar instead of logged. Under g_mx.
+struct Progress {
+    std::wstring stage, what;
+    int stage_i = 0, stage_n = 0;
+    long long done = 0, total = 0;
+    ULONGLONG since = 0;    // when <what> started: for the time left
+};
+static Progress g_prog;
 
 constexpr UINT WM_APP_LOG = WM_APP + 1, WM_APP_DONE = WM_APP + 2;
 
@@ -255,6 +268,20 @@ static HANDLE g_job = nullptr;           // under g_mx: the running command's jo
 static std::atomic<bool> g_running{false}, g_cancel{false}, g_log_posted{false};
 
 static void log_line(std::wstring s) {
+    if (s.rfind(L"@@progress ", 0) == 0) {
+        long long done = 0, total = 0;
+        int used = 0;
+        if (swscanf_s(s.c_str() + 11, L"%lld %lld %n", &done, &total, &used) >= 2) {
+            std::lock_guard lk(g_mx);
+            std::wstring what = trim(s.substr(11 + used));
+            if (what != g_prog.what || done < g_prog.done) g_prog.since = GetTickCount64();
+            g_prog.what = std::move(what);
+            g_prog.done = done;
+            g_prog.total = total;
+        }
+        if (!g_log_posted.exchange(true)) PostMessageW(g_hwnd, WM_APP_LOG, 0, 0);
+        return;
+    }
     {
         std::lock_guard lk(g_mx);
         g_log.push_back(std::move(s));
@@ -342,8 +369,9 @@ struct Row {
 };
 
 struct Tools {
-    std::wstring python;   // version, '' when there is no working python
-    bool zstd = false, dotnet = false, vp9 = false;
+    std::wstring python;      // version, '' when there is no working python
+    std::wstring py_missing;  // the required Python packages it lacks (tools\deps.py check), space-separated
+    bool dotnet = false, vp9 = false;
 };
 static Tools g_tools;
 
@@ -404,6 +432,32 @@ static int dump_version(const fs::path& dir) {
     return -1;
 }
 
+// Python and its packages: "python <version>" and "missing <package> ..." from tools\deps.py check
+static void check_python() {
+    g_tools.python.clear();
+    g_tools.py_missing.clear();
+    DWORD code;
+    const std::string out = capture(L"python \"" + (g_root / "tools" / "deps.py").wstring() + L"\" check", &code);
+    if (code != 0) return;
+    const std::wstring w = widen(out);
+    size_t a = 0;
+    for (size_t b; a < w.size(); a = b + 1) {
+        b = w.find(L'\n', a);
+        if (b == std::wstring::npos) b = w.size();
+        const std::wstring l = trim(w.substr(a, b - a));
+        if (l.rfind(L"python ", 0) == 0) g_tools.python = l.substr(7);
+        else if (l.rfind(L"missing", 0) == 0) g_tools.py_missing = trim(l.substr(7));
+    }
+}
+
+// The SPIR-V tools the shader stage runs (tools\paths.py VULKAN_BIN): the repository's copy, else the Vulkan SDK's
+static bool spirv_tools() {
+    if (const auto v = setting(L"VULKAN_BIN"); !v.empty()) return path_exists(fs::path(v) / "spirv-val.exe");
+    if (path_exists(g_root / "third_party" / "spirv" / "bin" / "spirv-val.exe")) return true;
+    if (const auto sdk = env_var(L"VULKAN_SDK"); !sdk.empty()) return path_exists(fs::path(sdk) / "Bin" / "spirv-val.exe");
+    return false;
+}
+
 static void check_tools() {
     const fs::path vswhere = fs::path(env_var(L"ProgramFiles(x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe";
     if (path_exists(vswhere)) {
@@ -423,16 +477,7 @@ static void check_tools() {
         const std::string sdks = capture(L"dotnet --list-sdks");
         g_tools.dotnet = sdks.rfind("10.", 0) == 0 || sdks.find("\n10.") != std::string::npos;
     }
-    DWORD code;
-    const std::string out = capture(L"python -c \"import sys,importlib.util as u;print(sys.version.split()[0],"
-                                    L"int(sys.version_info>=(3,14) or bool(u.find_spec('backports') and u.find_spec('backports.zstd'))))\"",
-                                    &code);
-    if (code == 0) {
-        const std::wstring w = trim(widen(out));
-        const size_t sp = w.find(L' ');
-        g_tools.python = w.substr(0, sp);
-        g_tools.zstd = sp != std::wstring::npos && w.substr(sp + 1, 1) == L"1";
-    }
+    check_python();
 }
 
 struct Stage {
@@ -471,11 +516,13 @@ static std::vector<Stage> stages() {
         {L"Module glue", [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
          [=] { return std::vector<Cmd>{{L"python tools\\gen_glue.py", root}}; }},
         // The translation, then the renderer's reflection table (nothing is drawn without it), the mesh shaders'
-        // per-vertex variants and the shaders the NVIDIA driver miscompiles as they are
-        {L"Translate the shaders", [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv"); },
+        // per-vertex variants, the shaders the NVIDIA driver miscompiles as they are, and the compute shaders whose
+        // barriers hang Intel GPUs (.bar.spv)
+        {L"Translate the shaders", [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv") && any_file(sh, L"*.bar.spv"); },
          [=] {
              return std::vector<Cmd>{{L"python tools\\nvn_shaders.py", root}, {L"python tools\\nvn_refl.py", root},
-                                     {L"python tools\\nvn_mesh.py --flat", root}, {L"python tools\\nvn_spvfix.py --all", root}};
+                                     {L"python tools\\nvn_mesh.py --flat", root}, {L"python tools\\nvn_spvfix.py --all", root},
+                                     {L"python tools\\nvn_barfix.py", root}};
          }},
         {L"Link " + exe_name(), [=] { return path_exists(exe); },
          [=] { return std::vector<Cmd>{{L"cmd /c build.bat", (g_root / "host").wstring()}}; }},
@@ -519,17 +566,23 @@ static void refresh() {
     auto& deps = g_rows[1];
     deps.clear();
     const bool vs = !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
-    deps.push_back({L"Visual Studio", vs ? L"C++ tools found" : L"install \"Desktop development with C++\"", vs ? ST_OK : ST_BAD});
-    if (g_tools.python.empty()) deps.push_back({L"Python", L"not on PATH", ST_BAD});
+    deps.push_back({L"Visual Studio", vs ? L"C++ tools found" : L"install it with \"Desktop development with C++\"", vs ? ST_OK : ST_BAD});
+    const bool py = !g_tools.python.empty(), pkgs = py && g_tools.py_missing.empty();
+    if (!py) deps.push_back({L"Python", L"install Python 3.13 from python.org, with \"Add to PATH\"", ST_BAD});
     else deps.push_back({L"Python", L"", ST_OK, g_tools.python});
-    deps.push_back({L"backports.zstd", g_tools.zstd ? L"found" : L"pip install backports.zstd", g_tools.zstd ? ST_OK : ST_BAD});
-    deps.push_back({L".NET 10 SDK", g_tools.dotnet ? L"found" : L"not found", g_tools.dotnet ? ST_OK : ST_BAD});
+    deps.push_back({L"Python packages", !py ? L"" : pkgs ? L"installed" : L"Set up installs " + g_tools.py_missing,
+                    pkgs ? ST_OK : ST_MISSING});
+    deps.push_back({L".NET 10 SDK", g_tools.dotnet ? L"found" : L"install it from dot.net (winget install Microsoft.DotNet.SDK.10)",
+                    g_tools.dotnet ? ST_OK : ST_BAD});
+    const bool spirv = spirv_tools();
+    deps.push_back({L"SPIR-V tools", spirv ? L"included (third_party\\spirv)" : L"missing: third_party\\spirv\\bin or the Vulkan SDK",
+                    spirv ? ST_OK : ST_BAD});
     deps.push_back({L"VP9 Video Extensions", g_tools.vp9 ? L"found" : L"optional: without it the movies are skipped",
                     g_tools.vp9 ? ST_OK : ST_OPTIONAL});
     const bool xlate = path_exists(fs::path(setting(L"NVN_XLATE")) / "dmsh_xlate.exe");
-    deps.push_back({L"Shader translator", xlate ? L"built" : L"not built", xlate ? ST_OK : ST_MISSING});
-    g_done[1] = vs && !g_tools.python.empty() && g_tools.zstd && g_tools.dotnet && xlate;
-    g_can_setup = vs && !g_tools.python.empty() && g_tools.dotnet;
+    deps.push_back({L"Shader translator", xlate ? L"built" : L"Set up builds it", xlate ? ST_OK : ST_MISSING});
+    g_done[1] = vs && pkgs && g_tools.dotnet && spirv && xlate;
+    g_can_setup = vs && py && g_tools.dotnet;
 
     auto& build = g_rows[2];
     build.clear();
@@ -540,7 +593,7 @@ static void refresh() {
         all &= d;
     }
     g_done[2] = all;
-    g_can_build = g_done[0] && g_done[1] && !g_tools.python.empty() && g_tools.zstd;
+    g_can_build = g_done[0] && g_done[1];
 
     auto& play = g_rows[3];
     play.clear();
@@ -724,10 +777,12 @@ static const wchar_t* STEP_TEXT[4] = {
     L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\, or a .nup file of it, which "
     L"is unpacked into a folder you choose. Versions 1.0.0 and 1.8.0 work, each built and played on its own (the "
     L"version buttons above).",
-    L"The tools the build needs, and the shader translator (tools\\xlate, built with the .NET SDK in a minute or two). "
-    L"Nothing is downloaded: the third-party code the host uses is in the repository (third_party\\).",
+    L"Visual Studio, Python and the .NET SDK you install yourself. Set up does the rest: it installs the Python packages "
+    L"(pip) and builds the shader translator from the packages in the repository, in a minute or two. The SPIR-V tools "
+    L"and the third-party code the host uses come with the repository (third_party\\).",
     L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
-    L"linked. The first build takes half an hour or more; later ones redo only what is missing.",
+    L"linked. The first build takes about an hour (the game is close to 1 GB of C++; the bar below shows how far it is); "
+    L"later ones redo only what is missing.",
     L"Starts kart.exe on your dump. Pipelines are made ahead of time over the first runs; baking decodes every "
     L"texture into the cache ahead of time, so the first races do not hitch.",
 };
@@ -858,10 +913,39 @@ static float draw_rows(const std::vector<Row>& rows, int cols, float x0, float x
 static void draw_status(float x, float x1, float y) {
     if (g_running) {
         fill_circle(x + 5, y + 20, 4.5f, col::accent);
-        text(g_job_name + L"   " + clock_text(GetTickCount64() - g_job_start), F_BODY, {x + 18, y, x1, y + 40}, col::text, T_VCENTER);
+        std::wstring s = g_job_name;
+        {
+            std::lock_guard lk(g_mx);
+            if (!g_prog.stage.empty()) {
+                s += L": " + g_prog.stage;
+                if (g_prog.stage_n > 1) s += L" (" + std::to_wstring(g_prog.stage_i) + L" of " + std::to_wstring(g_prog.stage_n) + L")";
+            }
+        }
+        text(s + L"   " + clock_text(GetTickCount64() - g_job_start), F_BODY, {x + 18, y, x1, y + 40}, col::text, T_VCENTER);
     } else {
         text(g_status, F_BODY, {x, y, x1, y + 40}, g_status_color, T_VCENTER);
     }
+}
+
+// The running tool's progress: a bar, what it is doing, n of total and the time left; returns the y below it
+static float draw_progress(float x0, float x1, float y) {
+    Progress p;
+    {
+        std::lock_guard lk(g_mx);
+        p = g_prog;
+    }
+    if (!g_running || p.total <= 0) return y;
+    const float f = std::clamp((float)p.done / (float)p.total, 0.f, 1.f);
+    std::wstring s = (p.what.empty() ? std::wstring(L"Working") : p.what) + L"   " + std::to_wstring(p.done) + L" of " +
+                     std::to_wstring(p.total) + L"   " + std::to_wstring((int)(f * 100)) + L"%";
+    const ULONGLONG el = GetTickCount64() - p.since;
+    if (p.done > 0 && p.done < p.total && el > 10000)
+        s += L"   about " + clock_text((ULONGLONG)((double)el * (p.total - p.done) / p.done)) + L" left";
+    text(s, F_SMALL, {x0, y, x1, y + 20}, col::muted, T_VCENTER);
+    const D2D1_RECT_F bar{x0, y + 26, x1, y + 32};
+    fill_round(bar, 3, col::inset);
+    if (f > 0) fill_round({x0, bar.top, x0 + std::max(6.f, (x1 - x0) * f), bar.bottom}, 3, col::accent);
+    return y + 46;
 }
 
 static void draw_log(D2D1_RECT_F r) {
@@ -984,17 +1068,23 @@ static void paint_steps(D2D1_RECT_F p) {
         y = draw_rows(g_rows[1], 2, x0, x1, y) + 18;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
-        else x = button(B_SETUP, g_done[1] ? L"Build the translator again" : L"Build the translator", x, y, !g_done[1], g_can_setup);
+        else x = button(B_SETUP, g_done[1] ? L"Set up again" : L"Set up", x, y, !g_done[1], g_can_setup);
         if (!busy && g_done[1]) x = button(B_CONTINUE, L"Continue", x, y, true, true);
         if (!busy && !g_can_setup && g_status.empty())
             text(L"Install what is marked red first.", F_BODY, {x + 4, y, x1, y + 40}, col::muted, T_VCENTER);
         else draw_status(x + 4, x1, y);
-        y += 56;
+        y = draw_progress(x0, x1, y + 56);
         draw_log({x0, y, x1, p.bottom - 30});
         break;
     }
     case 2: {
-        y = draw_rows(g_rows[2], 2, x0, x1, y);
+        auto rows = g_rows[2];
+        if (busy) {   // the stage running now
+            std::lock_guard lk(g_mx);
+            for (auto& r : rows)
+                if (r.name == g_prog.stage) r.detail = L"running…";
+        }
+        y = draw_rows(rows, 2, x0, x1, y);
         const std::wstring mp = env_var(L"BUILD_MP");
         text(L"Up to " + mp + L" compiler processes at once (BUILD_MP in local.cfg or the environment)", F_SMALL,
              {x0, y + 6, x1, y + 26}, col::muted);
@@ -1007,11 +1097,10 @@ static void paint_steps(D2D1_RECT_F p) {
             if (g_done[2]) x = button(B_CONTINUE, L"Continue", x, y, true, true);
         }
         if (!busy && !g_can_build && g_status.empty()) {
-            const wchar_t* why = !g_done[0] ? L"Choose the game dump first." : !g_done[1] ? L"Set up the dependencies first."
-                                                                                           : L"Python with backports.zstd is needed.";
-            text(why, F_BODY, {x + 4, y, x1, y + 40}, col::muted, T_VCENTER);
+            text(!g_done[0] ? L"Choose the game dump first." : L"Set up the dependencies first.", F_BODY, {x + 4, y, x1, y + 40},
+                 col::muted, T_VCENTER);
         } else draw_status(x + 4, x1, y);
-        y += 56;
+        y = draw_progress(x0, x1, y + 56);
         draw_log({x0, y, x1, p.bottom - 30});
         break;
     }
@@ -1029,7 +1118,7 @@ static void paint_steps(D2D1_RECT_F p) {
             x = button(B_BAKE, L"Bake textures", x, y, false, g_done[3]);
         }
         draw_status(x + 4, x1, y);
-        y += 56;
+        y = draw_progress(x0, x1, y + 56);
         draw_log({x0, y, x1, p.bottom - 30});
         break;
     }
@@ -1126,10 +1215,18 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
     g_job_name = name;
     g_job_start = GetTickCount64();
     g_status.clear();
+    {
+        std::lock_guard lk(g_mx);
+        g_prog = {};
+    }
     SetTimer(g_hwnd, TIMER_JOB, 500, nullptr);
     std::thread([cmds = std::move(cmds)] {
         DWORD code = 0;
         for (const auto& c : cmds) {
+            {
+                std::lock_guard lk(g_mx);
+                g_prog = {c.stage, L"", c.stage_i, c.stage_n};   // each command reports its own progress
+            }
             code = run_cmd(c);
             if (code || g_cancel) break;
         }
@@ -1171,6 +1268,7 @@ static void job_done(DWORD code, bool cancelled) {
         g_status = L"Unpacked in " + took + L" into " + dest;
     }
     const int step = g_step;
+    if (step == 1) check_python();   // packages Set up just installed
     refresh();
     if (!cancelled && code == 0 && (step == 1 || step == 2) && g_done[step]) g_step = step + 1, g_status.clear();
     redraw();
@@ -1328,11 +1426,16 @@ static void click(int id) {
         g_status.clear();
         refresh();
     } else if (id == B_SETUP) {
-        start_job(L"Building the shader translator",
-                  {{L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj", root}});
+        // The Python packages (pip, from PyPI), then the translator from the NuGet packages in tools\xlate\packages
+        std::vector<Cmd> cmds;
+        if (!g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages", 1, 2});
+        cmds.push_back({L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj",
+                        root, L"Shader translator", (int)cmds.size() + 1, (int)cmds.size() + 1});
+        if (cmds.size() == 2) cmds[0].stage_n = 2;
+        start_job(L"Setting up", cmds);
     } else if (id == B_BUILD || id == B_REBUILD) {
         if (id == B_REBUILD &&
-            MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes half an hour or more.", L"Rebuild everything",
+            MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes about an hour.", L"Rebuild everything",
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
             return;
         const auto st = stages();
@@ -1345,7 +1448,12 @@ static void click(int id) {
         }
         std::vector<Cmd> cmds;
         for (size_t i = from; i < st.size(); i++)
-            for (auto& c : st[i].cmds()) cmds.push_back(c);
+            for (auto& c : st[i].cmds()) {
+                c.stage = st[i].name;
+                c.stage_i = (int)(i - from) + 1;
+                c.stage_n = (int)(st.size() - from);
+                cmds.push_back(c);
+            }
         start_job(id == B_BUILD ? L"Building" : L"Rebuilding everything", cmds);
     } else if (id == B_PLAY || id == B_BAKE) {
         const std::wstring exe = (g_root / "host" / "out" / exe_name()).wstring();
@@ -1532,6 +1640,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // For the tools it runs: Python output as it comes, in UTF-8; builds on about half the cores unless BUILD_MP says
     SetEnvironmentVariableW(L"PYTHONUNBUFFERED", L"1");
     SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
+    SetEnvironmentVariableW(L"PYTHONUTF8", L"1");      // files in UTF-8 too, whatever the system code page (cp950: issue #7)
+    SetEnvironmentVariableW(L"KART_PROGRESS", L"1");   // the tools' @@progress lines, drawn as a bar
     if (env_var(L"BUILD_MP").empty()) {
         std::wstring mp = local_cfg()[L"BUILD_MP"];
         if (mp.empty()) mp = std::to_wstring(std::max(1u, std::thread::hardware_concurrency() / 2));

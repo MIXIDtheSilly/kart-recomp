@@ -7,6 +7,8 @@ when their source is newer, so re-running after lifting a subset is cheap.
 """
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -63,43 +65,136 @@ def main():
     # MSVC skips optimizing functions it finds too big (C4883, silent under /w): the hot ones (lift.py --hot, in
     # <module>_hot_*.cpp) are compiled with /d2OptimizeHugeFunctions, which takes far longer, the rest as they are.
     # BUILD_WARN_HUGE=1 reports the functions it skips (C4883) in <build>/<module>_cl.log. BUILD_MP=<n>: parallel compiles.
-    warn = "/W1 /w14883" if os.environ.get("BUILD_WARN_HUGE") else "/w"
-    objs = build / f"{a.module}_objs.rsp"
-    objs.write_text("\n".join(f'"{build / (s.stem + ".obj")}"' for s in sources))
-    lines = [f'@call "{VCVARS}" >nul']
-    for kind, group in (("", [s for s in stale if "_hot_" not in s.stem]), ("_hot", [s for s in stale if "_hot_" in s.stem])):
-        if not group:
-            continue
-        rsp = build / f"{a.module}{kind}.rsp"
-        rsp.write_text("\n".join(f'"{s}"' for s in group))
+    warn = ["/W1", "/w14883"] if os.environ.get("BUILD_WARN_HUGE") else ["/w"]
+    env = paths.vcvars_env()   # exits with a message when Visual Studio's C++ tools are missing
+    cl = shutil.which("cl", path=env.get("PATH", env.get("Path", "")))
+    if not cl:
+        sys.exit("cl.exe not found after vcvars64.bat: install Visual Studio's \"Desktop development with C++\"")
+    base = [cl, "/nologo", "/c", a.opt, "/MD", "/std:c++20", "/EHsc", "/bigobj", *warn, f"/I{ROOT / 'runtime'}"]
+
+    def flags(s):
+        hot = "_hot_" in s.stem
         # BUILD_FORCE_INLINE=1: the hot files also get the runtime helpers forced inline (RT_FORCE_INLINE in
         # runtime/cpu.h). Off by default: no measured fps gain, ~3 min a file more, and cl needs a few GB a file.
-        huge = " /d2OptimizeHugeFunctions" if kind or a.huge_all else ""
-        if kind and os.environ.get("BUILD_FORCE_INLINE"):
-            huge += " /DRT_FORCE_INLINE"
-        lines.append(f'cl /nologo /c {a.opt}{huge} /MD /std:c++20 /EHsc /bigobj {warn} /MP{os.environ.get("BUILD_MP", "")} /I"{ROOT / "runtime"}" /Fo"{build}\\\\" @"{rsp}" || exit /b 1')
-    lines.append(f'lib /nologo /out:"{lib}" @"{objs}" || exit /b 1')
-    bat = build / f"build_{a.module}.bat"
-    bat.write_text("\r\n".join(lines) + "\r\n")
+        return (["/d2OptimizeHugeFunctions"] if hot or a.huge_all else []) + \
+               (["/DRT_FORCE_INLINE"] if hot and os.environ.get("BUILD_FORCE_INLINE") else [])
 
     t = time.time()
-    r = subprocess.run(["cmd", "/c", str(bat)], capture_output=True, text=True, errors="replace")
-    (build / f"{a.module}_cl.log").write_text(r.stdout, errors="replace")
-    errors = [l for l in r.stdout.splitlines() if " error " in l or "fatal error" in l]
-    if r.returncode:
-        print("\n".join(errors[:30]) or r.stdout[-4000:])
-        sys.exit(f"build failed ({len(errors)} errors)")
-    size = lib.stat().st_size
-    print(f"built {a.module}.lib ({size / 2**20:.0f} MiB) in {time.time() - t:.0f} s")
+    log = open(build / f"{a.module}_cl.log", "w", encoding="utf-8", errors="replace")
+    failed = compile_all(a.module, stale, build, lambda s, out: [*base, *flags(s), f"/Fo{out}", str(s)], env, log, t)
+    if failed:
+        sys.exit(f"build failed ({len(failed)} of {len(stale)} files did not compile; the compiler's output is above)")
+    lib_all(a.module, sources, build, lib, env, log,
+            lambda objs: compile_all(a.module, objs, build, lambda s, out: [*base, *flags(s), f"/Fo{out}", str(s)], env, log, t))
+    print(f"built {a.module}.lib ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
+
+
+def fmt(sec):
+    sec = int(sec)
+    return f"{sec // 3600}:{sec // 60 % 60:02}:{sec % 60:02}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02}"
+
+
+FILE_GIB, HOT_GIB = 1.0, 3.0   # a compiler on one generated file / one hot file: 0.63 / 2.25 GB at most (measured), plus margin
+
+
+def free_ram_gib():
+    import ctypes
+
+    class MS(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [(f, ctypes.c_ulonglong) for f in
+                    ("total", "avail", "ptotal", "pavail", "vtotal", "vavail", "xavail")]
+    ms = MS()
+    ms.len = ctypes.sizeof(MS)
+    return ms.avail / 2**30 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)) else 64.0
+
+
+def compile_all(module, stale, build, cmd, env, log, t0):
+    """Compiles <stale> BUILD_MP at a time (default: every core), the hot files first (they take the longest), then the
+    biggest. Each object is written as <stem>.obj.tmp and renamed once the compiler succeeds, so a build that is stopped or
+    runs out of memory never leaves a cut-off .obj that looks finished (LNK1136 on the next build). Returns the failed files."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if not stale:
+        return []
+    import threading
+    order = sorted(stale, key=lambda s: ("_hot_" not in s.stem, -s.stat().st_size))
+    n, done, failed, last = len(order), 0, [], time.time()
+    hot = sum("_hot_" in s.stem for s in order)
+    workers = int(os.environ.get("BUILD_MP") or os.cpu_count())
+    # As many compilers at once as the free RAM holds (a 16 GB PC running 8 swapped for hours, issue #10)
+    budget = max(HOT_GIB, free_ram_gib() - 1.5)
+    need = lambda s: HOT_GIB if "_hot_" in s.stem else FILE_GIB
+    fit = min(workers, int(budget // FILE_GIB))
+    print(f"compiling {n} files, up to {workers} at a time ({budget:.0f} GB of RAM free: {fit} files"
+          + (f", {min(workers, int(budget // HOT_GIB))} of the hot ones" if hot else "") + ")"
+          + (f"; the {hot} hot files first, several minutes each" if hot else ""), flush=True)
+    paths.progress(0, n, f"{module}: compiling")
+    mem = threading.Condition()
+    in_use = [0.0]
+
+    def one(s):
+        obj = build / (s.stem + ".obj")
+        tmp = build / (s.stem + ".obj.tmp")
+        with mem:
+            mem.wait_for(lambda: in_use[0] == 0 or in_use[0] + need(s) <= budget)
+            in_use[0] += need(s)
+        try:
+            r = subprocess.run(cmd(s, tmp), env=env, capture_output=True, encoding="oem", errors="replace")
+        finally:
+            with mem:
+                in_use[0] -= need(s)
+                mem.notify_all()
+        if r.returncode == 0 and tmp.exists():
+            os.replace(tmp, obj)
+        else:
+            tmp.unlink(missing_ok=True)
+        return s, r
+
+    with ThreadPoolExecutor(workers) as ex:
+        for f in as_completed([ex.submit(one, s) for s in order]):
+            s, r = f.result()
+            out = (r.stdout + r.stderr).strip()
+            # cl echoes the file name first: only what follows is worth showing
+            lines = [l for l in out.splitlines() if l.strip() and l.strip() != s.name]
+            log.write(f"{s.name}: exit {r.returncode}\n" + "\n".join(lines) + "\n")
+            done += 1
+            if r.returncode:
+                failed.append(s)
+                print(f"{s.name} failed (exit code {r.returncode}):\n" + ("\n".join(lines[-40:]) or "(no output)"), flush=True)
+            paths.progress(done, n, f"{module}: compiling")
+            now = time.time()
+            if now - last >= 30 or done == n:
+                last = now
+                el = now - t0
+                eta = f", about {fmt(el / done * (n - done))} left" if done < n else ""
+                print(f"  {done}/{n} compiled, {fmt(el)} so far{eta}", flush=True)
+    return failed
+
+
+def lib_all(module, sources, build, lib, env, log, recompile):
+    """Archives the objects; an object the librarian finds corrupt (LNK1136, LNK1106: left by an older build that was cut
+    off) is compiled again once."""
+    objs = build / f"{module}_objs.rsp"
+    objs.write_text("\n".join(f'"{build / (s.stem + ".obj")}"' for s in sources))
+    libexe = shutil.which("lib", path=env.get("PATH", env.get("Path", ""))) or "lib"
+    for attempt in range(2):
+        r = subprocess.run([libexe, "/nologo", f"/out:{lib}", f"@{objs}"], env=env, capture_output=True, encoding="oem", errors="replace")
+        out = r.stdout + r.stderr
+        log.write(out)
+        if r.returncode == 0:
+            return
+        bad = [Path(m) for m in re.findall(r"^(.*?\.obj) : fatal error LNK1\d\d\d", out, re.M)]
+        if attempt == 0 and bad:
+            print(f"{len(bad)} corrupt object(s) from an earlier build, compiling again: " + ", ".join(b.name for b in bad), flush=True)
+            for b in bad:
+                b.unlink(missing_ok=True)
+            by_stem = {s.stem: s for s in sources}
+            if recompile([by_stem[b.stem] for b in bad if b.stem in by_stem]):
+                sys.exit("build failed")
+            continue
+        sys.exit(f"lib failed:\n{out[-3000:]}")
 
 
 CLANG = paths.get("CLANG")
-
-
-def vcvars_env():
-    """The environment vcvars64.bat sets up (include and library paths for clang-cl and lib)."""
-    out = subprocess.run(f'cmd /c ""{VCVARS}" >nul && set"', capture_output=True, text=True, errors="replace").stdout
-    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
 
 
 def build_clang(a, sources, stale, build, lib, arch, stamp, key):
@@ -108,37 +203,24 @@ def build_clang(a, sources, stale, build, lib, arch, stamp, key):
     BUILD_ARCH (default -march=native) sets the target CPU: -march=native was 82 -> 89.6 fps in the scripted race
     (clang without it: 82, the same as cl), but the build then only runs on CPUs with the same features.
     -ffp-contract=off: never fuse a separate guest multiply and add into an FMA (the guest rounds twice)."""
-    from concurrent.futures import ThreadPoolExecutor
-    env = vcvars_env()
+    env = paths.vcvars_env()
     flags = [CLANG, "/nologo", "/c", a.opt, "/MD", "/std:c++20", "/EHsc", "/bigobj", "/w", "-ffp-contract=off",
              *arch.split(), f"/I{ROOT / 'runtime'}"]
     t = time.time()
     if stale and stamp.exists():
         stamp.unlink()  # a failed or partial build must not look finished for the new flags
 
-    def one(s):
+    def cmd(s, out):
         extra = ["/DRT_FORCE_INLINE"] if "_hot_" in s.stem and os.environ.get("BUILD_FORCE_INLINE") else []
-        r = subprocess.run([*flags, *extra, f"/Fo{build / (s.stem + '.obj')}", str(s)], env=env,
-                           capture_output=True, text=True, errors="replace")
-        return s, r
+        return [*flags, *extra, f"/Fo{out}", str(s)]
 
-    failed = []
-    with ThreadPoolExecutor(int(os.environ.get("BUILD_MP") or os.cpu_count())) as ex:
-        # The biggest files first, so one of them does not start last and hold up the end of the build.
-        for s, r in ex.map(one, sorted(stale, key=lambda s: -s.stat().st_size)):
-            if r.returncode:
-                failed.append(s)
-                print(f"{s.name}:\n{(r.stdout + r.stderr)[-3000:]}")
+    log = open(build / f"{a.module}_cl.log", "w", encoding="utf-8", errors="replace")
+    failed = compile_all(a.module, stale, build, cmd, env, log, t)
     if failed:
-        sys.exit(f"build failed ({len(failed)} files)")
-    objs = build / f"{a.module}_objs.rsp"
-    objs.write_text("\n".join(f'"{build / (s.stem + ".obj")}"' for s in sources))
-    r = subprocess.run(["lib", "/nologo", f"/out:{lib}", f"@{objs}"], env=env, capture_output=True, text=True,
-                       errors="replace", shell=True)
-    if r.returncode:
-        sys.exit(f"lib failed:\n{r.stdout[-3000:]}")
+        sys.exit(f"build failed ({len(failed)} of {len(stale)} files did not compile; the compiler's output is above)")
+    lib_all(a.module, sources, build, lib, env, log, lambda objs: compile_all(a.module, objs, build, cmd, env, log, t))
     stamp.write_text(key)
-    print(f"built {a.module}.lib with clang-cl {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {time.time() - t:.0f} s")
+    print(f"built {a.module}.lib with clang-cl {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
 
 
 if __name__ == "__main__":

@@ -31,7 +31,9 @@ def run(*args):
 
 
 def main():
-    for m in sys.argv[1:] or modules():
+    mods = sys.argv[1:] or modules()
+    for i, m in enumerate(mods, 1):
+        print(f"== {m} (module {i} of {len(mods)})", flush=True)
         # tools/hot_<module>_<id>.txt: the functions MSVC finds too big to optimize (C4883; list them with
         # BUILD_WARN_HUGE=1, build/<module>_cl.log), compiled apart with its huge-function optimization. A module
         # without a list (the small ones, or a game version nobody listed yet) gets it for every file.

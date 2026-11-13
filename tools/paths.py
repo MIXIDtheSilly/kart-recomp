@@ -8,6 +8,8 @@ a comment; the file is not committed), else from the default below.
   NVN_XLATE  folder the shader translator (dmsh_xlate.exe, from tools/xlate) is built into   (work/xlate)
   VCVARS     Visual Studio's vcvars64.bat                                   (found with vswhere)
   CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\Program Files\LLVM\bin)
+  VULKAN_BIN folder with spirv-val, spirv-opt, spirv-dis, spirv-cross and glslangValidator
+             (third_party\spirv\bin, which the repository carries; else the Vulkan SDK's Bin)
   KART_VER   another game version, built next to the default one: its out/, gen/ and build/ go to
              ver/<KART_VER>/ and host\build.bat links host\out\kart-<KART_VER>.exe   (none)
              Set it in the environment for that build only: in local.cfg it would switch every build.
@@ -21,7 +23,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ["KART_GAME", "NVN_XLATE", "VCVARS", "CLANG", "KART_VER"]
+KEYS = ["KART_GAME", "NVN_XLATE", "VCVARS", "CLANG", "VULKAN_BIN", "KART_VER"]
 
 
 def _local():
@@ -48,6 +50,16 @@ def _find_vcvars():
     return r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 
+def _find_vulkan_bin():
+    own = ROOT / "third_party" / "spirv" / "bin"
+    if (own / "spirv-val.exe").exists():
+        return str(own)
+    if os.environ.get("VULKAN_SDK"):
+        return str(Path(os.environ["VULKAN_SDK"]) / "Bin")
+    sdks = sorted(Path(r"C:\VulkanSDK").glob("*/Bin"))
+    return str(sdks[-1]) if sdks else str(own)
+
+
 def get(key):
     """The setting's value ('' when there is none)."""
     if key == "KART_GAME" and get("KART_VER"):
@@ -60,13 +72,15 @@ def get(key):
     local = _local()
     if local.get(key):
         v = local[key]
-        return str((ROOT / v).resolve()) if key != "VCVARS" and key != "CLANG" and not Path(v).is_absolute() else v
+        return str((ROOT / v).resolve()) if key not in ("VCVARS", "CLANG") and not Path(v).is_absolute() else v
     if key == "NVN_XLATE":
         return str(ROOT / "work" / "xlate")
     if key == "VCVARS":
         return _find_vcvars()
     if key == "CLANG":
         return r"C:\Program Files\LLVM\bin\clang-cl.exe"
+    if key == "VULKAN_BIN":
+        return _find_vulkan_bin()
     return ""
 
 
@@ -85,12 +99,20 @@ def art(sub=""):
     return base / sub if sub else base
 
 
+def progress(done, total, what=""):
+    """A progress line for the launcher, which sets KART_PROGRESS=1 and draws "@@progress <done> <total> <what>" as a bar
+    instead of logging it. Nothing without KART_PROGRESS."""
+    if os.environ.get("KART_PROGRESS"):
+        print(f"@@progress {done} {total} {what}", flush=True)
+
+
 def vcvars_env():
     """The environment vcvars64.bat sets up (compilers, include and library paths)."""
     out = subprocess.run(f'cmd /c ""{get("VCVARS")}" >nul && set"', capture_output=True, text=True, errors="replace").stdout
     env = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
     if "INCLUDE" not in env:
         sys.exit(f"vcvars64.bat failed ({get('VCVARS')}): install Visual Studio with the C++ workload, or set VCVARS in local.cfg")
+    env["VSLANG"] = "1033"   # compiler messages in English where that language is installed: easier to search for and report
     return env
 
 

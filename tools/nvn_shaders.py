@@ -30,7 +30,7 @@ OUT = os.path.join(WORK, 'nvn_shaders' + ('-' + paths.get('KART_VER') if paths.g
 SPLIT = os.path.join(OUT, 'split')
 XLATE_DIR = paths.get('NVN_XLATE')
 XLATE_EXE = os.path.join(XLATE_DIR, 'dmsh_xlate.exe')
-SPIRV_VAL = os.environ.get('SPIRV_VAL', r'C:\VulkanSDK\1.4.363.0\Bin\spirv-val.exe')
+SPIRV_VAL = os.environ.get('SPIRV_VAL') or os.path.join(paths.get('VULKAN_BIN'), 'spirv-val.exe')
 XLATE_PROJ = os.path.join(RECOMP, 'tools', 'xlate', 'dmsh_xlate', 'dmsh_xlate.csproj')
 
 CTL_MAGIC = bytes.fromhex('34127698')
@@ -119,7 +119,7 @@ def load_tables():
         if len(c) > 4:
             rows.append((c[0], int(c[1]), c[2], c[3], c[4]))
     facts = {}
-    for ln in open(os.path.join(SPLIT, 'shader_facts.tsv')):
+    for ln in open(os.path.join(SPLIT, 'shader_facts.tsv'), encoding='utf-8', errors='replace'):
         if ln.strip() and not ln.startswith('#'):
             k, v = ln.rstrip('\n').split('\t', 1)
             facts[k] = json.loads(v)
@@ -311,6 +311,7 @@ def main():
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         for e in ex.map(lambda c: translate_chunk(c, outdir, w, a.timeout), chunks):
             errs.update(e); done += 1
+            paths.progress(done, len(chunks), 'translating shaders to SPIR-V')
             if done % 20 == 0 or done == len(chunks):
                 print(f'  chunks {done}/{len(chunks)}  failed so far {len(errs)}  {time.time() - t0:.0f}s', flush=True)
     shutil.rmtree(w, ignore_errors=True)
@@ -322,8 +323,10 @@ def main():
     if a.validate:
         print('spirv-val ...', flush=True)
         with cf.ThreadPoolExecutor(a.jobs) as ex:
-            for k, rc, msg in ex.map(lambda k: validate_one(k, outdir), ok):
+            for i, (k, rc, msg) in enumerate(ex.map(lambda k: validate_one(k, outdir), ok)):
                 summary[k]['spirv_val'] = 'ok' if rc == 0 else msg[:400]
+                if i % 50 == 0 or i + 1 == len(ok):
+                    paths.progress(i + 1, len(ok), 'checking shaders (spirv-val)')
     with open(os.path.join(outdir, 'build_summary.json'), 'w') as f:
         json.dump(summary, f, indent=0)
     st = collections.Counter((v['stage'], v['status']) for v in summary.values() if 'stage' in v)

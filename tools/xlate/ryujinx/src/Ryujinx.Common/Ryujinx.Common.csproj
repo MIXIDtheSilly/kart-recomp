@@ -10,7 +10,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" />
     <PackageReference Include="MsgPack.Cli" />
-    <PackageReference Include="Humanizer" />
+    <PackageReference Include="Humanizer.Core" />
     <PackageReference Include="Gommon" />
   </ItemGroup>
 

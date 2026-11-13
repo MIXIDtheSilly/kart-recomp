@@ -84,17 +84,18 @@ std::unordered_map<u64, Imported> g_windows;  // by k
 // there, plentiful. Unified memory: every import counts against the GPU's one heap (on an Intel handheld 9 GB of 16 GB
 // RAM, which the overlapping 256 MB windows and the pools' own imports filled to 8.5 GB before the first frame, so no
 // image could be made). There the windows are smaller and do not overlap: HOST_NVN_IMPORT_WINDOW_MB (64); a pool
-// across a window edge gets an import of its own.
+// across a window edge gets an import of its own. The same on a dedicated GPU whose host heap is small (feat.lean_imports:
+// 8 GB on a 16 GB PC, which the imports filled).
 u64 win_step() {
     static const u64 s = [] {
-        if (!ctx().feat.uma) return Step;
+        if (!ctx().feat.lean_imports) return Step;
         u64 mb = 64;
         if (const char* e = getenv("HOST_NVN_IMPORT_WINDOW_MB"); e && *e) mb = std::max<u64>(4, std::strtoull(e, nullptr, 0));
         return mb << 20;
     }();
     return s;
 }
-u64 win_span() { return ctx().feat.uma ? win_step() : 2 * win_step(); }
+u64 win_span() { return ctx().feat.lean_imports ? win_step() : 2 * win_step(); }
 
 // The window holding physical [phys, phys + size); imports it the first time.
 const Imported* window(u64 phys, u64 size) {
@@ -398,6 +399,7 @@ void pool_part_begin(bool submission) {
         if (it == g_pools.end()) continue;
         Pool& p = it->second;
         p.promote_queued = false;
+        if (p.pending || p.failed || !p.buffer) continue;   // (lean imports: not imported yet, nothing to copy from)
         if (p.pinned || p.shared || p.mirror || !p.gpu_written || (p.flags != 0x21 && frame - p.quiet_from < QuietFrames)) continue;
         if (!mirror_alloc(addr, p, MirrorMaxPool)) {
             p.quiet_from = frame;   // (asked again in a while)
@@ -442,11 +444,12 @@ void pool_part_begin(bool submission) {
 // Unified memory: a pool is imported the first time pool_find gives it out, not when the game makes it. Every import
 // counts against the GPU's one heap there, and most of the game's pool memory is textures, which the GPU reads from
 // images of its own (textures.cpp) and never as a buffer: imported up front, the pools took 6.5 GB of an Intel
-// handheld's 7.6 GB budget and the textures then had no room. HOST_NVN_LAZY_IMPORT=0: up front as on a dedicated GPU.
+// handheld's 7.6 GB budget and the textures then had no room. Also a dedicated GPU with a small host heap
+// (feat.lean_imports). HOST_NVN_LAZY_IMPORT=0: up front.
 bool lazy_import() {
     static const bool on = [] {
         const char* e = getenv("HOST_NVN_LAZY_IMPORT");
-        return e && *e ? *e != '0' : ctx().feat.uma;
+        return e && *e ? *e != '0' : ctx().feat.lean_imports;
     }();
     return on;
 }

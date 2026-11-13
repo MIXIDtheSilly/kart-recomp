@@ -13,7 +13,53 @@ import struct
 import sys
 from pathlib import Path
 
-import lz4.block
+try:
+    import lz4.block as _lz4
+except ImportError:   # no wheel for this Python yet: the slower decoder below
+    _lz4 = None
+
+
+def lz4_block_decompress(src: bytes, size: int) -> bytes:
+    """An LZ4 block in plain Python (for when the lz4 package is missing): a few seconds for the main module."""
+    if _lz4:
+        return _lz4.decompress(src, uncompressed_size=size)
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        out += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | src[i + 1] << 8
+        i += 2
+        ml = token & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(out) - off
+        if off >= ml:
+            out += out[start:start + ml]
+        else:   # overlapping copy: the last `off` bytes repeat
+            reps, rest = divmod(ml, off)
+            chunk = bytes(out[start:])
+            out += chunk * reps + chunk[:rest]
+    return bytes(out)
+
 
 MODULE_ORDER = ["rtld", "main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "sdk"]
 
@@ -50,7 +96,7 @@ class Nso:
         for i, ((foff, moff, size), csize, digest) in enumerate(zip(segs, csizes, hashes)):
             compressed = flags & (1 << i)
             blob = raw[foff:foff + csize]
-            data = lz4.block.decompress(blob, uncompressed_size=size) if compressed else blob[:size]
+            data = lz4_block_decompress(blob, size) if compressed else blob[:size]
             if len(data) != size:
                 raise ValueError(f"{path}: segment {i} size mismatch")
             if flags & (1 << (i + 3)) and hashlib.sha256(data).digest() != digest:

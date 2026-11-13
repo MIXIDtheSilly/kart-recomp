@@ -15,7 +15,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nvn_shaders as ns
 
-BIN = os.environ.get('VULKAN_BIN', r'C:\VulkanSDK\1.4.363.0\Bin')
+BIN = ns.paths.get('VULKAN_BIN')   # third_party\spirv\bin (VULKAN_BIN overrides)
 EXE = lambda n: os.path.join(BIN, n + '.exe')
 SKEW = 32
 PER = {1: 1, 2: 2, 3: 3}
@@ -180,8 +180,9 @@ def main():
     want = set(a.keys.split(',')) if a.keys else None
     packs, report, ok = {}, {}, 0
     tmp = tempfile.mkdtemp(prefix='nvn_mesh_')
-    for name, idx, stname, key, src in rows:
-        if ns.STAGE_OF_NAME.get(stname, name[:2]) not in ('ts', 'ms') or want and key not in want: continue
+    todo = [r for r in rows if ns.STAGE_OF_NAME.get(r[2], r[0][:2]) in ('ts', 'ms') and not (want and r[3] not in want)]
+    for i, (name, idx, stname, key, src) in enumerate(todo):
+        ns.paths.progress(i, len(todo), 'task and mesh shaders')
         if key in report: continue
         variants = [False] + ([True] if a.flat else [])
         for flat in variants:

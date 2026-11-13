@@ -321,6 +321,14 @@ void create_device(Device& c) {
 
     c.feat.uma = c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     if (const char* e = std::getenv("HOST_NVN_UMA"); e && *e) c.feat.uma = std::strcmp(e, "0") != 0;
+    u64 host_heap = 0;   // the largest heap that is not device-local: where host imports go on a dedicated GPU
+    for (u32 h = 0; h < c.mem_props.memoryHeapCount; h++)
+        if (!(c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) host_heap = std::max(host_heap, c.mem_props.memoryHeaps[h].size);
+    c.feat.lean_imports = c.feat.uma || (host_heap && host_heap < (12ull << 30));
+    if (const char* e = std::getenv("HOST_NVN_LEAN_IMPORTS"); e && *e) c.feat.lean_imports = std::strcmp(e, "0") != 0;
+    if (c.feat.lean_imports && !c.feat.uma)
+        LOG("nvk: host heap %llu MB: memory pools imported at first use, in small windows (HOST_NVN_LEAN_IMPORTS=0: off)",
+            static_cast<unsigned long long>(host_heap >> 20));
 
     std::string list;
     for (const char* e : want) list += std::string(" ") + e;

@@ -22,8 +22,9 @@ Integrated GPUs and handheld PCs get a unified-memory mode automatically. Saves 
 `host\out\user\` (or `user-1.8.0\`). Settings: see [Every setting](#every-setting).
 
 The optional VP9 Video Extensions (Microsoft Store) play the movies; without them they're skipped.
-On Python 3.13, the tools also need `pip install backports.zstd`. Keep the repository in a path
-without spaces.
+The launcher's **Set up** installs the Python packages (`requirements.txt`) and builds the shader
+translator from the NuGet packages in `tools\xlate\packages\`; the SPIR-V tools are in
+`third_party\spirv\`. Keep the repository in a path without spaces.
 
 Everything the tools make from your dump (`out\`, `gen\`, `build\`, `ver\`, `work\`) is derived from
 the game: keep it to yourself.
@@ -31,6 +32,9 @@ the game: keep it to yourself.
 ## Building by hand
 
 ```
+:: The Python packages
+python -m pip install -r requirements.txt
+
 :: Where your dump is (local.cfg stays on your machine; tools\paths.py lists every setting)
 echo KART_GAME=D:\dumps\kart> local.cfg
 
@@ -45,6 +49,7 @@ python tools\nvn_shaders.py
 python tools\nvn_refl.py
 python tools\nvn_mesh.py --flat
 python tools\nvn_spvfix.py --all
+python tools\nvn_barfix.py
 
 :: Build the host and play
 host\build.bat
@@ -218,6 +223,7 @@ GPL-3.0-or-later overall (`LICENSE`); `third_party\README.md` lists each project
 * the audio renderer and the ASTC decoder are from Eden / yuzu (GPL), and `host\services\gsv.cpp`
   is ported from Eden-based code (GPL-3.0-or-later)
 * the shader tools are from plumber-racer-2 and Ryujinx (MIT)
-* Vulkan-Headers, VMA, LZ4, Zstandard, Opus and stb_dxt are in `third_party\`
+* Vulkan-Headers, VMA, LZ4, Zstandard, Opus and stb_dxt are in `third_party\`, and so are the
+  Khronos SPIR-V tools the shader stage runs (SPIRV-Tools, SPIRV-Cross, glslang)
 * `host\nvn\nvn.h` is MIT (h1k421), and `tools\texbake\stb_image_write.h` is public domain / MIT
 * the launcher's fonts, Instrument Sans and DM Mono, are SIL OFL (licenses in `launcher\fonts\`)

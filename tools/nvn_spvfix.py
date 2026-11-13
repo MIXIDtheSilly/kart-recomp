@@ -15,7 +15,9 @@ usage: nvn_spvfix.py [--dir DIR] [--min-bytes N] [--all]
 """
 import argparse, concurrent.futures, json, os, subprocess, sys
 
-BIN = os.environ.get('VULKAN_BIN', r'C:\VulkanSDK\1.4.363.0\Bin')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths
+BIN = paths.get('VULKAN_BIN')   # third_party\spirv\bin (VULKAN_BIN overrides)
 EXE = lambda n: os.path.join(BIN, n + '.exe')
 FIXES = ['87c52decaf1a8e68', 'c3e3a664e970c1bc']
 
@@ -58,7 +60,9 @@ def main():
 
     bad = done = 0
     with concurrent.futures.ThreadPoolExecutor(max(1, (os.cpu_count() or 4) // 2)) as pool:
-        for k, r in zip(sorted(keys), pool.map(fix, sorted(keys))):
+        for i, (k, r) in enumerate(zip(sorted(keys), pool.map(fix, sorted(keys)))):
+            if i % 25 == 0 or i + 1 == len(keys):
+                paths.progress(i + 1, len(keys), 'optimizing shaders (spirv-opt)')
             if r:
                 print(r)
                 bad += 1
