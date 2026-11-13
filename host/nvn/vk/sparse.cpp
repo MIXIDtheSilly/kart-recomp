@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <execution>
+#include "../../par.h"
 #include <memory>
 #include <mutex>
 #include <span>
@@ -673,7 +673,7 @@ void sparse_image_use(Image* img, VkCommandBuffer pre) {
             jobs.push_back(std::move(j));
         }
         if (!jobs.empty()) {
-            std::for_each(std::execution::par, jobs.begin(), jobs.end(), [s](Job& j) { convert(s, j); });
+            par_for_each(jobs.begin(), jobs.end(), [s](Job& j) { convert(s, j); });
             size_t total = 0;
             for (Job& j : jobs) j.r.bufferOffset = total, total += (j.out.size() + 15) & ~size_t{15};
             Device& c = ctx();

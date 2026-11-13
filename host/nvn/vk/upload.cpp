@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <map>
-#include <execution>
+#include "../../par.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -484,7 +484,7 @@ bool disk_get(u64 key, Prepared& out, bool* old) {
             } else {
                 std::vector<size_t> idx(sizes.size());
                 for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
-                std::for_each(std::execution::par, idx.begin(), idx.end(), unpack);
+                par_for_each(idx.begin(), idx.end(), unpack);
             }
             ok = good.load();
         }

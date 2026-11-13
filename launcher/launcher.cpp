@@ -1,9 +1,10 @@
 // The launcher: the way from a game dump to a running kart.exe, one step per dot at the top.
 //
 //   1 Game          the dump folder (exefs\ and romfs\), its module ids checked, saved as KART_GAME in local.cfg
-//   2 Dependencies  the tools the build needs (Visual Studio, Python, the .NET SDK); Set up installs the Python packages
-//                   (tools\deps.py) and builds the shader translator from tools\xlate and its packages\ (the SPIR-V
-//                   tools and everything else the host uses are in third_party\)
+//   2 Dependencies  the tools the build needs (Python, the .NET SDK); Set up downloads the C++ compiler (llvm-mingw,
+//                   tools\toolchain.py: no Visual Studio needed), installs the Python packages (tools\deps.py) and builds
+//                   the shader translator from tools\xlate and its packages\ (the SPIR-V tools and everything else
+//                   the host uses are in third_party\). BUILD_CC=cl or clang in local.cfg builds with Visual Studio.
 //   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
 //                   the first stage whose output is missing; the tools' @@progress lines are drawn as a bar
 //   4 Play          host\out\kart.exe on the dump
@@ -148,10 +149,12 @@ static std::wstring setting(const std::wstring& key) {
     const auto cfg = local_cfg();
     if (auto it = cfg.find(key); it != cfg.end() && !it->second.empty()) {
         fs::path v = it->second;
-        if (key != L"VCVARS" && key != L"CLANG" && v.is_relative()) v = (g_root / v).lexically_normal();
+        if (key != L"VCVARS" && key != L"CLANG" && key != L"BUILD_CC" && key != L"KART_VER" && v.is_relative())
+            v = (g_root / v).lexically_normal();
         return v.wstring();
     }
     if (key == L"NVN_XLATE") return (g_root / "work" / "xlate").wstring();
+    if (key == L"MINGW") return (g_root / "tools" / "llvm-mingw").wstring();
     if (key == L"VCVARS") return g_vcvars_found;
     return L"";
 }
@@ -432,6 +435,23 @@ static int dump_version(const fs::path& dir) {
     return -1;
 }
 
+// The C++ compiler, as tools\paths.py picks it: BUILD_CC when it is set (mingw, cl, clang), else mingw once Set up has
+// downloaded llvm-mingw into MINGW, else cl (Visual Studio)
+static bool mingw_ok() { return path_exists(fs::path(setting(L"MINGW")) / "bin" / "clang++.exe"); }
+static bool build_cc_set() { return !setting(L"BUILD_CC").empty(); }
+static std::wstring build_cc() {
+    std::wstring cc = setting(L"BUILD_CC");
+    for (auto& ch : cc) ch = (wchar_t)towlower(ch);
+    if (cc.empty()) return mingw_ok() ? L"mingw" : L"cl";
+    return cc == L"clang-cl" ? L"clang" : cc;
+}
+// Where build_lib.py puts the module libraries for that compiler, and their extension
+static fs::path lib_dir(const fs::path& build) {
+    const std::wstring cc = build_cc();
+    return cc == L"mingw" ? build / "mingw" : cc == L"clang" ? build / "clang" : build;
+}
+static const wchar_t* lib_ext() { return build_cc() == L"mingw" ? L".a" : L".lib"; }
+
 // Python and its packages: "python <version>" and "missing <package> ..." from tools\deps.py check
 static void check_python() {
     g_tools.python.clear();
@@ -511,7 +531,7 @@ static std::vector<Stage> stages() {
              }
              return v;
          }},
-        {L"Lift and compile", [=] { return all(a / "build", L".lib"); },
+        {L"Lift and compile", [=] { return all(lib_dir(a / "build"), lib_ext()); },
          [=] { return std::vector<Cmd>{{L"python tools\\build_all.py", root}}; }},
         {L"Module glue", [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
          [=] { return std::vector<Cmd>{{L"python tools\\gen_glue.py", root}}; }},
@@ -565,8 +585,14 @@ static void refresh() {
 
     auto& deps = g_rows[1];
     deps.clear();
-    const bool vs = !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
-    deps.push_back({L"Visual Studio", vs ? L"C++ tools found" : L"install it with \"Desktop development with C++\"", vs ? ST_OK : ST_BAD});
+    // The C++ compiler: llvm-mingw, which Set up downloads, unless BUILD_CC asks for Visual Studio
+    const bool ms = build_cc_set() && build_cc() != L"mingw";
+    const bool vs = ms && !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
+    const bool cc = ms ? vs : mingw_ok();
+    if (ms) deps.push_back({L"Visual Studio", vs ? L"C++ tools found (BUILD_CC=" + build_cc() + L")" :
+                            L"install it with \"Desktop development with C++\", or remove BUILD_CC from local.cfg", vs ? ST_OK : ST_BAD});
+    else deps.push_back({L"C++ compiler", cc ? L"LLVM MinGW (tools\\llvm-mingw)" : L"Set up downloads LLVM MinGW (190 MB): no Visual Studio needed",
+                         cc ? ST_OK : ST_MISSING});
     const bool py = !g_tools.python.empty(), pkgs = py && g_tools.py_missing.empty();
     if (!py) deps.push_back({L"Python", L"install Python 3.13 from python.org, with \"Add to PATH\"", ST_BAD});
     else deps.push_back({L"Python", L"", ST_OK, g_tools.python});
@@ -581,8 +607,8 @@ static void refresh() {
                     g_tools.vp9 ? ST_OK : ST_OPTIONAL});
     const bool xlate = path_exists(fs::path(setting(L"NVN_XLATE")) / "dmsh_xlate.exe");
     deps.push_back({L"Shader translator", xlate ? L"built" : L"Set up builds it", xlate ? ST_OK : ST_MISSING});
-    g_done[1] = vs && pkgs && g_tools.dotnet && spirv && xlate;
-    g_can_setup = vs && py && g_tools.dotnet;
+    g_done[1] = cc && pkgs && g_tools.dotnet && spirv && xlate;
+    g_can_setup = (cc || !ms) && py && g_tools.dotnet;
 
     auto& build = g_rows[2];
     build.clear();
@@ -777,11 +803,12 @@ static const wchar_t* STEP_TEXT[4] = {
     L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\, or a .nup file of it, which "
     L"is unpacked into a folder you choose. Versions 1.0.0 and 1.8.0 work, each built and played on its own (the "
     L"version buttons above).",
-    L"Visual Studio, Python and the .NET SDK you install yourself. Set up does the rest: it installs the Python packages "
-    L"(pip) and builds the shader translator from the packages in the repository, in a minute or two. The SPIR-V tools "
-    L"and the third-party code the host uses come with the repository (third_party\\).",
+    L"Python and the .NET SDK you install yourself. Set up does the rest, in a few minutes: it downloads the C++ compiler "
+    L"(LLVM MinGW: no Visual Studio needed), installs the Python packages (pip) and builds the shader translator from the "
+    L"packages in the repository. The SPIR-V tools and the third-party code the host uses come with the repository "
+    L"(third_party\\).",
     L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
-    L"linked. The first build takes about an hour (the game is close to 1 GB of C++; the bar below shows how far it is); "
+    L"linked. The first build takes about half an hour (the game is close to 1 GB of C++; the bar below shows how far it is); "
     L"later ones redo only what is missing.",
     L"Starts kart.exe on your dump. Pipelines are made ahead of time over the first runs; baking decodes every "
     L"texture into the cache ahead of time, so the first races do not hitch.",
@@ -1426,16 +1453,19 @@ static void click(int id) {
         g_status.clear();
         refresh();
     } else if (id == B_SETUP) {
-        // The Python packages (pip, from PyPI), then the translator from the NuGet packages in tools\xlate\packages
+        // The C++ compiler (llvm-mingw, from GitHub, checked against its SHA-256), the Python packages (pip, from
+        // PyPI), then the translator from the NuGet packages in tools\xlate\packages
         std::vector<Cmd> cmds;
-        if (!g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages", 1, 2});
+        if (!mingw_ok() && !(build_cc_set() && build_cc() != L"mingw"))
+            cmds.push_back({L"python tools\\toolchain.py install", root, L"C++ compiler"});
+        if (!g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages"});
         cmds.push_back({L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj",
-                        root, L"Shader translator", (int)cmds.size() + 1, (int)cmds.size() + 1});
-        if (cmds.size() == 2) cmds[0].stage_n = 2;
+                        root, L"Shader translator"});
+        for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
         start_job(L"Setting up", cmds);
     } else if (id == B_BUILD || id == B_REBUILD) {
         if (id == B_REBUILD &&
-            MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes about an hour.", L"Rebuild everything",
+            MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes about half an hour.", L"Rebuild everything",
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
             return;
         const auto st = stages();

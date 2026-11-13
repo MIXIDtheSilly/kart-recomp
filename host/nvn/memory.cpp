@@ -5,6 +5,7 @@
 // its GPU address is ga(mem). A virtual pool (flags 0x200) is a GPU address range with no storage of its own: its range is
 // reserved in the guest address space (never mapped), and MapVirtual shows pages of physical pools in it. The CPU never
 // touches a virtual pool (nvnMemoryPoolMap returns NULL); the renderer resolves its addresses through the 4 KB page table below.
+#include <algorithm>
 #include <map>
 
 #include "nvn_int.h"

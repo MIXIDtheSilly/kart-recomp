@@ -9,6 +9,31 @@
 #include <limits>
 #include <type_traits>
 
+#ifndef _MSC_VER
+// clang for MinGW (the llvm-mingw toolchain, BUILD_CC=mingw) has these MSVC intrinsics only as builtins with
+// -fms-extensions (and -mcx16 for the 128-bit one); _udiv128 not at all.
+#if !__has_builtin(_InterlockedCompareExchange128)
+static inline unsigned char _InterlockedCompareExchange128(volatile int64_t* dst, int64_t hi, int64_t lo, int64_t* cmp) {
+    unsigned char ok;
+    __asm__ __volatile__("lock cmpxchg16b %1"
+                         : "=@ccz"(ok), "+m"(*reinterpret_cast<volatile int64_t(*)[2]>(dst)), "+a"(cmp[0]), "+d"(cmp[1])
+                         : "b"(lo), "c"(hi)
+                         : "memory");
+    return ok;
+}
+#endif
+#if !__has_builtin(__lzcnt)
+static inline unsigned __lzcnt(unsigned v) { return v ? static_cast<unsigned>(__builtin_clz(v)) : 32u; }
+#endif
+#if !__has_builtin(_udiv128)
+static inline uint64_t _udiv128(uint64_t hi, uint64_t lo, uint64_t div, uint64_t* rem) {
+    const unsigned __int128 n = (static_cast<unsigned __int128>(hi) << 64) | lo;
+    *rem = static_cast<uint64_t>(n % div);
+    return static_cast<uint64_t>(n / div);
+}
+#endif
+#endif
+
 // The helpers below are tiny, but MSVC stops inlining into very large functions, and the lifted hot functions are
 // very large: there each float operation became a call. RT_FORCE_INLINE (set for the hot files by build_lib.py)
 // forces them inline; it makes a file take several times as long to compile, so the rest are built without it.
@@ -218,10 +243,16 @@ uint32_t crc32_8(uint32_t acc, uint64_t v);
 uint32_t crc32_16(uint32_t acc, uint64_t v);
 uint32_t crc32_32(uint32_t acc, uint64_t v);
 uint32_t crc32_64(uint32_t acc, uint64_t v);
-RT_INLINE uint32_t crc32c_8(uint32_t acc, uint64_t v) { return _mm_crc32_u8(acc, static_cast<uint8_t>(v)); }
-RT_INLINE uint32_t crc32c_16(uint32_t acc, uint64_t v) { return _mm_crc32_u16(acc, static_cast<uint16_t>(v)); }
-RT_INLINE uint32_t crc32c_32(uint32_t acc, uint64_t v) { return _mm_crc32_u32(acc, static_cast<uint32_t>(v)); }
-RT_INLINE uint32_t crc32c_64(uint32_t acc, uint64_t v) { return static_cast<uint32_t>(_mm_crc32_u64(acc, v)); }
+// SSE4.2's CRC32C (every x86-64 CPU this runs on has it). clang, unlike MSVC, only uses it in code built for it.
+#if defined(__clang__) && !defined(__CRC32__)
+#define RT_CRC_TARGET __attribute__((target("crc32")))
+#else
+#define RT_CRC_TARGET
+#endif
+RT_CRC_TARGET RT_INLINE uint32_t crc32c_8(uint32_t acc, uint64_t v) { return _mm_crc32_u8(acc, static_cast<uint8_t>(v)); }
+RT_CRC_TARGET RT_INLINE uint32_t crc32c_16(uint32_t acc, uint64_t v) { return _mm_crc32_u16(acc, static_cast<uint16_t>(v)); }
+RT_CRC_TARGET RT_INLINE uint32_t crc32c_32(uint32_t acc, uint64_t v) { return _mm_crc32_u32(acc, static_cast<uint32_t>(v)); }
+RT_CRC_TARGET RT_INLINE uint32_t crc32c_64(uint32_t acc, uint64_t v) { return static_cast<uint32_t>(_mm_crc32_u64(acc, v)); }
 
 // ------------------------------------------------------------------ floating point
 
@@ -271,11 +302,16 @@ template <class T> RT_INLINE T fsub_(T a, T b) { T r = a - b; return r == r ? r 
 template <class T> RT_INLINE T fmul_(T a, T b) { T r = a * b; return r == r ? r : nan2(a, b); }
 template <class T> RT_INLINE T fdiv_(T a, T b) { T r = a / b; return r == r ? r : nan2(a, b); }
 // Fused multiply-add: the host's FMA3 instruction when it has one (x86 CPUs since about 2013), else the library call.
+#ifndef _MSC_VER
+__attribute__((target("xsave"))) static inline unsigned long long rt_xgetbv0() { return _xgetbv(0); }
+#else
+static inline unsigned long long rt_xgetbv0() { return _xgetbv(0); }
+#endif
 inline const bool g_host_fma3 = [] {
     int r[4];
     __cpuid(r, 1);
     const bool cpu = (r[2] >> 12 & 1) && (r[2] >> 27 & 1) && (r[2] >> 28 & 1);  // FMA, OSXSAVE, AVX
-    return cpu && (_xgetbv(0) & 6) == 6;                                         // the OS saves the ymm state
+    return cpu && (rt_xgetbv0() & 6) == 6;                                      // the OS saves the ymm state
 }();
 #if defined(__clang__) && !defined(__FMA__)
 // clang (unlike MSVC) will not inline an FMA3 intrinsic into code built without FMA: keep it in its own function.

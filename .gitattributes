@@ -1,2 +1,5 @@
 # The patches apply byte for byte: no line-ending conversion
 *.patch -text
+
+# cmd finds goto labels reliably only in CRLF files
+*.bat text eol=crlf

@@ -20,7 +20,9 @@
 #include "../common.h"
 #include "gamepads.h"
 
+#ifdef _MSC_VER   // (mingw: tools/build_host.py links xinput1_4; its libxinput.a is XINPUT1_3.dll, not in Windows)
 #pragma comment(lib, "xinput.lib")
+#endif
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 

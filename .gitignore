@@ -21,6 +21,11 @@ __pycache__/
 /deps/
 /local.cfg
 
+# The C++ toolchain tools/toolchain.py downloads (the launcher's Set up)
+/tools/llvm-mingw/
+/tools/llvm-mingw.tmp/
+/tools/llvm-mingw-*.zip
+
 # Built by dotnet (tools/nvn_shaders.py builds the shader translator into work/xlate)
 /tools/xlate/**/bin/
 /tools/xlate/**/obj/

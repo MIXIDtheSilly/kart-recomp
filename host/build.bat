@@ -1,10 +1,16 @@
 @echo off
 rem Builds out\kart.exe: the host runtime, the recompiled modules and the native NVN renderer.
-rem Third-party code comes from ..\third_party (each folder with its license); nothing else is needed but Visual Studio.
-rem Paths (Visual Studio, the game version's module libraries) come from tools\paths.py.
+rem Third-party code comes from ..\third_party (each folder with its license).
+rem Paths (the compiler, the game version's module libraries) come from tools\paths.py.
 rem BUILD_MP=<n>: at most n compiler processes (default: one per core).
 cd /d %~dp0
 for /f "usebackq delims=" %%L in (`python ..\tools\paths.py bat`) do set "%%L"
+rem BUILD_CC=mingw (the default once the launcher's Set up has downloaded llvm-mingw): no Visual Studio needed,
+rem tools\build_host.py builds the same exe with clang. Below: Visual Studio (BUILD_CC=cl or clang).
+if /i "%BUILD_CC%"=="mingw" (
+  python ..\tools\build_host.py
+  exit /b
+)
 call "%VCVARS%" >nul 2>nul
 set TP=..\third_party
 if not exist out\obj mkdir out\obj

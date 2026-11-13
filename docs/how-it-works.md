@@ -22,8 +22,9 @@ Integrated GPUs and handheld PCs get a unified-memory mode automatically. Saves 
 `host\out\user\` (or `user-1.8.0\`). Settings: see [Every setting](#every-setting).
 
 The optional VP9 Video Extensions (Microsoft Store) play the movies; without them they're skipped.
-The launcher's **Set up** installs the Python packages (`requirements.txt`) and builds the shader
-translator from the NuGet packages in `tools\xlate\packages\`; the SPIR-V tools are in
+The launcher's **Set up** downloads the C++ compiler (LLVM MinGW, into `tools\llvm-mingw\`; see
+[Build options](#build-options)), installs the Python packages (`requirements.txt`) and builds the
+shader translator from the NuGet packages in `tools\xlate\packages\`; the SPIR-V tools are in
 `third_party\spirv\`. Keep the repository in a path without spaces.
 
 Everything the tools make from your dump (`out\`, `gen\`, `build\`, `ver\`, `work\`) is derived from
@@ -32,7 +33,8 @@ the game: keep it to yourself.
 ## Building by hand
 
 ```
-:: The Python packages
+:: The C++ compiler (LLVM MinGW, into tools\llvm-mingw) and the Python packages
+python tools\toolchain.py install
 python -m pip install -r requirements.txt
 
 :: Where your dump is (local.cfg stays on your machine; tools\paths.py lists every setting)
@@ -93,7 +95,7 @@ you play, the game runs at a steady 60.
 ## From AArch64 to an exe
 
 ```
- rtld/main/subsdk*/sdk (AArch64) --lift.py--> <module>_*.cpp --MSVC /MD--> build/<module>.lib
+ rtld/main/subsdk*/sdk (AArch64) --lift.py--> <module>_*.cpp --clang--> build/mingw/<module>.a
                                                                                  │
  host\ (this repository): loader, kernel, services, native NVN on Vulkan  ◄──────┘  =  host\out\kart.exe
 ```
@@ -200,8 +202,9 @@ Set them in the environment, or as `HOST_*` lines in `local.cfg`.
 The tools take the module list from the dump (`out\layout.json`), and the game patch
 (`tools\patches.py`) finds its site by its code. `host\` binds to the sdk through its exports. So
 another version needs the build steps run again, not code changes. `tools\hot_<module>_<build id>.txt`
-lists the functions MSVC needs its huge-function optimization for (C4883). For a new version, build
-once with `BUILD_WARN_HUGE=1` and list the functions `build\main_cl.log` names.
+lists the functions MSVC needs its huge-function optimization for (C4883; clang needs no list). For a
+new version, build once with `BUILD_CC=cl BUILD_WARN_HUGE=1` and list the functions
+`build\main_cl.log` names.
 
 With `KART_VER=<version>` in the environment, the build steps write to `ver\<version>\{out,gen,build}`
 and `work\nvn_shaders-<version>`, and `host\build.bat` links `host\out\kart-<version>.exe`. That exe
@@ -212,9 +215,16 @@ out of `local.cfg`, because there it would switch every build.
 ## Build options
 
 * `BUILD_MP=<n>` caps parallel compiles in every build step.
-* `BUILD_CC=clang` compiles with clang-cl (needs LLVM). Its default `BUILD_ARCH=-march=native` is a
-  few percent faster but the exe then only runs on CPUs with the same features; set `BUILD_ARCH` to
-  something portable for an exe you take to another machine.
+* `BUILD_CC` picks the C++ compiler. The default is `mingw`: clang from LLVM MinGW (llvm-mingw
+  20261020, LLVM 23.1.4, which `tools\toolchain.py` downloads and checks by its SHA-256). It needs no
+  Visual Studio, links everything statically and compiles the game several times faster than MSVC
+  (1.8.0's main module: 5 minutes against 46 on 10 threads). Its objects go to `build\mingw\` and the
+  host's to `host\out\obj-mingw\` (`tools\build_host.py`, which `host\build.bat` runs). `BUILD_ARCH`
+  (default none: any x86-64 CPU) adds target flags such as `-march=native`.
+* `BUILD_CC=cl` builds with Visual Studio 2026 (C++), `BUILD_CC=clang` with clang-cl (Visual Studio and
+  LLVM). clang-cl's default `BUILD_ARCH=-march=native` is a few percent faster but the exe then only
+  runs on CPUs with the same features; set `BUILD_ARCH` to something portable for an exe you take to
+  another machine.
 
 ## Third-party code
 

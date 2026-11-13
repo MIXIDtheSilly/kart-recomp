@@ -12,16 +12,17 @@ emulated CPU or GPU. Versions 1.0.0 and 1.8.0 work.
 
 ## Run it
 
-You need Windows 10/11, a Vulkan 1.3 GPU, Visual Studio 2026 (C++), Python 3.13+ and the .NET 10 SDK.
-The launcher installs the Python packages and builds the rest; everything else is in the repository.
+You need Windows 10/11, a Vulkan 1.3 GPU, Python 3.13+ and the .NET 10 SDK. No Visual Studio: the
+C++ compiler (LLVM MinGW) is downloaded on first use. The launcher installs the Python packages and
+builds the rest; everything else is in the repository.
 
 ```
 launcher\build.bat
 launcher\out\launcher.exe
 ```
 
-The launcher takes you from your dump (or `.nup`) to playing. The first build takes about an hour
-on an 8-core CPU, with a progress bar. Controls, settings and how it all works: [docs/how-it-works.md](docs/how-it-works.md).
+The launcher takes you from your dump (or `.nup`) to playing. The first build takes about
+half an hour on an 8-core CPU, with a progress bar. Controls, settings and how it all works: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## License
 

@@ -1,7 +1,13 @@
 # Third-party code
 
 Copied unchanged from upstream, each folder with its license. `host\build.bat` compiles the C sources
-once into `host\out\obj\third_party\`. If you change a file here, delete that folder so it builds again.
+once into `host\out\obj\third_party\` (with Visual Studio; delete that folder after changing a file
+here). `tools\build_host.py` (LLVM MinGW) recompiles whatever changed by itself.
+
+The C++ compiler is not in the repository: `tools\toolchain.py` downloads llvm-mingw by Martin Storsjö
+(https://github.com/mstorsjo/llvm-mingw: LLVM under Apache-2.0 with LLVM exceptions, MinGW-w64 under
+its own permissive licenses, listed in its `LICENSE.TXT`) into `tools\llvm-mingw\`. The exes it links
+carry libc++, libunwind (Apache-2.0 with LLVM exceptions) and winpthreads (MIT-style).
 
 | folder | what | version | license |
 |--------|------|---------|---------|

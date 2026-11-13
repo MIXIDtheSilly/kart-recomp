@@ -1,9 +1,11 @@
-"""Compile a module's generated C++ into a static library with MSVC.
+"""Compile a module's generated C++ into a static library.
 
 Usage: python build_lib.py <gen dir> <module> <build dir> [--opt /O2]
 
-Produces <build dir>/<module>.lib from <gen dir>/<module>_*.cpp. Objects are only rebuilt
-when their source is newer, so re-running after lifting a subset is cheap.
+Produces <build dir>/<module>.lib from <gen dir>/<module>_*.cpp with MSVC (BUILD_CC=cl), <build dir>/clang/<module>.lib
+with clang-cl (BUILD_CC=clang) or <build dir>/mingw/<module>.a with llvm-mingw's clang (BUILD_CC=mingw, the default once
+tools/toolchain.py has downloaded it; see paths.py). Objects are only rebuilt when their source is newer, so re-running
+after lifting a subset is cheap.
 """
 import argparse
 import os
@@ -17,7 +19,6 @@ from pathlib import Path
 import paths
 
 ROOT = Path(__file__).resolve().parent.parent
-VCVARS = paths.get("VCVARS")
 
 
 def main():
@@ -32,16 +33,33 @@ def main():
     gen, build = Path(a.gen).resolve(), Path(a.build).resolve()
     lib = build / (a.module + ".lib")
     # BUILD_CC=clang: clang-cl (LLVM) instead of cl, objects in <build>/clang so the cl ones stay for switching back.
-    clang = os.environ.get("BUILD_CC", "cl").lower() in ("clang", "clang-cl")
+    # BUILD_CC=mingw: llvm-mingw's clang, objects and <module>.a in <build>/mingw.
+    cc = paths.build_cc()
+    clang, mingw = cc == "clang", cc == "mingw"
     # BUILD_PGO=gen: instrumented objects (link clang_rt.profile, run with KART_PGO_DUMP); BUILD_PGO=<x.profdata>:
     # optimized with that profile. Each has its own object folder.
     pgo = os.environ.get("BUILD_PGO", "")
     if clang:
         build = build / ("clang" if not pgo else "clang_pgogen" if pgo == "gen" else "clang_pgo")
+    if mingw:
+        build = build / "mingw"
+        lib = build / (a.module + ".a")
     build.mkdir(parents=True, exist_ok=True)
     sources = sorted(gen.glob(f"{a.module}_*.cpp"))
     stale = [s for s in sources if not (build / (s.stem + ".obj")).exists()
              or (build / (s.stem + ".obj")).stat().st_mtime < s.stat().st_mtime]
+    if mingw:
+        # BUILD_ARCH (default none: any x86-64 CPU, like cl's build) sets the target CPU; a change recompiles everything.
+        arch = os.environ.get("BUILD_ARCH", "")
+        stamp = build / f"{a.module}_arch.txt"
+        key = " ".join(["mingw", *MINGW_FLAGS, arch])
+        if not stamp.exists() or stamp.read_text() != key:
+            # New flags: the objects go and the stamp is written at once, so a build that fails later redoes only the
+            # files that did not compile
+            for s in sources:
+                (build / (s.stem + ".obj")).unlink(missing_ok=True)
+            stamp.write_text(key)
+            stale = sources
     if clang:
         # The target CPU flags change every object: a change of BUILD_ARCH recompiles everything.
         arch = os.environ.get("BUILD_ARCH", "-march=native")
@@ -61,6 +79,8 @@ def main():
     print(f"{len(sources)} sources, {len(stale)} to compile")
     if clang:
         return build_clang(a, sources, stale, build, lib, arch, stamp, key)
+    if mingw:
+        return build_mingw(a, sources, stale, build, lib, arch, stamp, key)
 
     # MSVC skips optimizing functions it finds too big (C4883, silent under /w): the hot ones (lift.py --hot, in
     # <module>_hot_*.cpp) are compiled with /d2OptimizeHugeFunctions, which takes far longer, the rest as they are.
@@ -221,6 +241,55 @@ def build_clang(a, sources, stale, build, lib, arch, stamp, key):
     lib_all(a.module, sources, build, lib, env, log, lambda objs: compile_all(a.module, objs, build, cmd, env, log, t))
     stamp.write_text(key)
     print(f"built {a.module}.lib with clang-cl {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
+
+
+MINGW_FLAGS = ["-mcx16", "-fms-extensions", "-fms-volatile", "-ffp-contract=off"]   # (see build_mingw; the stamp holds them)
+
+
+def build_mingw(a, sources, stale, build, lib, arch, stamp, key):
+    """clang from llvm-mingw: no Visual Studio, and several times faster than cl on these files (a hot file ~30 s
+    instead of ~7 min: cl needs /d2OptimizeHugeFunctions to optimize their huge functions at all).
+    -fms-extensions: the MSVC intrinsics runtime/cpu.h uses (with -mcx16 for the 128-bit compare-and-swap).
+    -fms-volatile: a volatile read is an acquire, as with cl and clang-cl. The lifted spin loops read guest memory with
+    plain loads and check the volatile ctx.halt between them: with ISO volatile clang kept the first load in a register
+    and spun on halt alone, so a guest spinlock that another thread released never looked free (1.8.0 hung while loading).
+    -ffp-contract=off: never fuse a separate guest multiply and add into an FMA (the guest rounds twice)."""
+    env = paths.mingw_env()
+    bindir = Path(paths.get("MINGW")) / "bin"
+    opt = "-O0" if a.opt.lower() == "/od" else "-" + a.opt.lstrip("/-")
+    flags = [str(bindir / "clang++.exe"), "-c", opt, "-std=c++20", "-w", *MINGW_FLAGS, *arch.split(), f"-I{ROOT / 'runtime'}"]
+    t = time.time()
+
+    def cmd(s, out):
+        extra = ["-DRT_FORCE_INLINE"] if "_hot_" in s.stem and os.environ.get("BUILD_FORCE_INLINE") else []
+        return [*flags, *extra, "-o", str(out), str(s)]
+
+    log = open(build / f"{a.module}_cc.log", "w", encoding="utf-8", errors="replace")
+    failed = compile_all(a.module, stale, build, cmd, env, log, t)
+    if failed:
+        sys.exit(f"build failed ({len(failed)} of {len(stale)} files did not compile; the compiler's output is above)")
+    rsp = build / f"{a.module}_objs.rsp"
+    for attempt in range(2):
+        # llvm-ar reads the response file the GNU way (a backslash escapes): forward slashes
+        rsp.write_text("\n".join(f'"{(build / (s.stem + ".obj")).as_posix()}"' for s in sources))
+        lib.unlink(missing_ok=True)   # 'r' would keep members of sources that are gone
+        r = subprocess.run([str(bindir / "llvm-ar.exe"), "rcs", str(lib), f"@{rsp}"], env=env, capture_output=True,
+                           text=True, errors="replace")
+        out = r.stdout + r.stderr
+        log.write(out)
+        if r.returncode == 0:
+            break
+        by_stem = {s.stem: s for s in sources}
+        bad = [by_stem[Path(m).stem] for m in set(re.findall(r"([^\s'\"]+\.obj)", out)) if Path(m).stem in by_stem]
+        if attempt == 0 and bad:
+            print(f"{len(bad)} bad object(s) from an earlier build, compiling again: " + ", ".join(b.name for b in bad), flush=True)
+            for b in bad:
+                (build / (b.stem + ".obj")).unlink(missing_ok=True)
+            if compile_all(a.module, bad, build, cmd, env, log, t):
+                sys.exit("build failed")
+            continue
+        sys.exit(f"llvm-ar failed:\n{out[-3000:]}")
+    print(f"built {a.module}.a with llvm-mingw clang {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
 
 
 if __name__ == "__main__":

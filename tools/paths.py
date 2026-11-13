@@ -6,7 +6,11 @@ a comment; the file is not committed), else from the default below.
   KART_GAME  the game dump: the folder holding exefs/ and romfs/            (none)
              (with KART_VER set, KART_GAME_<KART_VER> comes first)
   NVN_XLATE  folder the shader translator (dmsh_xlate.exe, from tools/xlate) is built into   (work/xlate)
-  VCVARS     Visual Studio's vcvars64.bat                                   (found with vswhere)
+  BUILD_CC   the C++ compiler: mingw (clang from llvm-mingw, which the launcher's Set up downloads: no Visual Studio
+             needed), cl (Visual Studio) or clang (clang-cl with Visual Studio's libraries)
+                                                             (mingw when MINGW holds it, else cl)
+  MINGW      the llvm-mingw toolchain (python tools\toolchain.py install puts it there)    (tools\llvm-mingw)
+  VCVARS     Visual Studio's vcvars64.bat, for BUILD_CC=cl or clang         (found with vswhere)
   CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\Program Files\LLVM\bin)
   VULKAN_BIN folder with spirv-val, spirv-opt, spirv-dis, spirv-cross and glslangValidator
              (third_party\spirv\bin, which the repository carries; else the Vulkan SDK's Bin)
@@ -23,7 +27,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ["KART_GAME", "NVN_XLATE", "VCVARS", "CLANG", "VULKAN_BIN", "KART_VER"]
+KEYS = ["KART_GAME", "NVN_XLATE", "BUILD_CC", "MINGW", "VCVARS", "CLANG", "VULKAN_BIN", "KART_VER"]
+NOT_PATHS = ("BUILD_CC", "VCVARS", "CLANG", "KART_VER")
 
 
 def _local():
@@ -72,9 +77,13 @@ def get(key):
     local = _local()
     if local.get(key):
         v = local[key]
-        return str((ROOT / v).resolve()) if key not in ("VCVARS", "CLANG") and not Path(v).is_absolute() else v
+        return str((ROOT / v).resolve()) if key not in NOT_PATHS and not Path(v).is_absolute() else v
     if key == "NVN_XLATE":
         return str(ROOT / "work" / "xlate")
+    if key == "MINGW":
+        return str(ROOT / "tools" / "llvm-mingw")
+    if key == "BUILD_CC":
+        return "mingw" if (Path(get("MINGW")) / "bin" / "clang++.exe").exists() else "cl"
     if key == "VCVARS":
         return _find_vcvars()
     if key == "CLANG":
@@ -104,6 +113,23 @@ def progress(done, total, what=""):
     instead of logging it. Nothing without KART_PROGRESS."""
     if os.environ.get("KART_PROGRESS"):
         print(f"@@progress {done} {total} {what}", flush=True)
+
+
+def build_cc():
+    """mingw, cl or clang (BUILD_CC; clang-cl counts as clang)."""
+    cc = get("BUILD_CC").lower()
+    return "clang" if cc == "clang-cl" else cc
+
+
+def mingw_env():
+    """The environment with llvm-mingw's bin folder first on PATH; exits with a message when it is not there."""
+    b = Path(get("MINGW")) / "bin"
+    if not (b / "clang++.exe").exists():
+        sys.exit(f"llvm-mingw is not in {b.parent}: run python tools\\toolchain.py install (the launcher's Set up does), "
+                 "or set BUILD_CC=cl to build with Visual Studio")
+    env = dict(os.environ)
+    env["PATH"] = str(b) + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def vcvars_env():

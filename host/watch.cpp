@@ -3,8 +3,10 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <set>
