@@ -1,4 +1,5 @@
-// Gamepads: Xbox pads through XInput, DualShock 4 and DualSense (USB and Bluetooth) through their HID input reports.
+// Gamepads: Xbox pads through XInput; DualShock 4, DualSense and the Switch Pro Controller (USB and Bluetooth)
+// through their HID input reports.
 #pragma once
 #include "hid_shared.h"
 
