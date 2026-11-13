@@ -94,6 +94,10 @@ void rp_tex_init(const tex_t* t);
 void rp_tex_release(tex_t* t);
 // The CPU filled the storage of t (WriteTexels, packaged data at Initialize): upload from guest memory before the next use.
 void rp_tex_cpu_written(const tex_t* t);
+// TextureInitialize done (the game's thread): content the texture already has may be read ahead of its first use.
+void rp_tex_prefetch(const tex_t* t);
+// MemoryPoolFinalize of a pool with storage: prefetches stop reading it (before the game can free it).
+void rp_prefetch_drop(const uint8_t* mem, uint64_t size);
 // Whether the renderer's copy of the texture is GPU content (render target / shader-writable): never re-uploaded from guest memory.
 int rp_tex_gpu_owned(uint64_t serial);
 // ReadTexels: starting at (level, layer0) of t, write the region r into host memory dst with row / img byte strides
@@ -190,6 +194,9 @@ uint64_t sparse_gen();                                 // bumped per mapping req
 bool sparse_alias(u64 lo, u64 hi);                     // [lo, hi) overlaps a sparse pool's range
 uint64_t sparse_copy(const pool_t* pool, void* dst, u64 gpu, u64 n);   // bytes of a texture in a sparse pool, unmapped pages as 0; returns the unmapped bytes
 bool sparse_mapped(const pool_t* pool, u64 gpu, u64 n);              // every page of the range has memory behind it
+// sparse_copy's pages: the host address of each 4 KB page of [gpu, gpu+n) (gpu page aligned; nullptr: unmapped), to read
+// them later without the page table's lock (guest memory stays put); returns the unmapped bytes.
+uint64_t sparse_pages(const pool_t* pool, u64 gpu, u64 n, const void** pages);
 // The physical memory (guest address) behind [gpu, gpu+n) when it is one contiguous run, else 0.
 u64 sparse_phys(const pool_t* pool, u64 gpu, u64 n);
 void sparse_alias_report();   // HOST_NVN_ALIAS_STATS=1: mapped vs distinct physical memory per sparse pool

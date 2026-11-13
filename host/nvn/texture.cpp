@@ -79,6 +79,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture* t, const NVNtextureBuilder* b)
     }
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void*)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, (unsigned long long)o->L.size);
+    rp_tex_prefetch(o);
     return 1;
 }
 NVN(nvnTextureFinalize, void, NVNtexture* t) { rp_tex_release(TX(t)); TX(t)->magic = 0; }

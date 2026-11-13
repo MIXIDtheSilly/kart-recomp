@@ -251,6 +251,20 @@ uint64_t sparse_copy(const pool_t* pool, void* dst, u64 gpu, u64 n) {
     }
     return miss;
 }
+uint64_t sparse_pages(const pool_t* pool, u64 gpu, u64 n, const void** pages) {
+    std::scoped_lock lk{g_vp_mu};
+    vpool* v = pool ? pool->vp : nullptr;
+    const u64 np = (n + 0xFFF) >> 12;
+    const bool in = v && gpu >= v->base && gpu < v->base + v->size;
+    uint64_t miss = 0;
+    for (u64 i = 0; i < np; i++) {
+        const u64 at = gpu - (in ? v->base : 0) + (i << 12);
+        const vpte* e = in && at < v->pool->size ? vpt_get(v, at) : nullptr;
+        pages[i] = e && e->phys ? hp(e->phys) : nullptr;
+        if (!pages[i]) miss += std::min<u64>(0x1000, n - (i << 12));
+    }
+    return miss;
+}
 bool sparse_mapped(const pool_t* pool, u64 gpu, u64 n) {   // every page of [gpu, gpu+n) has memory behind it
     std::scoped_lock lk{g_vp_mu};
     vpool* v = pool ? pool->vp : nullptr;
@@ -387,6 +401,7 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool* p) {
     rp_alias_drop_pool(o); o->magic = 0;
     if ((o->flags & 0x200) && o->vp) vpool_release(o);
     if (o->mem && !(o->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
+        rp_prefetch_drop(o->mem, o->size);
         rp_pool_del(ga(o->mem)); flushed_drop(ga(o->mem), o->size);
     }
 }

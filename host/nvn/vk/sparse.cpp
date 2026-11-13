@@ -51,6 +51,7 @@ struct SparseImage {
     u64 block = 0;                          // bytes of a sparse block
     u32 memtypes = 0;
     u64 bound = 0, uploads = 0, unbinds = 0, ms_total = 0, last_log = 0;
+    u64 ns_read = 0, ns_bind = 0, ns_conv = 0, ns_stage = 0;  // the tile work's parts
     std::once_flag zero_once;
     std::vector<u8> zero_out;  // an all-zero tile converted
     // Moved out to host memory while not used (sparse_tick): the bound tiles' texels copied to buf, then (once the copy
@@ -247,44 +248,76 @@ void restore(SparseImage* s, VkCommandBuffer pre) {
     evict_drop(s);
 }
 
-// One upload: texels of one level and layer, from NVN storage (as `desc` level `dlevel` at `base`) to the image's format.
+// One upload: texels of one level and layer, from NVN storage (as `desc` level `dlevel`) to the image's format, written
+// straight into the upload buffer at r.bufferOffset.
 struct Job {
     const nvn_texdesc* desc;
     u32 dlevel, fw, fh;  // the source level and its size in texels
-    std::shared_ptr<std::vector<u8>> src;
+    std::shared_ptr<std::vector<u8>> src;   // the storage, read already (a tail; a tile when not page aligned), or:
     u64 src_off;         // of the source's level 0 in src (may be "negative": a tail starts past level 0)
+    const void* pages[Tile64 / 0x1000] = {};   // a tile's guest pages, read on a worker (nullptr: unmapped)
     VkBufferImageCopy r{};
-    std::vector<u8> out;
+    size_t bytes = 0;    // converted
 };
 
-void convert_now(const SparseImage* s, Job& j);
-
-void convert(SparseImage* s, Job& j) {
-    // Unwritten storage (most tiles at first) converts the same every time
-    const bool tile = j.desc == &s->tile_d;
-    const bool zero = tile && std::all_of(j.src->begin(), j.src->end(), [](u8 b) { return b == 0; });
-    if (zero) {
-        std::call_once(s->zero_once, [&] { Job z = j; z.out.clear(); convert_now(s, z); s->zero_out = std::move(z.out); });
-        j.out = s->zero_out;
-        return;
-    }
-    convert_now(s, j);
+// Bytes of a level of fw x fh texels as uploaded (ASTC as BC3 or BC1)
+size_t out_bytes(const SparseImage* s, u32 fw, u32 fh) {
+    if (s->astc) return static_cast<size_t>((fw + 3) / 4) * ((fh + 3) / 4) * (s->bc1 ? 8 : 16);
+    return static_cast<size_t>((fw + s->bw - 1) / s->bw) * ((fh + s->bh - 1) / s->bh) * s->bpb;
 }
 
-void convert_now(const SparseImage* s, Job& j) {
+bool all_zero(const u8* p, size_t n) {
+    u64 acc = 0;
+    for (size_t i = 0; i + 8 <= n; i += 8) {
+        u64 v;
+        std::memcpy(&v, p + i, 8);
+        acc |= v;
+    }
+    return !acc;
+}
+
+// src: the storage (level 0 of j.desc at src - j.src_off); dst: j.bytes
+void convert_now(const SparseImage* s, const Job& j, const u8* src, u8* dst) {
     const u32 bx = (j.fw + s->bw - 1) / s->bw, by = (j.fh + s->bh - 1) / s->bh;
     const size_t pitch = static_cast<size_t>(bx) * s->bpb;
-    std::vector<u8> lin(pitch * by);
-    ::nvn_deswizzle(j.desc, j.dlevel, 0, j.src->data() - j.src_off, lin.data(), pitch);
     if (!s->astc) {
-        j.out = std::move(lin);
+        ::nvn_deswizzle(j.desc, j.dlevel, 0, src - j.src_off, dst, pitch);
         return;
     }
-    std::vector<u8> rgba(static_cast<size_t>(j.fw) * j.fh * 4);
+    thread_local std::vector<u8> lin, rgba;
+    lin.assign(pitch * by, 0);
+    rgba.resize(static_cast<size_t>(j.fw) * j.fh * 4);
+    ::nvn_deswizzle(j.desc, j.dlevel, 0, src - j.src_off, lin.data(), pitch);
     codec::astc_decode(std::span<const u8>(lin), j.fw, j.fh, 1, s->bw, s->bh, std::span<u8>(rgba));
-    j.out.resize(static_cast<size_t>((j.fw + 3) / 4) * ((j.fh + 3) / 4) * (s->bc1 ? 8 : 16));
-    if (s->bc1) codec::bc1_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
-    else codec::bc3_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(j.out));
+    if (s->bc1) codec::bc1_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(dst, j.bytes));
+    else codec::bc3_encode(std::span<const u8>(rgba), j.fw, j.fh, 1, std::span<u8>(dst, j.bytes));
+}
+
+// On a worker: the tile's pages read, then converted into dst
+void convert(SparseImage* s, const Job& j, u8* dst) {
+    if (j.src) return convert_now(s, j, j.src->data(), dst);
+    thread_local std::vector<u8> tile;
+    tile.resize(Tile64);
+    bool zero = true;
+    for (size_t p = 0; p < std::size(j.pages); p++) {
+        u8* d = tile.data() + p * 0x1000;
+        if (!j.pages[p]) {
+            std::memset(d, 0, 0x1000);
+            continue;
+        }
+        std::memcpy(d, j.pages[p], 0x1000);
+        zero = zero && all_zero(d, 0x1000);
+    }
+    // Unwritten storage (most tiles at first) converts the same every time
+    if (zero) {
+        std::call_once(s->zero_once, [&] {
+            s->zero_out.resize(j.bytes);
+            convert_now(s, j, tile.data(), s->zero_out.data());
+        });
+        std::memcpy(dst, s->zero_out.data(), j.bytes);
+        return;
+    }
+    convert_now(s, j, tile.data(), dst);
 }
 
 void set_region(const SparseImage* s, Job& j, u32 level, u32 layer, VkOffset3D o, VkExtent3D e) {
@@ -308,6 +341,10 @@ void log_stats(SparseImage* s, const char* why) {
         static_cast<unsigned long long>(s->img->serial), s->img->width, s->img->height, s->img->layers, s->img->nvn_format, why,
         static_cast<unsigned long long>(s->bound), static_cast<unsigned long long>(s->bound * region_bytes(s, {s->tw, s->th, 1}) >> 20),
         static_cast<unsigned long long>(s->uploads), static_cast<unsigned long long>(s->unbinds), static_cast<unsigned long long>(s->ms_total));
+    LOG("nvk: sparse image %llu: tile work: %llu ms reading guest memory, %llu binding, %llu converting, %llu staging",
+        static_cast<unsigned long long>(s->img->serial), static_cast<unsigned long long>(s->ns_read / 1000000),
+        static_cast<unsigned long long>(s->ns_bind / 1000000), static_cast<unsigned long long>(s->ns_conv / 1000000),
+        static_cast<unsigned long long>(s->ns_stage / 1000000));
 }
 
 }  // namespace
@@ -643,13 +680,25 @@ void sparse_image_use(Image* img, VkCommandBuffer pre) {
             SparseImage::Tile& tile = s->tiles[i];
             tile.dirty = false;
             const TileAt at = tile_at(s, i);
-            auto src = std::make_shared<std::vector<u8>>(Tile64);
             // A stale alias (its physical pages mapped again at another tile since, the terrain caches' way of recycling
             // them) goes as an unmapped tile: the game no longer samples it, and kept it took a tile of memory each, without
             // end (+1 GB in 2 minutes of racing, then device lost). HOST_NVN_KEEP_ALIASES=1 keeps them.
             static const bool keep_aliases = getenv("HOST_NVN_KEEP_ALIASES") != nullptr;
-            if (nvn::sparse_copy(s->pool, src->data(), s->gpu + at.off, Tile64) == Tile64 ||
-                (!keep_aliases && nvn::sparse_stale(s->pool, s->gpu + at.off, Tile64))) {  // unmapped
+            const u64 tr = host_ns();
+            Job j{&s->tile_d, 0, s->tw, s->th, nullptr, 0};
+            const u64 ga = s->gpu + at.off;
+            u64 miss;
+            if (ga & 0xFFF) {
+                j.src = std::make_shared<std::vector<u8>>(Tile64);
+                miss = nvn::sparse_copy(s->pool, j.src->data(), ga, Tile64);
+            } else {
+                miss = nvn::sparse_pages(s->pool, ga, Tile64, j.pages);
+            }
+            const bool gone = miss == Tile64 ||
+                (!keep_aliases && nvn::sparse_stale(s->pool, s->gpu + at.off, Tile64));  // unmapped
+            const u64 tb = host_ns();
+            s->ns_read += tb - tr;
+            if (gone) {
                 if (tile.mem) {
                     unbind_region(s, at.level, at.layer, at.o, at.e);
                     const VmaAllocation a = tile.mem;
@@ -668,35 +717,39 @@ void sparse_image_use(Image* img, VkCommandBuffer pre) {
                 }
                 s->bound++;
             }
-            Job j{&s->tile_d, 0, s->tw, s->th, src, 0};
+            s->ns_bind += host_ns() - tb;
             set_region(s, j, at.level, at.layer, at.o, at.e);
             jobs.push_back(std::move(j));
         }
         if (!jobs.empty()) {
-            par_for_each(jobs.begin(), jobs.end(), [s](Job& j) { convert(s, j); });
+            const u64 ts = host_ns();
             size_t total = 0;
-            for (Job& j : jobs) j.r.bufferOffset = total, total += (j.out.size() + 15) & ~size_t{15};
+            for (Job& j : jobs) j.bytes = out_bytes(s, j.fw, j.fh), j.r.bufferOffset = total, total += (j.bytes + 15) & ~size_t{15};
             Device& c = ctx();
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bci.size = total;
             bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             VmaAllocationCreateInfo ai{};
             ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-            ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            // (random: the converters write it in their own order, which write-combined memory takes badly)
+            ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
             VkBuffer buf;
             VmaAllocation alloc;
             VmaAllocationInfo info;
             if (vmaCreateBuffer(c.vma, &bci, &ai, &buf, &alloc, &info) == VK_SUCCESS) {
+                u8* const base = static_cast<u8*>(info.pMappedData);
+                const u64 tc = host_ns();
+                par_for_each(jobs.begin(), jobs.end(), [s, base](Job& j) { convert(s, j, base + j.r.bufferOffset); });
+                const u64 te = host_ns();
+                s->ns_conv += te - tc, s->ns_stage -= te - tc;
                 std::vector<VkBufferImageCopy> regions;
-                for (Job& j : jobs) {
-                    std::memcpy(static_cast<u8*>(info.pMappedData) + j.r.bufferOffset, j.out.data(), j.out.size());
-                    regions.push_back(j.r);
-                }
+                for (Job& j : jobs) regions.push_back(j.r);
                 vmaFlushAllocation(c.vma, alloc, 0, VK_WHOLE_SIZE);
                 vkCmdCopyBufferToImage(pre, buf, img->image, VK_IMAGE_LAYOUT_GENERAL, static_cast<u32>(regions.size()), regions.data());
                 defer([buf, alloc] { vmaDestroyBuffer(ctx().vma, buf, alloc); });
                 s->uploads += jobs.size();
             }
+            s->ns_stage += host_ns() - ts;
         }
     }
     s->ms_total += (host_ns() - t0) / 1000000;

@@ -16,6 +16,7 @@
 #include <random>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -267,12 +268,29 @@ bool record(Image* img, const Prepared& p, VkCommandBuffer cb) {
 
 }  // namespace
 
+// (prefetches: below)
+namespace {
+bool prefetchable(const nvn::tex_t* t);
+Geom geom_of_tex(const nvn::tex_t* t);
+u64 cache_key(const Geom& g, const nvn_texdesc& d, const u8* src, size_t n);
+std::shared_ptr<const Prepared> pre_take(u64 key);
+void note_pre_bc();
+}  // namespace
+
 bool upload_from_storage(Image* img, const nvn::tex_t* t, VkCommandBuffer cb) {
     if (!uploadable(img, t->d)) return false;
     HitchTimer ht{HI_UPLOAD};
     std::vector<u8> copy;
     const u8* storage = storage_of(t, copy, false);
     if (!storage) return false;
+    if (prefetchable(t)) {
+        const Geom g = geom_of(img), gt = geom_of_tex(t);
+        if (std::memcmp(&g, &gt, sizeof g) == 0)
+            if (auto pf = pre_take(cache_key(g, t->d, storage, t->L.size))) {
+                note_pre_bc();
+                return record(img, *pf, cb);
+            }
+    }
     Prepared p;
     if (!prepare(geom_of(img), t->d, storage, t->L.size, p)) return false;
     return record(img, p, cb);
@@ -324,8 +342,8 @@ u64 cache_max() {
     return mb << 20;
 }
 
-u64 cache_key(const Geom& g, const nvn_texdesc& d, const std::vector<u8>& src) {
-    u64 h = CityHash64(reinterpret_cast<const char*>(src.data()), src.size());
+u64 cache_key(const Geom& g, const nvn_texdesc& d, const u8* src, size_t n) {
+    u64 h = CityHash64(reinterpret_cast<const char*>(src), n);
     for (const u64 v : {static_cast<u64>(g.type), static_cast<u64>(g.width), static_cast<u64>(g.height), static_cast<u64>(g.depth),
                         static_cast<u64>(g.layers), static_cast<u64>(g.levels), static_cast<u64>(d.format), static_cast<u64>(d.flags),
                         static_cast<u64>(d.target), static_cast<u64>(d.stride)})
@@ -355,6 +373,85 @@ void cache_put(u64 key, std::shared_ptr<const Prepared> p) {
         g_cache.erase(it);
         g_lru.pop_back();
     }
+}
+
+// Prefetches (upload_prefetch): when the game creates a big ASTC texture, a worker reads its prepared upload from the
+// disk cache then, not at its first use. The game streams a texture in and copies it into a terrain cache straight away,
+// and the renderer stood still for the read (the "ASTC waits" of a hitch). Kept here by cache_key until that use takes
+// it, the oldest dropped past HOST_NVN_PREFETCH_MB (default 512). Storage not written yet at creation hashes to another
+// key: nothing found, nothing used.
+// Which textures are prefetched: ASTC ones (from the disk cache) and block-compressed ones of 1 MB or more (untiled; the
+// big BC6H ones took 35-60 ms on the renderer thread). Not in sparse pools.
+bool prefetchable(const nvn::tex_t* t) {
+    if (!t->mem || !t->pool || !t->pool->mem || nvn::sparse_pool(t->pool)) return false;
+    if (t->off < 0 || static_cast<u64>(t->off) > t->pool->size || t->L.size > t->pool->size - static_cast<u64>(t->off)) return false;
+    const nvn_texdesc& d = t->d;
+    if (d.target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || d.target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY ||
+        d.target == NVN_TEXTURE_TARGET_BUFFER || (d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)))
+        return false;
+    const Format& f = format(static_cast<u32>(d.format));
+    if (f.kind == FmtKind::Astc) return true;
+    return f.block_w > 1 && !f.depth && !f.stencil && t->L.size >= (1u << 20);
+}
+
+// The geometry image_of gives t (the cache key has it)
+Geom geom_of_tex(const nvn::tex_t* t) {
+    const nvn_texdesc& d = t->d;
+    Geom g{VK_IMAGE_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, std::max(d.width, 1u), std::max(d.height, 1u), 1, std::max(t->L.layers, 1u),
+           std::max(d.levels, 1u)};
+    if (d.target == NVN_TEXTURE_TARGET_1D || d.target == NVN_TEXTURE_TARGET_1D_ARRAY) g.type = VK_IMAGE_TYPE_1D, g.height = 1;
+    if (d.target == NVN_TEXTURE_TARGET_3D) g.type = VK_IMAGE_TYPE_3D, g.depth = std::max(d.depth, 1u), g.layers = 1;
+    return g;
+}
+
+struct Prefetch {
+    Geom g;
+    nvn_texdesc d;
+    const u8* mem;   // the storage, read where it is (guest memory stays mapped)
+    u64 size;
+};
+std::deque<Prefetch> g_pre;   // to do (under g_q_mu): after the uploads asked for
+constexpr u32 PreAtOnce = 2;   // prefetches running at once: the other workers stay free for uploads asked for
+u32 g_pre_running = 0;         // (under g_q_mu)
+std::vector<const u8*> g_pre_reading;   // storage the workers are reading now (under g_q_mu; upload_prefetch_drop waits for it)
+std::unordered_map<u64, std::shared_ptr<const Prepared>> g_pre_done;   // under g_c_mu
+std::deque<u64> g_pre_order;
+u64 g_pre_bytes = 0;
+u64 g_n_pre = 0, g_n_pre_disk = 0, g_n_pre_used = 0;   // statistics (under g_q_mu): looked up, found on disk, taken by a use
+std::atomic<u64> g_n_pre_bc{0};   // BC uploads taken from a prefetch
+void note_pre_bc() { g_n_pre_bc++; }
+
+u64 pre_max() {
+    static const u64 mb = [] {
+        const char* e = getenv("HOST_NVN_PREFETCH_MB");
+        return e ? std::strtoull(e, nullptr, 10) : 512ull;
+    }();
+    return mb << 20;
+}
+
+void pre_put(u64 key, std::shared_ptr<const Prepared> p) {
+    std::scoped_lock lk{g_c_mu};
+    if (g_pre_done.count(key)) return;
+    g_pre_bytes += p->staging.size();
+    g_pre_done.emplace(key, std::move(p));
+    g_pre_order.push_back(key);
+    while (g_pre_bytes > pre_max() && !g_pre_order.empty()) {
+        if (auto it = g_pre_done.find(g_pre_order.front()); it != g_pre_done.end()) {
+            g_pre_bytes -= it->second->staging.size();
+            g_pre_done.erase(it);
+        }
+        g_pre_order.pop_front();
+    }
+}
+
+std::shared_ptr<const Prepared> pre_take(u64 key) {
+    std::scoped_lock lk{g_c_mu};
+    auto it = g_pre_done.find(key);
+    if (it == g_pre_done.end()) return nullptr;
+    std::shared_ptr<const Prepared> p = std::move(it->second);
+    g_pre_bytes -= p->staging.size();
+    g_pre_done.erase(it);
+    return p;
 }
 
 // Prepared uploads on disk, by content key (content_key), so an ASTC texture is decoded once and not again in later runs:
@@ -418,8 +515,9 @@ std::string disk_file(u64 key) {
     return disk_dir() + b;
 }
 
-// The prepared upload of key from the folder; *old: it is in the one-block format (to be written again).
-bool disk_get(u64 key, Prepared& out, bool* old) {
+// The prepared upload of key from the folder; *old: it is in the one-block format (to be written again). parallel: its
+// pieces unpacked on the shared thread pool (not for prefetches: they would hold up the renderer's own parallel work).
+bool disk_get(u64 key, Prepared& out, bool* old, bool parallel = true) {
     if (disk_dir().empty()) return false;
     // The whole file in one read, by the Win32 calls (not the C runtime's streams)
     const u64 t0 = host_ns();
@@ -479,7 +577,8 @@ bool disk_get(u64 key, Prepared& out, bool* old) {
                                         static_cast<int>(sizes[i]), static_cast<int>(n)) != static_cast<int>(n))
                     good.store(false);
             };
-            if (sizes.size() == 1) {
+            if (sizes.size() == 1 || !parallel) {
+                for (size_t i = 1; i < sizes.size(); i++) unpack(i);
                 unpack(0);   // (not through the shared thread pool for one piece)
             } else {
                 std::vector<size_t> idx(sizes.size());
@@ -570,6 +669,40 @@ void disk_put(u64 key, std::shared_ptr<const Prepared> p) {
     g_disk_cv.notify_one();
 }
 
+// (the worker put f.mem in g_pre_reading: taken out once the storage is read)
+void prefetch(const Prefetch& f) {
+    const auto read = [&] {
+        {
+            std::scoped_lock lk{g_q_mu};
+            g_pre_reading.erase(std::find(g_pre_reading.begin(), g_pre_reading.end(), f.mem));
+        }
+        g_done_cv.notify_all();
+    };
+    const u64 key = cache_key(f.g, f.d, f.mem, f.size);
+    bool have;
+    {
+        std::scoped_lock lk{g_c_mu};
+        have = g_cache.count(key) || g_pre_done.count(key);
+    }
+    Untiled u;
+    const bool ok = !have && untile(f.g, f.d, f.mem, f.size, u);
+    read();
+    if (!ok) return;
+    auto p = std::make_shared<Prepared>();
+    if (format(static_cast<u32>(f.d.format)).kind != FmtKind::Astc) {   // (BC: untiled is all there is to it)
+        convert(f.g, f.d, u, *p);
+        pre_put(key, std::move(p));
+        return;
+    }
+    bool old = false;
+    const bool hit = disk_get(content_key(f.g, f.d, u), *p, &old, false);
+    {
+        std::scoped_lock lk{g_q_mu};
+        g_n_pre++, g_n_pre_disk += hit;
+    }
+    if (hit) pre_put(key, std::move(p));
+}
+
 void run(AsyncUpload& j) {
     if (!j.cancel.load()) {
         const u64 t0 = host_ns();
@@ -612,11 +745,28 @@ void run(AsyncUpload& j) {
 void worker() {
     for (;;) {
         std::shared_ptr<AsyncUpload> j;
+        Prefetch f{};
         {
             std::unique_lock lk{g_q_mu};
-            g_q_cv.wait(lk, [] { return !g_q.empty(); });
-            j = std::move(g_q.front());
-            g_q.pop_front();
+            g_q_cv.wait(lk, [] { return !g_q.empty() || (!g_pre.empty() && g_pre_running < PreAtOnce); });
+            if (!g_q.empty()) {
+                j = std::move(g_q.front());
+                g_q.pop_front();
+            } else {
+                f = g_pre.front();
+                g_pre.pop_front();
+                g_pre_reading.push_back(f.mem);
+                g_pre_running++;
+            }
+        }
+        if (!j) {
+            prefetch(f);
+            {
+                std::scoped_lock lk{g_q_mu};
+                g_pre_running--;
+            }
+            g_q_cv.notify_one();
+            continue;
         }
         int queued = 0;
         if (j->state.compare_exchange_strong(queued, 1)) run(*j);
@@ -629,18 +779,45 @@ void log_stats() {
     if (now - g_stats_at < 10'000'000'000ull) return;
     if (g_stats_at)
         LOG("nvk: uploads on the worker: %llu done (%llu ms of work, %llu ms average from asked to done, worst %llu ms), %llu waited for, "
-            "%zu queued, %llu drawn before ready; %llu from the cache (%llu MB in it), %llu from disk (%llu ms), %llu written",
+            "%zu queued, %llu drawn before ready; %llu from the cache (%llu MB in it), %llu from disk (%llu ms), %llu written; "
+            "prefetched %llu (%llu found on disk), %llu used (and %llu BC uploads)",
             static_cast<unsigned long long>(g_n_done), static_cast<unsigned long long>(g_ms_work),
             static_cast<unsigned long long>(g_n_done ? g_ms_wait / g_n_done : 0), static_cast<unsigned long long>(g_worst_wait),
             static_cast<unsigned long long>(g_n_sync), g_q.size(), static_cast<unsigned long long>(g_n_missed), static_cast<unsigned long long>(g_n_hit),
             static_cast<unsigned long long>(g_cache_bytes >> 20), static_cast<unsigned long long>(g_n_disk),
-            static_cast<unsigned long long>(g_ms_disk), static_cast<unsigned long long>(g_n_disk_put));
+            static_cast<unsigned long long>(g_ms_disk), static_cast<unsigned long long>(g_n_disk_put), static_cast<unsigned long long>(g_n_pre),
+            static_cast<unsigned long long>(g_n_pre_disk), static_cast<unsigned long long>(g_n_pre_used),
+            static_cast<unsigned long long>(g_n_pre_bc.exchange(0)));
     if (g_stats_at && g_n_sync)
         LOG("nvk: uploads waited for: %llu ms in all (%llu prepared on the renderer thread), longest %llu ms: %s",
             static_cast<unsigned long long>(g_ms_sync), static_cast<unsigned long long>(g_n_sync_here),
             static_cast<unsigned long long>(g_sync_worst_ms), g_sync_worst);
     g_stats_at = now, g_n_done = g_ms_work = g_ms_wait = g_n_sync = g_worst_wait = g_n_hit = 0;
     g_ms_sync = g_n_sync_here = g_sync_worst_ms = g_n_missed = g_n_disk = g_ms_disk = g_n_disk_put = 0;
+    g_n_pre = g_n_pre_disk = g_n_pre_used = 0;
+}
+
+// (g_q_mu held)
+void start_workers() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    // A few threads (HOST_NVN_UPLOAD_WORKERS, default 4): an upload from the disk cache (untile, hash, read,
+    // unpack) runs on one thread only, and the game streams hundreds at once in free roam; with one worker they
+    // queued for 250 ms on average (1 s worst) and the renderer stood still for the ones a copy needed. A
+    // decode (cache miss) still spreads over the transcode threads (codec::parallel_for).
+    const char* e = getenv("HOST_NVN_UPLOAD_WORKERS");
+    const int n = std::clamp(e ? std::atoi(e) : 4, 1, 16);
+    // At normal priority: below it, a worker waited ~30 ms (two scheduler ticks) for a CPU after each file read
+    // while the game's threads ran, and the renderer often waits for the upload a worker has
+    // (HOST_NVN_UPLOAD_PRIORITY=<Windows thread priority>, e.g. -1 for below normal).
+    const char* pe = getenv("HOST_NVN_UPLOAD_PRIORITY");
+    const int prio = pe ? std::atoi(pe) : THREAD_PRIORITY_NORMAL;
+    for (int i = 0; i < n; i++)
+        std::thread([prio] {
+            SetThreadPriority(GetCurrentThread(), prio);
+            worker();
+        }).detach();
 }
 
 }  // namespace
@@ -657,7 +834,7 @@ bool upload_async_start(Image* img, const nvn::tex_t* t) {
     j->queued = host_ns();
     img->pending = j;
     if (cache_max() || !disk_dir().empty()) {
-        j->key = cache_key(j->g, j->d, j->src);
+        j->key = cache_key(j->g, j->d, j->src.data(), j->src.size());
         if (cache_max() && (j->out = cache_get(j->key))) {
             j->ok = true;
             j->state.store(2);
@@ -667,29 +844,21 @@ bool upload_async_start(Image* img, const nvn::tex_t* t) {
             log_stats();
             return true;
         }
+        if (auto p = pre_take(j->key)) {
+            j->out = p;
+            j->ok = true;
+            j->state.store(2);
+            std::vector<u8>().swap(j->src);
+            if (cache_max()) cache_put(j->key, std::move(p));
+            std::scoped_lock lk{g_q_mu};
+            g_n_pre_used++;
+            log_stats();
+            return true;
+        }
     }
     {
         std::scoped_lock lk{g_q_mu};
-        static bool started = false;
-        if (!started) {
-            started = true;
-            // A few threads (HOST_NVN_UPLOAD_WORKERS, default 4): an upload from the disk cache (untile, hash, read,
-            // unpack) runs on one thread only, and the game streams hundreds at once in free roam; with one worker they
-            // queued for 250 ms on average (1 s worst) and the renderer stood still for the ones a copy needed. A
-            // decode (cache miss) still spreads over the transcode threads (codec::parallel_for).
-            const char* e = getenv("HOST_NVN_UPLOAD_WORKERS");
-            const int n = std::clamp(e ? std::atoi(e) : 4, 1, 16);
-            // At normal priority: below it, a worker waited ~30 ms (two scheduler ticks) for a CPU after each file read
-            // while the game's threads ran, and the renderer often waits for the upload a worker has
-            // (HOST_NVN_UPLOAD_PRIORITY=<Windows thread priority>, e.g. -1 for below normal).
-            const char* pe = getenv("HOST_NVN_UPLOAD_PRIORITY");
-            const int prio = pe ? std::atoi(pe) : THREAD_PRIORITY_NORMAL;
-            for (int i = 0; i < n; i++)
-                std::thread([prio] {
-                    SetThreadPriority(GetCurrentThread(), prio);
-                    worker();
-                }).detach();
-        }
+        start_workers();
         g_q.push_back(std::move(j));
         log_stats();
     }
@@ -769,6 +938,26 @@ bool upload_async_poll(Image* img, VkCommandBuffer cb, bool wait) {
     img->pending.reset();
     if (j->ok && j->out && !img->gpu_written) record(img, *j->out, cb);
     return true;
+}
+
+void upload_prefetch(const nvn::tex_t* t) {
+    static const bool off = getenv("HOST_NVN_NO_PREFETCH") != nullptr || getenv("HOST_NVN_SYNC_UPLOADS") != nullptr;
+    if (off || !prefetchable(t)) return;
+    if (format(static_cast<u32>(t->d.format)).kind == FmtKind::Astc && disk_dir().empty()) return;
+    {
+        std::scoped_lock lk{g_q_mu};
+        if (g_pre.size() >= 2048) return;
+        start_workers();
+        g_pre.push_back({geom_of_tex(t), t->d, t->mem, t->L.size});
+    }
+    g_q_cv.notify_one();
+}
+
+void upload_prefetch_drop(const u8* mem, u64 size) {
+    std::unique_lock lk{g_q_mu};
+    const auto in = [&](const u8* p) { return p >= mem && p < mem + size; };
+    g_pre.erase(std::remove_if(g_pre.begin(), g_pre.end(), [&](const Prefetch& f) { return in(f.mem); }), g_pre.end());
+    g_done_cv.wait(lk, [&] { return std::none_of(g_pre_reading.begin(), g_pre_reading.end(), in); });
 }
 
 void upload_async_cancel(Image* img) {

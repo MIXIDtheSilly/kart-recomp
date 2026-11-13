@@ -29,6 +29,7 @@
 
 #include "../nvn_int.h"
 #include "hitch.h"
+#include "upload.h"
 #include "vkq.h"
 
 namespace nvk {
@@ -269,6 +270,8 @@ void rp_reg_samp(int id, const samp_par* p) {
 void rp_tex_init(const tex_t* t) { post([ta = TexArg(t)]() mutable { vk_rp_tex_init(ta.get()); }); }
 void rp_tex_release(tex_t* t) { post([ta = TexArg(t)]() mutable { vk_rp_tex_release(ta.get()); }); }
 void rp_tex_cpu_written(const tex_t* t) { post([ta = TexArg(t)]() mutable { vk_rp_tex_cpu_written(ta.get()); }); }
+void rp_tex_prefetch(const tex_t* t) { nvk::upload_prefetch(t); }
+void rp_prefetch_drop(const uint8_t* mem, uint64_t size) { nvk::upload_prefetch_drop(mem, size); }   // (not through the queue: it only queues work for the upload workers)
 int rp_tex_gpu_owned(uint64_t serial) { return call([serial] { return vk_rp_tex_gpu_owned(serial); }); }
 void rp_read_texels(const tex_t* t, unsigned level, unsigned layer0, const NVNcopyRegion* r, uint8_t* dst, size_t row, size_t img) {
     call([&] { vk_rp_read_texels(t, level, layer0, r, dst, row, img); });

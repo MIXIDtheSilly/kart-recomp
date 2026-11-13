@@ -62,6 +62,8 @@ void rp_reg_samp(int, const samp_par*) {}
 void rp_tex_init(const tex_t*) {}
 void rp_tex_release(tex_t*) {}
 void rp_tex_cpu_written(const tex_t*) {}
+void rp_tex_prefetch(const tex_t*) {}
+void rp_prefetch_drop(const uint8_t*, uint64_t) {}
 int rp_tex_gpu_owned(uint64_t) { return 0; }
 void rp_read_texels(const tex_t* t, unsigned, unsigned, const NVNcopyRegion* r, uint8_t* dst, size_t row, size_t img) {
     // A GPU-written texture reads as zeros here

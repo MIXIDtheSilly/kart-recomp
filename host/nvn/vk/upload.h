@@ -18,6 +18,11 @@ bool upload_async_start(Image* img, const nvn::tex_t* t);
 // (after a short wait for it, within what the frame may spend: HOST_NVN_UPLOAD_WAIT_MS).
 // `wait`: prepare it now (in this thread when the worker has not started it) and record it.
 bool upload_async_poll(Image* img, VkCommandBuffer cb, bool wait);
+// The game created t (any thread): a big ASTC texture's prepared upload read from the disk cache now on a worker, for
+// its first use to take (HOST_NVN_NO_PREFETCH=1: not).
+void upload_prefetch(const nvn::tex_t* t);
+// A memory pool goes (its storage may be freed next): no prefetch reads it any more once this returns.
+void upload_prefetch_drop(const u8* mem, u64 size);
 // img's pending upload is not wanted any more (its storage changed again, or img goes).
 void upload_async_cancel(Image* img);
 
