@@ -1,13 +1,19 @@
-// par_for_each: std::for_each(std::execution::par, ...) on the Windows thread pool, which is where MSVC's standard
-// library runs it. libc++ (the llvm-mingw build) has no parallel algorithms.
+// par_for_each: std::for_each(std::execution::par, ...). MSVC builds use exactly that; libc++ (the llvm-mingw build)
+// has no parallel algorithms, so there it runs on the Windows thread pool, which is where MSVC's runs it too.
 #pragma once
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#ifdef _MSC_VER
+#include <execution>
+#endif
 
 template <class It, class F> void par_for_each(It first, It last, F f) {
+#ifdef _MSC_VER
+    std::for_each(std::execution::par, first, last, f);
+#else
     const size_t n = static_cast<size_t>(last - first);
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -42,4 +48,5 @@ template <class It, class F> void par_for_each(It first, It last, F f) {
     s.work();
     WaitForSingleObject(s.done, INFINITE);
     CloseHandle(s.done);
+#endif
 }
