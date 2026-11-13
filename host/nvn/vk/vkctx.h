@@ -62,6 +62,10 @@ void device_budget(u64& used, u64& budget, u64* spare = nullptr);
 // device-local heap is the small carve-out and system memory is as fast).
 VkMemoryPropertyFlags gpu_only_flags();
 
+// The device is lost (vk_fail, before anything else): the pipeline cache is not saved any more and is moved aside, so the
+// next start builds it again (draw.cpp).
+void draw_device_lost();
+
 // Creates the instance and device (once). Logs the GPU and the features found.
 void init();
 // The draw a checkpoint marker stands for (draw.cpp).

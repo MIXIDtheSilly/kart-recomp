@@ -647,6 +647,13 @@ std::unordered_map<u64, VkPipeline> g_pipelines;
 VkPipelineCache g_pcache = VK_NULL_HANDLE;
 std::string g_pcache_path;
 u64 g_pcache_saved_at = 0;
+// The cache file as saved: the driver's data, then this trailer (a torn or foreign file is not handed to the driver).
+struct PcacheTrailer {
+    u64 magic, hash;   // PcacheMagic, CityHash64 of the data before it
+};
+constexpr u64 PcacheMagic = 0x3168736168434b50ull;   // "PKChash1"
+std::mutex g_pcache_file_mu;            // the file's write and rename, and draw_device_lost's move aside
+std::atomic<bool> g_device_lost{false};
 
 VkShaderStageFlags push_stages();
 
@@ -674,6 +681,7 @@ void save_pcache_now();
 
 // On a thread of its own (the cache is ~100 MB: writing it took 5% of the submitting thread); one save at a time.
 std::atomic<bool> g_pcache_busy{false};
+bool g_pcache_fresh = false;   // the cache starts empty (none, or not used): saved once the warm-up has filled it
 void save_pcache() {
     if (!g_pcache || g_pcache_path.empty()) return;
     if (g_pcache_busy.exchange(true)) return;
@@ -686,22 +694,48 @@ void save_pcache() {
 void save_descs();
 
 void save_pcache_now() {
+    // Not from a lost device: what it hands back may be broken, and a broken cache loses the device again at the first
+    // draw of a pipeline from it, start after start ("instruction pointer invalid"). fatal() waits on its message box
+    // while the warm-up and the periodic saves go on.
+    if (g_device_lost) return;
     save_descs();
     size_t n = 0;
     vkGetPipelineCacheData(ctx().dev, g_pcache, &n, nullptr);
-    std::vector<char> data(n);
-    if (vkGetPipelineCacheData(ctx().dev, g_pcache, &n, data.data()) != VK_SUCCESS) return;
+    std::vector<char> data(n + sizeof(PcacheTrailer));
+    if (vkGetPipelineCacheData(ctx().dev, g_pcache, &n, data.data()) != VK_SUCCESS || g_device_lost) return;
+    const PcacheTrailer tr{PcacheMagic, CityHash64(data.data(), n)};
+    std::memcpy(data.data() + n, &tr, sizeof tr);
     // Written beside it and renamed over it: the game may be killed while this runs, and a torn cache gives the driver
     // broken shader binaries (device loss at the first draw of a pipeline from it)
     const std::string tmp = g_pcache_path + ".tmp";
+    std::scoped_lock lk{g_pcache_file_mu};
+    std::error_code ec;
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f.write(data.data(), static_cast<std::streamsize>(n));
-        if (!f.good()) return;
+        f.write(data.data(), static_cast<std::streamsize>(n + sizeof tr));
+        if (!f.good() || g_device_lost) {
+            f.close();
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
     }
-    std::error_code ec;
     std::filesystem::rename(tmp, g_pcache_path, ec);
 }
+
+}  // namespace
+
+void draw_device_lost() {
+    if (g_device_lost.exchange(true) || g_pcache_path.empty()) return;
+    std::scoped_lock lk{g_pcache_file_mu};   // (after a save already writing: it sees the flag and drops its file)
+    std::error_code ec;
+    if (!std::filesystem::exists(g_pcache_path, ec)) return;
+    std::filesystem::rename(g_pcache_path, g_pcache_path + ".lost", ec);
+    std::filesystem::remove(g_pcache_path + ".primed", ec);   // (made ahead again into the new cache)
+    LOG("[RED] nvk: pipeline cache moved aside to %s.lost (%s): the next start builds it again", g_pcache_path.c_str(),
+        ec ? ec.message().c_str() : "ok");
+}
+
+namespace {
 
 // A pipeline as made: all it is made from (the rest is dynamic state). Every one made goes into <pipeline cache>.keys,
 // and the next start makes them again on threads of its own (warm_up), before the game draws with them.
@@ -1092,7 +1126,7 @@ void warm_up(std::vector<PipeDesc> list) {
         LOG("nvk: pipeline warm-up: %zu pipelines in the list, done in %llu ms on %u threads (%zu not used yet)", list.size(),
             static_cast<unsigned long long>((host_ns() - t0) / 1'000'000), n, made);
         // Long only when the driver had to compile them (a new driver, or the layouts changed): keep what it made
-        if (host_ns() - t0 > 10'000'000'000ull) save_pcache();
+        if (g_pcache_fresh || host_ns() - t0 > 10'000'000'000ull) save_pcache();
         prime(list);
     }).detach();
 }
@@ -3145,6 +3179,34 @@ void draw_init() {
     {
         std::ifstream f(g_pcache_path, std::ios::binary);
         if (f) data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    if (!data.empty()) {
+        // Only a whole cache made by this GPU and driver: the trailer's hash (no torn or older file), then the Vulkan
+        // header (the driver checks it too, but not every driver well).
+        const char* why = nullptr;
+        PcacheTrailer tr{};
+        if (data.size() < 32 + sizeof tr) why = "too short";
+        else {
+            std::memcpy(&tr, data.data() + data.size() - sizeof tr, sizeof tr);
+            data.resize(data.size() - sizeof tr);
+            u32 hdr[4];
+            std::memcpy(hdr, data.data(), sizeof hdr);
+            if (tr.magic != PcacheMagic) why = "from an older build, or not whole";
+            else if (tr.hash != CityHash64(data.data(), data.size())) why = "damaged";
+            else if (hdr[0] < 32 || hdr[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || hdr[2] != c.props.vendorID ||
+                     hdr[3] != c.props.deviceID || std::memcmp(data.data() + 16, c.props.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+                why = "from another GPU or driver";
+        }
+        if (why) {
+            LOG("nvk: pipeline cache %s not used (%s): building it again", g_pcache_path.c_str(), why);
+            data.clear();
+        }
+    }
+    if (data.empty()) {
+        // (the list of pipelines made ahead of time in earlier starts is of the cache gone: made again into this one)
+        g_pcache_fresh = true;
+        std::error_code ec;
+        std::filesystem::remove(g_pcache_path + ".primed", ec);
     }
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     pci.initialDataSize = data.size();

@@ -50,6 +50,7 @@ namespace nvk {
 
 void vk_fail(VkResult r, const char* what) {
     Device& c = ctx();
+    if (r == VK_ERROR_DEVICE_LOST) draw_device_lost();
     if (r == VK_ERROR_DEVICE_LOST && c.feat.device_fault && vkGetDeviceFaultInfoEXT) {
         VkDeviceFaultCountsEXT n{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
         if (vkGetDeviceFaultInfoEXT(c.dev, &n, nullptr) == VK_SUCCESS) {
