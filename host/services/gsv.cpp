@@ -289,6 +289,7 @@ struct VideoSession : Service {
     std::map<u32, Fence> release_fences;
     std::deque<Output> outputs;  // finished, for 213
     bool flush = false, quit = false;
+    bool at_end = false;  // the frame marked end of stream is out and no input came since
     std::thread worker, ticker;
 
     VideoSession(std::shared_ptr<NativeObjects> objects_, const char* name)
@@ -372,9 +373,23 @@ struct VideoSession : Service {
             free_images.push_back(image);
             if (release) release_fences[image] = *release;
             value = sync_base + ++handed;
+            release_unfilled();
         }
         cv.notify_all();
         reply(r, {~syncpoint, 0, value, 0});
+    }
+
+    // At the end of the stream (nothing left to decode), the images handed out that no frame will fill: their values
+    // signalled all the same, without an output (213 answers "nothing finished", which the client skips). When the
+    // movie stops, the client drains its ring of handed-out images and aborts on a value not reached
+    // (subsdk0+0x4540 after nn::gs::TryWaitNativeSync: svcBreak after IApplicationFunctions::22); stopping after the
+    // last frame with images still out did that now and then. (m held)
+    void release_unfilled() {
+        if (!at_end || !inputs.empty() || !decoded.empty() || syncpoint == NoSyncpoint) return;
+        for (; !free_images.empty(); free_images.pop_front()) {
+            release_fences.erase(free_images.front());
+            sync::increment(syncpoint);
+        }
     }
 
     // 109(A: one compressed frame, u64 pts in us, u8 end of stream): reply a u64.
@@ -384,6 +399,7 @@ struct VideoSession : Service {
             std::scoped_lock lk{m};
             inputs.push_back(std::move(input));
             room = inputs.size() < MaxQueuedInputs;
+            at_end = false;
         }
         cv.notify_all();
         reply64(r, {++submitted});
@@ -462,6 +478,7 @@ struct VideoSession : Service {
                 last_pts = frame.pts;
                 sync::increment(syncpoint);
                 ++frames_out;
+                if (frame.end) at_end = true, release_unfilled();
                 if (frames_out == 1 || frames_out % 600 == 0 || frame.end)
                     LOG("%s frame %llu (%ux%u, pts %llu us%s) in image %u", name.c_str(), frames_out, w, h,
                         frame.pts, frame.end ? ", end of stream" : "", image);
@@ -492,6 +509,8 @@ struct VideoSession : Service {
                 if (!decoded.empty()) decoded.back().end = true;
                 else if (!outputs.empty()) {
                     outputs.back().end = true;
+                    at_end = true;
+                    release_unfilled();
                     LOG("%s frame %llu marked end of stream (the decoder had nothing left)", name.c_str(), frames_out);
                 } else {
                     decoded.push_back({std::nullopt, input.pts == ~0ull ? last_pts : input.pts, true});
