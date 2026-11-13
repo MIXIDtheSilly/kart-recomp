@@ -648,6 +648,8 @@ VkPipelineCache g_pcache = VK_NULL_HANDLE;
 std::string g_pcache_path;
 u64 g_pcache_saved_at = 0;
 
+VkShaderStageFlags push_stages();
+
 VkPipelineLayout layout_for(const Shader* const* sets, u32 n, bool mesh_push = false) {
     Fnv f;
     f.add(mesh_push);
@@ -659,8 +661,9 @@ VkPipelineLayout layout_for(const Shader* const* sets, u32 n, bool mesh_push = f
     VkPipelineLayoutCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     ci.setLayoutCount = n;
     ci.pSetLayouts = l;
-    const VkPushConstantRange pc{VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, 4};  // first_group (nvn_mesh.py)
-    if (mesh_push) ci.pushConstantRangeCount = 1, ci.pPushConstantRanges = &pc;
+    VkPushConstantRange pc{VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, 4};  // first_group (nvn_mesh.py)
+    if (ssbo_deltas()) pc = {push_stages(), 0, DeltaSize};   // (+ the storage buffer offsets: every layout the same range)
+    if (mesh_push || ssbo_deltas()) ci.pushConstantRangeCount = 1, ci.pPushConstantRanges = &pc;
     VkPipelineLayout pl;
     check(vkCreatePipelineLayout(ctx().dev, &ci, nullptr, &pl), "vkCreatePipelineLayout");
     g_layouts.emplace(f.h, pl);
@@ -792,8 +795,8 @@ VkPipeline make_graphics(const PipeDesc& d, const Shader* ts, const Shader* vs, 
     VkPipeline p = VK_NULL_HANDLE;
     const u64 t0 = host_ns();
     HitchTimer ht{HI_PIPELINE};
-    if (vkCreateGraphicsPipelines(c.dev, g_pcache, 1, &ci, nullptr, &p) != VK_SUCCESS) {
-        LOG("[RED] nvk: graphics pipeline (vs %s, ps %s) could not be created", vs->name, ps ? ps->name : "-");
+    if (const VkResult r = vkCreateGraphicsPipelines(c.dev, g_pcache, 1, &ci, nullptr, &p); r != VK_SUCCESS) {
+        LOG("[RED] nvk: graphics pipeline (vs %s, ps %s) could not be created (VkResult %d)", vs->name, ps ? ps->name : "-", r);
         p = VK_NULL_HANDLE;
     }
     const u64 ms_taken = (host_ns() - t0) / 1000000;
@@ -810,8 +813,8 @@ VkPipeline make_compute(const Shader* cs, VkPipelineLayout layout) {
     ci.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     HitchTimer ht{HI_PIPELINE};
-    if (vkCreateComputePipelines(ctx().dev, g_pcache, 1, &ci, nullptr, &p) != VK_SUCCESS) {
-        LOG("[RED] nvk: compute pipeline %s could not be created", cs->name);
+    if (const VkResult r = vkCreateComputePipelines(ctx().dev, g_pcache, 1, &ci, nullptr, &p); r != VK_SUCCESS) {
+        LOG("[RED] nvk: compute pipeline %s could not be created (VkResult %d)", cs->name, r);
         p = VK_NULL_HANDLE;
     }
     return p;
@@ -1149,7 +1152,7 @@ VkDescriptorBufferInfo guest_buffer(u64 addr, u64 size, bool uniform, bool writt
     if (!pool_find(addr, 1, r, size)) return bi;
     if (pool_stats_on()) pool_note(addr, size, uniform ? 2 : written ? 6 : 3);
     const VkPhysicalDeviceLimits& lim = ctx().props.limits;
-    const u64 align = uniform ? lim.minUniformBufferOffsetAlignment : lim.minStorageBufferOffsetAlignment;
+    const u64 align = uniform ? lim.minUniformBufferOffsetAlignment : ssbo_align();
     u64 range = std::min<u64>(size, r.size);
     if (uniform) range = std::min<u64>(range, lim.maxUniformBufferRange);
     if (r.offset % align) {
@@ -1160,9 +1163,12 @@ VkDescriptorBufferInfo guest_buffer(u64 addr, u64 size, bool uniform, bool writt
             nvn::gpu_read(addr, s.ptr, range);
             return {s.buf, s.off, range};
         }
+        // (its shaders add the difference: push_deltas; without that they read and write it shifted, which on an Intel
+        // handheld, 64-byte alignment, lost the device and left the screen black)
         static int once;
-        if (!once++) LOG("[RED] nvk: storage buffer at %#llx is not %llu-byte aligned in its pool buffer: bound from the aligned address below",
-                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(align));
+        if (!once++) LOG("%snvk: storage buffer at %#llx is not %llu-byte aligned in its pool buffer: bound from the aligned address below%s",
+                         ssbo_deltas() ? "" : "[RED] ", static_cast<unsigned long long>(addr), static_cast<unsigned long long>(align),
+                         ssbo_deltas() ? ", its shaders told the difference" : "");
         const u64 back = r.offset % align;
         return {r.buffer, r.offset - back, range + back};
     }
@@ -1475,6 +1481,48 @@ void fast_mismatch(const char* fmt, ...);
 // bind_stage fills the set from it; a kept set is used again only while it is the same (keep_find).
 // t (if not null): what resolving it did besides (Touch: its guest buffer, or the image viewed); *fixed is cleared when
 // resolving it again would do more than that (a view not kept across submissions: uploads to finish, sparse tiles).
+// The guest buffer a buffer binding of stage st reads: false for the kinds that are not one.
+bool buffer_binding(const State& s, u32 st, const Binding& b, u64& addr, u64& size, bool& written) {
+    switch (b.kind) {
+    case BKind::Ubo:
+    case BKind::UboPtr:
+        if (b.reg < 18) addr = s.ubo[st][b.reg].addr, size = s.ubo[st][b.reg].size;
+        return true;
+    case BKind::Ssbo:
+        if (b.reg < 16) addr = s.ssbo[st][b.reg].addr, size = s.ssbo[st][b.reg].size, written = b.aux != 0;
+        return true;
+    case BKind::SsboUbo:
+        if (b.reg < 18 && s.ubo[st][b.reg].addr) {
+            u64 rec[2] = {};
+            nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
+            addr = rec[0], size = static_cast<u32>(rec[1]), written = b.aux != 0;
+        }
+        return true;
+    default: return false;
+    }
+}
+
+// The stages every push constant range covers once storage buffer offsets ride in push constants.
+VkShaderStageFlags push_stages() {
+    VkShaderStageFlags f = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+    if (ctx().feat.mesh_shader) f |= VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    return f;
+}
+
+// The storage buffer offsets sh reads (shaders.h DeltaBase): how far below each buffer guest_buffer bound from, in 16 bytes.
+void push_deltas(VkCommandBuffer cb, VkPipelineLayout layout, const State& s, const Shader* sh) {
+    if (!sh || !sh->delta_n) return;
+    const u64 align = ssbo_align();
+    u32 v[2] = {};
+    for (u32 k = 0; k < sh->delta_n; k++) {
+        u64 addr = 0, size = 0;
+        bool written = false;
+        if (!buffer_binding(s, sh->stage, sh->bindings[sh->delta_binding[k]], addr, size, written)) continue;
+        v[k / 8] |= static_cast<u32>((addr % align) / 16 & 15) << (4 * (k % 8));
+    }
+    vkCmdPushConstants(cb, layout, push_stages(), DeltaBase + 8 * sh->stage, 8, v);
+}
+
 u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nullptr, bool* fixed = nullptr) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     const bool uniform = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1482,23 +1530,7 @@ u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nul
     if (uniform || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
         u64 addr = 0, size = 0;
         bool written = false;
-        switch (b.kind) {
-        case BKind::Ubo:
-        case BKind::UboPtr:
-            if (b.reg < 18) addr = s.ubo[st][b.reg].addr, size = s.ubo[st][b.reg].size;
-            break;
-        case BKind::Ssbo:
-            if (b.reg < 16) addr = s.ssbo[st][b.reg].addr, size = s.ssbo[st][b.reg].size, written = b.aux != 0;
-            break;
-        case BKind::SsboUbo:
-            if (b.reg < 18 && s.ubo[st][b.reg].addr) {
-                u64 rec[2] = {};
-                nvn::gpu_read(s.ubo[st][b.reg].addr + b.off, rec, 12);
-                addr = rec[0], size = static_cast<u32>(rec[1]), written = b.aux != 0;
-            }
-            break;
-        default: return 0;
-        }
+        if (!buffer_binding(s, st, b, addr, size, written)) return 0;
         bi = guest_buffer(addr, size, uniform, written);
         if (t && addr && size) *t = {addr, size, nullptr, written};
         out[0] = reinterpret_cast<u64>(bi.buffer), out[1] = bi.offset, out[2] = bi.range;
@@ -1520,6 +1552,13 @@ u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nul
             if (const u32 h = s.img[st][b.reg]) v = texture_view(h & 0xfffff, view_type_of(b), true, &img, &sticky);
         } else {
             return 0;
+        }
+        // A texture with no image (not made: too big, or the driver refused it) is a null view where the device allows
+        // that (robustness2 nullDescriptor), else the placeholder: a null view without it is undefined, and an Intel
+        // handheld lost the device soon after its first textures went unmade.
+        if (!v && b.type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && !ctx().feat.null_descriptor) {
+            g_used_placeholder = true;
+            v = placeholder_view(view_type_of(b));
         }
         if (t) t->img = img;
         if (fixed && !sticky) *fixed = false;
@@ -2225,6 +2264,15 @@ template <class... T> bool dyn_same_v(int slot, const T&... a) {
     return dyn_same(slot, b, n);
 }
 
+// HOST_NVN_CLAMP_NO_DEPTH=0|1: draws without a depth target clamp depth instead of clipping it (set_dynamic); on by default on Intel.
+bool clamp_without_depth() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_CLAMP_NO_DEPTH");
+        return e && *e ? *e != '0' : ctx().props.vendorID == 0x8086;
+    }();
+    return on;
+}
+
 void set_dynamic(VkCommandBuffer cb, const State& s, const Shader* ps, VkPrimitiveTopology topo, DrawArgs& da, bool mesh = false) {
     Device& c = ctx();
     // A mesh pipeline has no vertex input or input assembly: binding one leaves those states undefined for the next.
@@ -2268,8 +2316,14 @@ void set_dynamic(VkCommandBuffer cb, const State& s, const Shader* ps, VkPrimiti
     if (!dyn_same_v(D_DBE, bias)) vkCmdSetDepthBiasEnable(cb, bias);
     if (!dyn_same_v(D_DB, s.po.units, s.po.clamp, s.po.factor)) vkCmdSetDepthBias(cb, s.po.units, s.po.clamp, s.po.factor);
     if (!dyn_same_v(D_RD, s.rast_discard)) vkCmdSetRasterizerDiscardEnable(cb, s.rast_discard);
-    if (!dyn_same_v(D_DCLAMP, s.depth_clamp)) vkCmdSetDepthClampEnableEXT(cb, s.depth_clamp);
-    if (c.feat.clip_enable && !dyn_same_v(D_DCLIP, s.depth_clamp)) vkCmdSetDepthClipEnableEXT(cb, !s.depth_clamp);
+    // Draws without a depth target are clamped instead of depth-clipped on Intel: in GL depth mode (near = -w) the Intel driver
+    // clips geometry lying exactly on the near plane, and the game's last draw of every frame (the copy of the finished
+    // picture into the window texture, vs a6430615519b0e2f) puts its quad at z = -w, so nothing reached the window: the black
+    // screen of the Intel handheld. Without a depth target depth only decides clipping, so clamping changes nothing else.
+    const bool depth_target = R.depth.img && (R.depth.img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT);
+    const bool clamp = s.depth_clamp || (!depth_target && clamp_without_depth());
+    if (!dyn_same_v(D_DCLAMP, clamp)) vkCmdSetDepthClampEnableEXT(cb, clamp);
+    if (c.feat.clip_enable && !dyn_same_v(D_DCLIP, clamp)) vkCmdSetDepthClipEnableEXT(cb, !clamp);
     if (const bool neg = !g_depth_zero.load(std::memory_order_relaxed); c.feat.clip_control && !dyn_same_v(D_DCLIPNEG, neg))
         vkCmdSetDepthClipNegativeOneToOneEXT(cb, neg);
     if (!mesh && !dyn_same_v(D_RESTART, s.prim_restart)) vkCmdSetPrimitiveRestartEnable(cb, s.prim_restart);
@@ -2777,7 +2831,8 @@ void do_mesh(VkCommandBuffer cb, const nvn::p_draw* d) {
     bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ms, da);
     if (ps) bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ps, da);
     const u32 first = static_cast<u32>(d->first);
-    vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, 4, &first);
+    vkCmdPushConstants(cb, layout, ssbo_deltas() ? push_stages() : VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, 4, &first);
+    push_deltas(cb, layout, s, ts), push_deltas(cb, layout, s, ms), push_deltas(cb, layout, s, ps);
     vkCmdDrawMeshTasksEXT(cb, static_cast<u32>(d->count), 1, 1);
     g_stats[ST_MESH]++;
     dump_note("mesh ts %s ms %s ps %s groups %d+%d", ts ? ts->name : "-", ms->name, ps ? ps->name : "-", d->first, d->count);
@@ -2926,6 +2981,7 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
         bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, vs, da);
         if (ps) bind_stage(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ps, da);
     }
+    push_deltas(cb, layout, s, vs), push_deltas(cb, layout, s, ps);
     const u32 query = dump_query_begin(cb);
     if (quads) {
         // quads as triangles: 0 1 2, 0 2 3 per quad, from the draw's own indices when it has them
@@ -3038,11 +3094,24 @@ void do_dispatch(VkCommandBuffer cb, const nvn::p_dispatch* d) {
         checkpoint(cb, 2, cs, nullptr, nullptr);
         bind_stage(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, cs, da);
     }
+    push_deltas(cb, layout, s, cs);
     if (d->ind) vkCmdDispatchIndirect(cb, ind.buffer, ind.offset);
     else vkCmdDispatch(cb, da.dispatch[0], da.dispatch[1], da.dispatch[2]);
     full_barrier(cb);
     g_stats[ST_DISPATCHED]++;
     if (dump_active()) dump_note("dispatch cs %s %u %u %u%s", cs->name, da.dispatch[0], da.dispatch[1], da.dispatch[2], d->ind ? " indirect" : "");
+    // Each compute shader's first dispatch (an Intel driver lost the device on one of them: HOST_NVN_SKIP_SHADERS bisects)
+    static std::mutex dispatched_mu;
+    static std::unordered_set<const Shader*> dispatched;
+    bool first;
+    {
+        std::scoped_lock lk{dispatched_mu};
+        first = dispatched.insert(cs).second;
+    }
+    if (first)
+        LOG("nvk: first dispatch of cs %s at frame %llu (%u %u %u%s)", cs->name,
+            static_cast<unsigned long long>(nvn::g_frame.load(std::memory_order_relaxed)), da.dispatch[0], da.dispatch[1],
+            da.dispatch[2], d->ind ? ", indirect" : "");
 }
 
 }  // namespace

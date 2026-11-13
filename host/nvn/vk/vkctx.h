@@ -29,6 +29,7 @@ struct Features {
     bool sparse = false;            // sparse residency 2D images, bound on the queue (vkQueueBindSparse)
     bool sparse_strict = false;     // unbound parts of a sparse image read as 0
     bool device_fault = false;      // VK_EXT_device_fault: what the GPU tripped over, logged at device loss
+    bool null_descriptor = false;   // robustness2 nullDescriptor: a texture with no image may be bound as a null view
     bool checkpoints = false;       // HOST_NVN_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints markers per draw
     // Unified memory (an integrated GPU; HOST_NVN_UMA=0/1 overrides): system memory is the GPU's own, so guest memory is
     // used in place (no device copies of pools), and memory pressure counts every heap, the device-local one being only
@@ -78,6 +79,8 @@ bool import_guest(u64 addr, u64 size, Imported& out, const char** why = nullptr)
 // Host memory [host, host + size) (aligned to the import alignment) as one buffer; out.addr is left 0.
 bool import_host(void* host, u64 size, Imported& out, const char** why = nullptr);
 void release_import(Imported& im);
+// Bytes imported for the GPU now (on unified memory they count against the GPU's heap).
+u64 imported_bytes();
 
 // ------------------------------------------------------------------ deferred destruction
 

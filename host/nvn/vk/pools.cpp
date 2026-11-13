@@ -38,6 +38,8 @@ struct Pool {
     u64 offset = 0;          // of the pool's first byte in buffer
     VkDeviceAddress gpu = 0; // of the pool's first byte
     bool own = false;        // im is the pool's own import
+    bool pending = false;    // not imported yet: at its first pool_find (lazy_import)
+    bool failed = false;     // its import was refused: pool_find finds nothing in it
     Imported im;
     // A copy in device memory, read instead of the import: see mirror_make.
     u32 flags = 0;
@@ -78,19 +80,35 @@ bool objects_only_when_freed() {
 std::mutex g_window_lock;
 std::unordered_map<u64, Imported> g_windows;  // by k
 
+// Window geometry. A dedicated GPU: windows of 2 * Step, a new one every Step (overlapping), as imports are system memory
+// there, plentiful. Unified memory: every import counts against the GPU's one heap (on an Intel handheld 9 GB of 16 GB
+// RAM, which the overlapping 256 MB windows and the pools' own imports filled to 8.5 GB before the first frame, so no
+// image could be made). There the windows are smaller and do not overlap: HOST_NVN_IMPORT_WINDOW_MB (64); a pool
+// across a window edge gets an import of its own.
+u64 win_step() {
+    static const u64 s = [] {
+        if (!ctx().feat.uma) return Step;
+        u64 mb = 64;
+        if (const char* e = getenv("HOST_NVN_IMPORT_WINDOW_MB"); e && *e) mb = std::max<u64>(4, std::strtoull(e, nullptr, 0));
+        return mb << 20;
+    }();
+    return s;
+}
+u64 win_span() { return ctx().feat.uma ? win_step() : 2 * win_step(); }
+
 // The window holding physical [phys, phys + size); imports it the first time.
 const Imported* window(u64 phys, u64 size) {
-    const u64 k = phys / Step;
-    if (phys + size > (k + 2) * Step) return nullptr;
+    const u64 step = win_step(), k = phys / step;
+    if (phys + size > k * step + win_span()) return nullptr;
     std::scoped_lock lk{g_window_lock};
     if (auto it = g_windows.find(k); it != g_windows.end()) return &it->second;
-    const u64 lo = k * Step, hi = std::min(lo + 2 * Step, mem::phys_pool_bytes());
+    const u64 lo = k * step, hi = std::min(lo + win_span(), mem::phys_pool_bytes());
     Imported im;
     const u64 t0 = host_ns();
     if (!import_host(mem::phys_ptr(lo), hi - lo, im)) return nullptr;
     im.addr = lo;
-    LOG("nvk: imported physical window %#llx+%#llx in %llu ms", lo, hi - lo,
-        static_cast<unsigned long long>((host_ns() - t0) / 1000000));
+    LOG("nvk: imported physical window %#llx+%#llx in %llu ms (%llu MB imported in all)", lo, hi - lo,
+        static_cast<unsigned long long>((host_ns() - t0) / 1000000), static_cast<unsigned long long>(imported_bytes() >> 20));
     return &g_windows.emplace(k, im).first->second;
 }
 
@@ -421,36 +439,56 @@ void pool_part_begin(bool submission) {
     g_flushed.clear();
 }
 
+// Unified memory: a pool is imported the first time pool_find gives it out, not when the game makes it. Every import
+// counts against the GPU's one heap there, and most of the game's pool memory is textures, which the GPU reads from
+// images of its own (textures.cpp) and never as a buffer: imported up front, the pools took 6.5 GB of an Intel
+// handheld's 7.6 GB budget and the textures then had no room. HOST_NVN_LAZY_IMPORT=0: up front as on a dedicated GPU.
+bool lazy_import() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_LAZY_IMPORT");
+        return e && *e ? *e != '0' : ctx().feat.uma;
+    }();
+    return on;
+}
+
+// Gives <p> (the pool at <addr>) its buffer: a share of an import window, else an import of its own. False if the
+// driver refuses (logged).
+bool import_pool(u64 addr, Pool& p) {
+    const u64 lo = addr & ~0xfffull, hi = (addr + p.size + 0xfff) & ~0xfffull;
+    const auto runs = mem::phys_runs(lo, hi - lo);
+    const bool one_run = runs.size() == 1 && runs[0].size == hi - lo;
+    const Imported* w = one_run && hi - lo <= win_step() ? window(runs[0].phys, hi - lo) : nullptr;
+    if (w) {
+        p.buffer = w->buffer;
+        p.offset = runs[0].phys - w->addr + (addr - lo);
+        p.gpu = w->gpu + p.offset;
+        return true;
+    }
+    const u64 t0 = host_ns();
+    const char* why = nullptr;
+    const bool ok = one_run ? import_host(mem::phys_ptr(runs[0].phys), hi - lo, p.im, &why) : import_guest(lo, hi - lo, p.im, &why);
+    if (!ok) {
+        LOG("[RED] nvk: memory pool %#llx+%#llx could not be imported for the GPU (%s)", addr, p.size, why ? why : "?");
+        return false;
+    }
+    LOG("nvk: memory pool %#llx+%#llx imported on its own (%s) in %llu ms (%llu MB imported in all)", addr, p.size,
+        one_run ? "large" : "several physical runs", static_cast<unsigned long long>((host_ns() - t0) / 1000000),
+        static_cast<unsigned long long>(imported_bytes() >> 20));
+    p.own = true;
+    p.buffer = p.im.buffer;
+    p.offset = addr - lo;
+    p.gpu = p.im.gpu + p.offset;
+    return true;
+}
+
 void pool_add(u64 addr, u64 size, u32 flags) {
     bind_epoch_bump(!objects_only_when_freed());
     g_bumps[2]++;
     Pool p;
     p.size = size;
     p.flags = flags;
-    const u64 lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
-    const auto runs = mem::phys_runs(lo, hi - lo);
-    const bool one_run = runs.size() == 1 && runs[0].size == hi - lo;
-    const Imported* w = one_run && hi - lo <= Step ? window(runs[0].phys, hi - lo) : nullptr;
-    if (w) {
-        p.buffer = w->buffer;
-        p.offset = runs[0].phys - w->addr + (addr - lo);
-        p.gpu = w->gpu + p.offset;
-    } else {
-        const u64 t0 = host_ns();
-        const char* why = nullptr;
-        const bool ok = one_run ? import_host(mem::phys_ptr(runs[0].phys), hi - lo, p.im, &why)
-                                : import_guest(lo, hi - lo, p.im, &why);
-        if (!ok) {
-            LOG("[RED] nvk: memory pool %#llx+%#llx could not be imported for the GPU (%s)", addr, size, why ? why : "?");
-            return;
-        }
-        LOG("nvk: memory pool %#llx+%#llx imported on its own (%s) in %llu ms", addr, size,
-            one_run ? "large" : "several physical runs", static_cast<unsigned long long>((host_ns() - t0) / 1000000));
-        p.own = true;
-        p.buffer = p.im.buffer;
-        p.offset = addr - lo;
-        p.gpu = p.im.gpu + p.offset;
-    }
+    if (lazy_import()) p.pending = true;
+    else if (!import_pool(addr, p)) return;
     std::unique_lock lk{g_lock};
     if (auto it = g_pools.find(addr); it != g_pools.end()) {
         if (it->second.mirror) mirror_drop(addr, it->second);
@@ -564,6 +602,8 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
         out.gpu = l.gpu + (addr - l.start);
         return true;
     }
+    u64 to_import = UINT64_MAX;   // a pool found that is not imported yet (lazy_import): imported below, then found again
+    {
     std::shared_lock lk{g_lock};
     auto it = g_pools.upper_bound(addr);
     const u64 next = it == g_pools.end() ? UINT64_MAX : it->first;
@@ -573,6 +613,11 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
         --it;
         Pool& p = it->second;
         if (addr >= it->first && addr + len <= it->first + p.size) {
+            if (p.failed) return false;
+            if (p.pending) {
+                to_import = it->first;
+                break;
+            }
             mirror_make(it->first, p);
             if (p.refresh) refresh_touch(it->first, p, addr, use);
             const VkBuffer buffer = p.mirror ? p.mirror : p.buffer;
@@ -586,7 +631,18 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
             return true;
         }
     }
-    return false;
+    }
+    if (to_import == UINT64_MAX) return false;
+    {
+        std::unique_lock lk{g_lock};
+        auto it = g_pools.find(to_import);
+        if (it != g_pools.end() && it->second.pending) {   // (another thread may have done it meanwhile)
+            it->second.pending = false;
+            it->second.failed = !import_pool(it->first, it->second);
+            g_pools_gen.fetch_add(1, std::memory_order_release);
+        }
+    }
+    return pool_find(addr, len, out, use);   // (no longer pending: found, or failed)
 }
 
 }  // namespace nvk

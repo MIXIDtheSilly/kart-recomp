@@ -440,9 +440,58 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     HitchTimer ht{HI_IMAGE};
-    if (vmaCreateImage(ctx().vma, &ci, &ai, &img->image, &img->alloc, nullptr) != VK_SUCCESS) {
-        LOG("[RED] nvk: image %ux%ux%u x%u layers, %u levels, format %d (NVN %#x) could not be created", img->width,
-            img->height, img->depth, img->layers, img->levels, img->format, d.format);
+    VkResult r = vmaCreateImage(ctx().vma, &ci, &ai, &img->image, &img->alloc, nullptr);
+    if (r != VK_SUCCESS) {
+        // A stricter driver (Intel's) can refuse what NVIDIA's takes: retry without storage use, then without the
+        // flags for views in other formats (the views then keep the image's own format), then in any memory type.
+        // Logged once per format and outcome, with what the driver says it supports for the first try.
+        const VkResult first = r;
+        VkImageFormatProperties fp{};
+        const VkResult q = vkGetPhysicalDeviceImageFormatProperties(ctx().phys, ci.format, ci.imageType, ci.tiling, ci.usage,
+                                                                    ci.flags, &fp);
+        const VkImageCreateFlags fl0 = ci.flags;
+        const VkImageUsageFlags us0 = ci.usage;
+        int step = 0;
+        if (r != VK_SUCCESS && (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+            ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+            img->storage_ok = false;
+            step = 1;
+            r = vmaCreateImage(ctx().vma, &ci, &ai, &img->image, &img->alloc, nullptr);
+        }
+        constexpr VkImageCreateFlags reinterpret = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+                                                   VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+        if (r != VK_SUCCESS && (ci.flags & reinterpret)) {
+            ci.flags &= ~reinterpret;
+            img->mutable_ok = false;
+            step = 2;
+            r = vmaCreateImage(ctx().vma, &ci, &ai, &img->image, &img->alloc, nullptr);
+        }
+        if (r != VK_SUCCESS) {
+            ai.usage = VMA_MEMORY_USAGE_AUTO;
+            step = 3;
+            r = vmaCreateImage(ctx().vma, &ci, &ai, &img->image, &img->alloc, nullptr);
+        }
+        static std::mutex seen_mu;
+        static std::unordered_set<u64> seen;
+        bool log;
+        {
+            std::scoped_lock lk{seen_mu};
+            log = seen.insert(static_cast<u64>(ci.format) << 8 | static_cast<u64>(step) << 1 | (r == VK_SUCCESS)).second;
+        }
+        if (log)
+            LOG("%s nvk: image format %d (NVN %#x) %ux%u: create failed (VkResult %d; driver says %d, max %ux%ux%u x%u layers, "
+                "flags %#x usage %#x) -> %s at step %d (1 no storage, 2 no view-format flags, 3 any memory)",
+                r == VK_SUCCESS ? "nvk:" : "[RED]", img->format, d.format, img->width, img->height, first, q, fp.maxExtent.width,
+                fp.maxExtent.height, fp.maxExtent.depth, fp.maxArrayLayers, fl0, us0,
+                r == VK_SUCCESS ? "made" : "still failed", step);
+    }
+    if (r != VK_SUCCESS) {
+        u64 used = 0, budget = 0;
+        device_budget(used, budget);
+        LOG("[RED] nvk: image %ux%ux%u x%u layers, %u levels, format %d (NVN %#x) could not be created (VkResult %d; GPU memory "
+            "%llu of %llu MB budget, %llu MB of it imported guest memory)", img->width, img->height, img->depth, img->layers,
+            img->levels, img->format, d.format, r, static_cast<unsigned long long>(used >> 20),
+            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(imported_bytes() >> 20));
         std::scoped_lock lk{g_lock};
         g_failed[t->serial] = true;
         delete img;
@@ -605,7 +654,8 @@ VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageVi
         nlayers = std::max(1u, std::min(nlayers, img->layers - base_layer));
     }
     const Format& f = format(fmt);
-    const VkFormat vkf = f.kind == FmtKind::None ? img->format : (format(img->nvn_format).kind == FmtKind::Astc ? img->format : f.vk);
+    VkFormat vkf = f.kind == FmtKind::None ? img->format : (format(img->nvn_format).kind == FmtKind::Astc ? img->format : f.vk);
+    if (!img->mutable_ok) vkf = img->format;   // made without MUTABLE_FORMAT (see image_of's retries)
     const u64 key = static_cast<u64>(base_level) | static_cast<u64>(nlevels) << 5 | static_cast<u64>(base_layer) << 10 |
                     static_cast<u64>(nlayers) << 23 | static_cast<u64>(target & 15) << 36 | static_cast<u64>(vkf) << 40 |
                     static_cast<u64>(attachment) << 63 | static_cast<u64>(stencil) << 62 |

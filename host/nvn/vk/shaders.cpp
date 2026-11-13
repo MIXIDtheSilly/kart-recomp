@@ -4,7 +4,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -212,6 +214,245 @@ void use_base_builtins(std::vector<u32>& w, const Shader& sh) {
     w = std::move(o);
 }
 
+// Bytes of Workgroup (shared) variables the SPIR-V declares: scalars, vectors, arrays and structs of them.
+u64 workgroup_bytes(const std::vector<u32>& w) {
+    std::unordered_map<u32, u64> size;    // type id -> bytes
+    std::unordered_map<u32, u64> konst;   // constant id -> value
+    std::unordered_map<u32, u32> ptr;     // Workgroup pointer type id -> pointee type id
+    u64 total = 0;
+    for (size_t i = 5; i < w.size();) {
+        const u32 n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || i + n > w.size()) break;
+        const u32* a = &w[i + 1];
+        switch (op) {
+        case 21: case 22: size[a[0]] = a[1] / 8; break;                              // OpTypeInt / OpTypeFloat
+        case 20: size[a[0]] = 4; break;                                              // OpTypeBool
+        case 23: size[a[0]] = size[a[1]] * a[2]; break;                              // OpTypeVector
+        case 28: size[a[0]] = size[a[1]] * konst[a[2]]; break;                       // OpTypeArray
+        case 30: { u64 s = 0; for (u32 k = 1; k < n - 1; k++) s += size[a[k]]; size[a[0]] = s; break; }   // OpTypeStruct
+        case 43: konst[a[1]] = a[2]; break;                                          // OpConstant
+        case 32: if (a[1] == 4) ptr[a[0]] = a[2]; break;                             // OpTypePointer Workgroup
+        case 59: if (a[2] == 4 && ptr.count(a[0])) total += size[ptr[a[0]]]; break;  // OpVariable Workgroup
+        }
+        i += n;
+    }
+    return total;
+}
+
+// Shrinks the one Workgroup array a shader declares (OpVariable of an OpTypeArray of 32-bit words with a constant length)
+// to `cap` bytes: a new OpConstant for the length goes in before the array type, so other uses of the old one stay.
+// The size it had, or 0 when the shader has no such array (left as it is).
+u64 shrink_workgroup(std::vector<u32>& w, u64 cap) {
+    std::unordered_map<u32, u32> konst, int_width, ptr;   // constant -> value, int type -> width, Workgroup pointer -> type
+    struct Arr { size_t at; u32 elem, len; };
+    std::unordered_map<u32, Arr> arrays;
+    u32 target = 0;
+    for (size_t i = 5; i < w.size();) {
+        const u32 n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || i + n > w.size()) return 0;
+        const u32* a = &w[i + 1];
+        if (op == 21) int_width[a[0]] = a[1];
+        else if (op == 43) konst[a[1]] = a[2];
+        else if (op == 28) arrays[a[0]] = {i, a[1], a[2]};
+        else if (op == 32 && a[1] == 4) ptr[a[0]] = a[2];
+        else if (op == 59 && a[2] == 4 && ptr.count(a[0])) {
+            if (target) return 0;   // (more than one shared variable: not this kind of shader)
+            target = ptr[a[0]];
+        }
+        i += n;
+    }
+    const auto it = arrays.find(target);
+    if (it == arrays.end() || int_width[it->second.elem] != 32 || !konst.count(it->second.len)) return 0;
+    const u64 had = static_cast<u64>(konst[it->second.len]) * 4;
+    if (had <= cap) return had;
+    const u32 id = w[3]++;   // a new id: the bound grows by one
+    const u32 inst[4] = {(4u << 16) | 43u, it->second.elem, id, static_cast<u32>(cap / 4)};   // OpConstant %elem %id cap/4
+    const size_t at = it->second.at;
+    w[at + 3] = id;          // OpTypeArray %result %elem %length -> the new length
+    w.insert(w.begin() + static_cast<std::ptrdiff_t>(at), inst, inst + 4);
+    return had;
+}
+
+// The storage buffer offsets (shaders.h DeltaBase): each access chain into a storage buffer the host binds from guest
+// memory gets its stage's nibble for that buffer added to the element index, from a push constant block (a new one,
+// or the mesh shaders' own with a member added). The bindings it covers (indexes in sh.bindings) go to
+// sh.delta_binding. False: left as it was.
+bool add_ssbo_deltas(std::vector<u32>& w, Shader& sh) {
+    enum : u32 { OpEntryPointK = 15, OpFunction = 54, OpLoad = 61, OpAccessChain = 65, OpInBoundsAccessChain = 66, OpMemberDecorate = 72,
+                 OpIAdd = 128, OpShiftRightLogical = 194, OpShiftLeftLogical = 196, OpBitwiseAnd = 199,
+                 DecArrayStride = 6, DecOffset = 35, ScPushConstant = 9 };
+    std::unordered_map<u32, u32> bind_of, stride, konst, ptr_pointee, var_ptr, array_elem, max_off;
+    std::unordered_map<u32, std::vector<u32>> structs;   // struct id -> member types
+    u32 uint_ty = 0, pc_var = 0;
+    size_t first_decl = 0, first_fn = 0;
+    for (size_t i = 5; i < w.size();) {
+        const u32 op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > w.size()) return false;
+        const bool decl = (op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == OpVariable;
+        if (decl && !first_decl) first_decl = i;
+        if (op == OpDecorate && n >= 4 && w[i + 2] == DecBinding) bind_of[w[i + 1]] = w[i + 3];
+        else if (op == OpDecorate && n >= 4 && w[i + 2] == DecArrayStride) stride[w[i + 1]] = w[i + 3];
+        else if (op == OpMemberDecorate && n >= 5 && w[i + 3] == DecOffset) max_off[w[i + 1]] = std::max(max_off[w[i + 1]], w[i + 4]);
+        else if (op == OpTypeInt && w[i + 2] == 32 && w[i + 3] == 0) uint_ty = w[i + 1];
+        else if (op == OpTypeArray || op == OpTypeRuntimeArray) array_elem[w[i + 1]] = w[i + 2];
+        else if (op == OpTypeStruct) structs[w[i + 1]].assign(w.begin() + static_cast<ptrdiff_t>(i + 2), w.begin() + static_cast<ptrdiff_t>(i + n));
+        else if (op == OpTypePointer) ptr_pointee[w[i + 1]] = w[i + 3];
+        else if (op == OpConstant && n == 4) konst[w[i + 2]] = w[i + 3];
+        else if (op == OpVariable && !first_fn) {
+            var_ptr[w[i + 2]] = w[i + 1];
+            if (w[i + 3] == ScPushConstant) pc_var = w[i + 2];
+        } else if (op == OpFunction && !first_fn) first_fn = i;
+        i += n;
+    }
+    if (!first_decl || !first_fn) return false;
+    // the storage buffers: var -> (nibble index, log2 of the elements in 16 bytes)
+    std::unordered_map<u32, std::pair<u32, u32>> ssbo;
+    u32 k = 0;
+    for (size_t bi = 0; bi < sh.bindings.size(); bi++) {
+        const Binding& b = sh.bindings[bi];
+        if (b.type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b.count != 1) continue;
+        if (b.kind != BKind::Ssbo && b.kind != BKind::SsboUbo && b.kind != BKind::Ubo && b.kind != BKind::UboPtr) continue;
+        u32 var = 0;
+        for (auto& [id, bn] : bind_of)
+            if (bn == b.binding && var_ptr.count(id)) var = id;
+        if (!var) continue;
+        const auto st = structs.find(ptr_pointee[var_ptr[var]]);
+        if (st == structs.end() || st->second.size() != 1 || !array_elem.count(st->second[0])) continue;
+        const u32 s = stride[st->second[0]];
+        if (s != 4 && s != 8 && s != 16) continue;
+        if (k == 16) {
+            LOG("[RED] nvk: shader %s: more than 16 storage buffers, binding %u left without its offset", sh.name, b.binding);
+            continue;
+        }
+        ssbo[var] = {k, s == 4 ? 2u : s == 8 ? 1u : 0u};
+        sh.delta_binding[k++] = static_cast<u32>(bi);
+    }
+    if (ssbo.empty()) return false;
+    // the push constant block: the shader's own (a member added after its last, which ends before DeltaBase) or a new one
+    u32 pc_struct = 0, member = 0;
+    if (pc_var) {
+        pc_struct = ptr_pointee[var_ptr[pc_var]];
+        if (!structs.count(pc_struct) || max_off[pc_struct] + 16 > DeltaBase) {
+            LOG("[RED] nvk: shader %s: its push constants overlap the storage buffer offsets: left as it is", sh.name);
+            return false;
+        }
+        member = static_cast<u32>(structs[pc_struct].size());
+    }
+    u32 bound = w[3];
+    const u32 new_uint = uint_ty ? 0 : bound++;
+    if (new_uint) uint_ty = new_uint;
+    const u32 c_len = bound++, arr = bound++, ptr_u = bound++;
+    const bool new_block = !pc_var;
+    u32 pc_ptr = 0;
+    if (new_block) pc_struct = bound++, pc_ptr = bound++, pc_var = bound++;
+    std::unordered_map<u32, u32> cid;   // uint constant value -> id
+    const auto want = [&](u32 v) { if (!cid.count(v)) cid[v] = bound++; };
+    const u32 st = sh.stage;
+    want(member), want(2 * st), want(2 * st + 1), want(15), want(1), want(2);
+    for (u32 i = 0; i < 8; i++) want(4 * i);
+
+    std::vector<u32> o(w.begin(), w.begin() + 5);
+    o.reserve(w.size() + w.size() / 4);
+    const auto emit = [&](std::initializer_list<u32> ins) { o.insert(o.end(), ins); };
+    const auto head = [](u32 op, u32 n) { return op | n << 16; };
+    const auto types_before = [&] {   // what the block's new member needs
+        if (new_uint) emit({head(OpTypeInt, 4), new_uint, 32, 0});
+        emit({head(OpConstant, 4), uint_ty, c_len, 2 * SH_N});
+        emit({head(OpTypeArray, 4), arr, uint_ty, c_len});
+    };
+    u32 patched = 0;
+    for (size_t i = 5; i < w.size();) {
+        const u32 op = w[i] & 0xffff, n = w[i] >> 16;
+        if (i == first_decl) {
+            emit({head(OpDecorate, 4), arr, DecArrayStride, 4});
+            emit({head(OpMemberDecorate, 5), pc_struct, member, DecOffset, DeltaBase});
+            if (new_block) emit({head(OpDecorate, 3), pc_struct, DecBlock});
+        }
+        if (!new_block && op == OpTypeStruct && w[i + 1] == pc_struct) {
+            types_before();
+            o.push_back(head(OpTypeStruct, n + 1));
+            o.insert(o.end(), w.begin() + static_cast<ptrdiff_t>(i + 1), w.begin() + static_cast<ptrdiff_t>(i + n));
+            o.push_back(arr);
+            i += n;
+            continue;
+        }
+        if (i == first_fn) {
+            if (new_block) {
+                types_before();
+                emit({head(OpTypeStruct, 3), pc_struct, arr});
+                emit({head(OpTypePointer, 4), pc_ptr, ScPushConstant, pc_struct});
+                emit({head(OpVariable, 4), pc_ptr, pc_var, ScPushConstant});
+            }
+            emit({head(OpTypePointer, 4), ptr_u, ScPushConstant, uint_ty});
+            for (auto& [v, id] : cid) emit({head(OpConstant, 4), uint_ty, id, v});
+        }
+        if (op == OpEntryPointK && new_block && w[1] >= 0x10400) {   // (from SPIR-V 1.4 every global it uses is listed)
+            o.push_back(head(op, n + 1));
+            o.insert(o.end(), w.begin() + static_cast<ptrdiff_t>(i + 1), w.begin() + static_cast<ptrdiff_t>(i + n));
+            o.push_back(pc_var);
+            i += n;
+            continue;
+        }
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && n >= 6 && ssbo.count(w[i + 3]) && konst.count(w[i + 4]) && konst[w[i + 4]] == 0) {
+            const auto [nib, mul] = ssbo[w[i + 3]];
+            const u32 p = bound++, v = bound++, sh_ = bound++, nb = bound++, d = mul ? bound++ : nb, idx = bound++;
+            emit({head(OpAccessChain, 6), ptr_u, p, pc_var, cid[member], cid[2 * st + nib / 8]});
+            emit({head(OpLoad, 4), uint_ty, v, p});
+            emit({head(OpShiftRightLogical, 5), uint_ty, sh_, v, cid[4 * (nib % 8)]});
+            emit({head(OpBitwiseAnd, 5), uint_ty, nb, sh_, cid[15]});
+            if (mul) emit({head(OpShiftLeftLogical, 5), uint_ty, d, nb, cid[mul]});
+            emit({head(OpIAdd, 5), uint_ty, idx, w[i + 5], d});
+            const size_t at = o.size();
+            o.insert(o.end(), w.begin() + static_cast<ptrdiff_t>(i), w.begin() + static_cast<ptrdiff_t>(i + n));
+            o[at + 5] = idx;
+            patched++;
+            i += n;
+            continue;
+        }
+        o.insert(o.end(), w.begin() + static_cast<ptrdiff_t>(i), w.begin() + static_cast<ptrdiff_t>(i + n));
+        i += n;
+    }
+    if (!patched) {
+        for (u32 j = 0; j < k; j++) sh.delta_binding[j] = 0;
+        return false;
+    }
+    o[3] = bound;
+    w = std::move(o);
+    sh.delta_n = static_cast<u8>(k);
+    return true;
+}
+
+// Workgroup barriers some threads may never reach: the game's compute shaders start with "if (id >= count) return;" and
+// then wait at barriers in a loop. NVIDIA lets the others through; an Intel GPU waits for the returned threads forever
+// (the handheld's device loss on a8310cf7..., dispatched as one workgroup of 64 with a count below 64). As Ryujinx does
+// on Intel, those barriers become memory barriers: after a return in the function or in a function of its own
+// (mode 2: also any inside a branch or loop). The number changed.
+u32 drop_divergent_barriers(std::vector<u32>& w, int mode) {
+    enum : u32 { OpFunctionK = 54, OpFunctionEnd = 56, OpLabel = 248, OpLoopMerge = 246, OpSelectionMerge = 247, OpReturn = 253,
+                 OpReturnValue = 254, OpKill = 252, OpTerminateInvocation = 4416, OpControlBarrier = 224, OpMemoryBarrier = 225 };
+    u32 entry_fn = 0, changed = 0;
+    bool returned = false, is_entry = false;
+    std::vector<u32> merges;
+    for (size_t i = 5; i < w.size();) {
+        const u32 op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > w.size()) return changed;
+        if (op == 15 && !entry_fn) entry_fn = w[i + 2];   // OpEntryPoint
+        else if (op == OpFunctionK) returned = false, is_entry = w[i + 2] == entry_fn, merges.clear();
+        else if (op == OpReturn || op == OpReturnValue || op == OpKill || op == OpTerminateInvocation) returned = true;
+        else if (op == OpSelectionMerge || op == OpLoopMerge) merges.push_back(w[i + 1]);
+        else if (op == OpLabel) merges.erase(std::remove(merges.begin(), merges.end(), w[i + 1]), merges.end());
+        else if (op == OpControlBarrier && n == 4 && (returned || !is_entry || (mode >= 2 && !merges.empty()))) {
+            const u32 mem = w[i + 2], sem = w[i + 3];
+            w[i] = OpMemoryBarrier | 3u << 16, w[i + 1] = mem, w[i + 2] = sem;
+            w.erase(w.begin() + static_cast<ptrdiff_t>(i + 3));
+            changed++;
+            continue;   // (read again as the 3-word memory barrier it is now, then passed)
+        }
+        i += n;
+    }
+    return changed;
+}
+
 // Reads the SPIR-V's resources into sh (descriptor types, counts, vertex inputs, colour outputs) and
 // moves its descriptor set to sh.set. False when it is malformed.
 bool reflect(std::vector<u32>& w, Shader& sh, const Row& row) {
@@ -373,11 +614,27 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     // TaskEXT / MeshEXT modules (<key>.mesh.spv), and per-primitive outputs into flat per-vertex ones where they fit
     // (<key>.meshflat.spv), which the translated fragment shaders read without PerPrimitiveEXT.
     std::string file = g_dir + "\\" + sh->name + ".spv";
+    // On Intel, compute / task / mesh shaders with workgroup barriers load <file>.bar.spv (tools/nvn_barfix.py): threads past the
+    // early "return" stay for the barriers with their writes skipped, as Intel needs (NVIDIA lets them leave).
+    // HOST_NVN_BARSPV=0: never, 1: on any GPU (to test on the desktop).
+    Device& c = ctx();
+    const bool intel = c.props.vendorID == 0x8086;
+    static const int barspv = getenv("HOST_NVN_BARSPV") ? atoi(getenv("HOST_NVN_BARSPV")) : -1;
+    const bool want_bar = barspv > 0 || (barspv < 0 && intel);
+    bool bar = false;
+    const auto bar_of = [&](const std::string& f) {
+        const std::string b = f.substr(0, f.size() - 4) + ".bar.spv";
+        if (want_bar && std::ifstream(b).good()) file = b, bar = true;
+    };
     if (row.stage == SH_TS || row.stage == SH_MS) {
         const std::string flat = g_dir + "\\" + sh->name + ".meshflat.spv", mesh = g_dir + "\\" + sh->name + ".mesh.spv";
         file = std::ifstream(flat).good() ? flat : mesh;
-    } else if (const std::string fix = g_dir + "\\" + sh->name + ".fix.spv"; std::ifstream(fix).good()) {
-        file = fix;   // one the driver miscompiles, restructured by tools/nvn_spvfix.py
+        bar_of(file);
+    } else {
+        if (row.stage == SH_CS) bar_of(file);
+        const std::string fix = g_dir + "\\" + sh->name + ".fix.spv";
+        if (!bar && !getenv("HOST_NVN_NO_SPVFIX") && std::ifstream(fix).good())
+            file = fix;   // one the driver miscompiles, restructured by tools/nvn_spvfix.py (HOST_NVN_NO_SPVFIX=1: the translation as it is)
     }
     std::ifstream f(file, std::ios::binary);
     if (!f) {
@@ -395,7 +652,49 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     static const bool base_builtins = !getenv("HOST_NVN_BASE_BUILTINS") || atoi(getenv("HOST_NVN_BASE_BUILTINS")) != 0;
     if (row.stage == SH_VS && base_builtins) use_base_builtins(words, *sh);
     if ((row.stage == SH_TS || row.stage == SH_MS) && !ctx().feat.mesh_shader) sh->unsupported = "no mesh shaders on this GPU";
-    Device& c = ctx();
+    if (bar) {
+        static std::atomic<int> logged{0};
+        if (logged++ == 0) LOG("nvk: shaders with workgroup barriers loaded from their .bar.spv (tools/nvn_barfix.py; HOST_NVN_BARSPV=0: not), e.g. %s", sh->name);
+    }
+    // The fallback for a shader without a .bar.spv: barriers after an early return hang Intel GPUs, so they become memory barriers
+    // (drop_divergent_barriers; their results can be wrong: the black screen of the first handheld runs). HOST_NVN_BARRIER_FIX=0:
+    // as translated, 1: after a return, 2 (Intel's default, as Ryujinx): also inside branches and loops, which is where the .fix.spv
+    // restructuring (tools/nvn_spvfix.py) puts the early return of a8310cf7 and its kin.
+    static const int barrier_fix = getenv("HOST_NVN_BARRIER_FIX") ? atoi(getenv("HOST_NVN_BARRIER_FIX")) : intel ? 2 : 0;
+    if (barrier_fix && !bar && (row.stage == SH_CS || row.stage == SH_TS || row.stage == SH_MS) && !sh->unsupported) {
+        if (const u32 n = drop_divergent_barriers(words, barrier_fix)) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 5) LOG("nvk: shader %s: %u workgroup barriers some threads may not reach made memory barriers (they hang Intel GPUs)", sh->name, n);
+        }
+    }
+    // Compute shaders that declare all of the GPU's shared memory (~170 with 48 KB, one array of 12288 words indexed by
+    // (workgroup * 64 + thread) * 48 bytes): the first guess at the Intel handheld's device loss, which was the barriers.
+    // HOST_NVN_SHARED_CAP_KB=<n>: cut to n KB on Intel (HOST_NVN_SHARED_CAP_ANY: any GPU); HOST_NVN_SHARED_SKIP=1: skipped.
+    if (row.stage == SH_CS && !sh->unsupported && (intel || getenv("HOST_NVN_SHARED_CAP_ANY"))) {
+        const u64 limit = c.props.limits.maxComputeSharedMemorySize;
+        const char* ce = getenv("HOST_NVN_SHARED_CAP_KB");
+        const u64 cap = (ce && *ce ? std::strtoull(ce, nullptr, 0) : 0) << 10;
+        if ((cap || getenv("HOST_NVN_SHARED_SKIP")) && workgroup_bytes(words) >= limit) {
+            if (getenv("HOST_NVN_SHARED_SKIP")) {
+                sh->unsupported = "skipped (declares all shared memory: hangs Intel GPUs; HOST_NVN_SHARED_SKIP)";
+            } else if (const u64 had = shrink_workgroup(words, std::min(cap, limit - 1024)); had) {
+                static std::atomic<int> logged{0};
+                if (logged++ < 5)
+                    LOG("nvk: compute shader %s: shared memory cut from %llu to %llu bytes (HOST_NVN_SHARED_CAP_KB)", sh->name,
+                        static_cast<unsigned long long>(had), static_cast<unsigned long long>(workgroup_bytes(words)));
+            } else {
+                sh->unsupported = "skipped (declares all shared memory, not in a form that can be cut: hangs Intel GPUs)";
+            }
+        }
+    }
+    if (ssbo_deltas() && !sh->unsupported && add_ssbo_deltas(words, *sh)) {
+        static std::atomic<int> logged{0};
+        if (logged++ < 3) LOG("nvk: shader %s: %u storage buffers read with offsets from push constants (aligned to %llu bytes)", sh->name,
+                              sh->delta_n, static_cast<unsigned long long>(ssbo_align()));
+    }
+    // HOST_NVN_DUMP_PATCHED=<folder>: the modules as given to the driver written there (to check with spirv-val)
+    if (const char* d = getenv("HOST_NVN_DUMP_PATCHED"))
+        std::ofstream(std::string(d) + "\\" + sh->name + ".spv", std::ios::binary).write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = words.size() * 4;
     mi.pCode = words.data();
@@ -430,6 +729,20 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
 }  // namespace
 
 std::string shader_folder() { return shader_dir(); }
+
+u64 ssbo_align() {
+    static const u64 a = [] {
+        u64 v = ctx().props.limits.minStorageBufferOffsetAlignment;
+        if (const char* e = getenv("HOST_NVN_SSBO_ALIGN"); e && *e) v = std::max<u64>(v, std::strtoull(e, nullptr, 0));
+        return v;
+    }();
+    return a;
+}
+
+bool ssbo_deltas() {
+    static const bool on = ssbo_align() > 16 && ssbo_align() <= 256 && !(getenv("HOST_NVN_SSBO_DELTA") && atoi(getenv("HOST_NVN_SSBO_DELTA")) == 0);
+    return on;
+}
 
 u32 stage_set(ShStage s) {
     switch (s) {

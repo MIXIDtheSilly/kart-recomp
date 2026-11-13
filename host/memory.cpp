@@ -305,8 +305,23 @@ void init() {
     // course): ~15 GB allocated after a race, ~2 GB of it resident. Machines whose RAM + page file
     // can't take the commit (a 16 GB handheld) get the largest of 20, 16, 14, 12 GiB that fits;
     // past the pool's last GiB the GPU's sparse and GPU-only memory goes without backing.
+    // A size that fits but leaves the rest of the process too little commit is skipped too: the GPU driver
+    // allocates from the same RAM + page file, and on an integrated GPU so do its images and pipelines (an
+    // Intel handheld took 24 GiB and then every image of the first frame failed, out of host memory, and the
+    // device was lost). HOST_PHYS_HEADROOM_GIB sets that reserve (8).
     std::vector<u64> sizes{24, 20, 16, 14, 12};
+    MEMORYSTATUSEX ms{sizeof ms};
+    GlobalMemoryStatusEx(&ms);
+    u64 headroom = 8;
+    if (const char* v = std::getenv("HOST_PHYS_HEADROOM_GIB")) headroom = std::strtoull(v, nullptr, 0);
+    LOG("memory: %llu MB RAM, %llu MB of %llu MB commit (RAM + page file) free; %llu GiB kept for the rest", ms.ullTotalPhys >> 20,
+        ms.ullAvailPageFile >> 20, ms.ullTotalPageFile >> 20, headroom);
     if (const char* v = std::getenv("HOST_PHYS_GIB")) sizes = {std::strtoull(v, nullptr, 0)};
+    else
+        while (sizes.size() > 1 && ((sizes.front() + headroom) << 30) > ms.ullAvailPageFile) {
+            LOG("guest memory pool: %llu GiB would leave less than %llu GiB of commit", sizes.front(), headroom);
+            sizes.erase(sizes.begin());
+        }
     load_memory_api();
     for (const u64 gib : sizes) {
         g_phys_size = gib << 30;

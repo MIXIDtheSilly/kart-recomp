@@ -194,7 +194,8 @@ void create_device(Device& c) {
     c.feat.host_import = opt(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     const bool memory_budget = opt(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     opt(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    c.feat.mesh_shader = opt(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    // HOST_NVN_NO_MESH=1: as if the GPU had none (their draws are skipped): for finding what a driver faults on
+    c.feat.mesh_shader = opt(VK_EXT_MESH_SHADER_EXTENSION_NAME) && !getenv("HOST_NVN_NO_MESH");
     c.feat.eds3 = opt(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     c.feat.vertex_input_dynamic = opt(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     c.feat.conditional_rendering = opt(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
@@ -259,6 +260,7 @@ void create_device(Device& c) {
     c.feat.mesh_shader = c.feat.mesh_shader && fmesh.meshShader && fmesh.taskShader;
     c.feat.index_uint8 = uint8 && fu8.indexTypeUint8;
     c.feat.device_fault = fault && ffault.deviceFault;
+    c.feat.null_descriptor = robustness2 && frob.nullDescriptor;
     ffault.deviceFaultVendorBinary = VK_FALSE;
     c.feat.clip_control = clip_control && fdcc.depthClipControl && feds3.extendedDynamicState3DepthClipNegativeOneToOne;
     c.feat.clip_enable = clip_enable && fdce.depthClipEnable && feds3.extendedDynamicState3DepthClipEnable;
@@ -330,11 +332,13 @@ void create_device(Device& c) {
         heaps += b;
     }
     LOG("nvk: %s (Vulkan %u.%u.%u, driver %#x), %s memory (heaps %s), queue family %u, mesh shaders %d, dynamic state 3 %d, "
-        "host import %d (alignment %llu), sparse images %d (strict %d); extensions:%s",
+        "host import %d (alignment %llu), sparse images %d (strict %d), null descriptors %d, compute shared memory %u, "
+        "workgroup invocations %u; extensions:%s",
         c.props.deviceName, VK_API_VERSION_MAJOR(c.props.apiVersion), VK_API_VERSION_MINOR(c.props.apiVersion),
         VK_API_VERSION_PATCH(c.props.apiVersion), c.props.driverVersion, c.feat.uma ? "unified" : "dedicated", heaps.c_str(), c.family,
         c.feat.mesh_shader, c.feat.eds3, c.feat.host_import, static_cast<unsigned long long>(c.feat.import_alignment), c.feat.sparse,
-        c.feat.sparse_strict, list.c_str());
+        c.feat.sparse_strict, c.feat.null_descriptor, c.props.limits.maxComputeSharedMemorySize,
+        c.props.limits.maxComputeWorkGroupInvocations, list.c_str());
 }
 
 }  // namespace
@@ -368,6 +372,8 @@ void init() {
 }
 
 // ------------------------------------------------------------------ guest memory as GPU buffers
+
+static std::atomic<u64> g_import_bytes{0};   // memory imported for the GPU now (imported_bytes)
 
 bool import_guest(u64 addr, u64 size, Imported& out, const char** why) {
     const u64 align = ctx().feat.import_alignment;
@@ -431,6 +437,7 @@ bool import_host(void* host, u64 size, Imported& out, const char** why) {
                                                      : "vkAllocateMemory failed";
         return false;
     }
+    g_import_bytes += im.size;
     VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -460,8 +467,12 @@ bool import_host(void* host, u64 size, Imported& out, const char** why) {
 void release_import(Imported& im) {
     Device& c = ctx();
     if (im.buffer) vkDestroyBuffer(c.dev, im.buffer, nullptr);
-    if (im.memory) vkFreeMemory(c.dev, im.memory, nullptr);
+    if (im.memory) vkFreeMemory(c.dev, im.memory, nullptr), g_import_bytes -= im.size;
     im = {};
+}
+
+u64 imported_bytes() {
+    return g_import_bytes.load(std::memory_order_relaxed);
 }
 
 // ------------------------------------------------------------------ one-off work

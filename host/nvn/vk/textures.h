@@ -22,6 +22,7 @@ struct Image {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube_ok = false;
     bool storage_ok = false;
+    bool mutable_ok = true;     // views may take other formats (false: the driver refused MUTABLE_FORMAT for it)
     nvn_texdesc desc{};
     u32 nvn_format = 0;
     bool gpu_written = false;   // rendered to / written by shaders or copies: guest storage is no longer its content

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <execution>
@@ -431,6 +432,17 @@ Image* sparse_image_of(const nvn::tex_t* t, VkCommandBuffer cb, bool mostly_unma
     if (!rq) return drop("no colour sparse requirements");
     s->gran = rq->formatProperties.imageGranularity;
     if (tw % s->gran.width || th % s->gran.height) return drop("its tiles are not whole sparse blocks");
+    // Memory a game tile (64 KB of texels) takes once bound: 64-128 KB on NVIDIA, 1-2 MB on an Intel handheld's driver
+    // (whose sparse blocks are that much larger), where one 8192x8192 x68 array took 4 GB of a 7.6 GB budget and the next
+    // ran out. Past 4x a tile, the texture is not made sparse (it is then too big to make at all and is sampled as empty).
+    // HOST_NVN_SPARSE_ANY=1: sparse whatever it costs.
+    if (const u64 per_tile = region_bytes(s.get(), {tw, th, 1}); per_tile > 4 * Tile64 && !getenv("HOST_NVN_SPARSE_ANY")) {
+        static thread_local char why[200];
+        snprintf(why, sizeof why, "the driver's sparse blocks take %llu KB for a 64 KB tile (block %llu KB, %ux%u texels): too costly",
+                 static_cast<unsigned long long>(per_tile >> 10), static_cast<unsigned long long>(s->block >> 10), s->gran.width,
+                 s->gran.height);
+        return drop(why);
+    }
 
     // Levels: the game's tiled ones that Vulkan also tiles go a tile at a time
     s->tiled = std::min<u32>(static_cast<u32>(tiled), std::min(levels, rq->imageMipTailFirstLod));

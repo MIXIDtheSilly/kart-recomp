@@ -59,7 +59,20 @@ struct Shader {
     u32 outputs = 0;                // pixel stage: colour locations written
     u32 local[3] = {1, 1, 1};
     const char* unsupported = nullptr;  // why draws with it are skipped
+    // Storage buffers the shader reads with a push-constant offset (ssbo_align() > 16: see draw.cpp guest_buffer):
+    // the bindings, in the order of their nibbles in the stage's two push-constant words.
+    u8 delta_n = 0;
+    u32 delta_binding[16] = {};
 };
+
+// GPUs that want storage buffers aligned more than the console does (16 bytes; Intel: 64): a guest storage buffer is
+// bound from the aligned address below it, and its shaders add (address % alignment) / 16 nibbles, read from push
+// constants: stage st's 16 nibbles in the two words at byte DeltaBase + 8 * st.
+constexpr u32 DeltaBase = 16, DeltaSize = DeltaBase + 8 * SH_N;
+// The storage buffer offset alignment guest buffers are bound with (HOST_NVN_SSBO_ALIGN overrides, to test on NVIDIA).
+u64 ssbo_align();
+// Push constants carry the storage buffer offsets (ssbo_align() > 16; HOST_NVN_SSBO_DELTA=0: off).
+bool ssbo_deltas();
 
 // The shader with this key (prog_key bytes), loaded on first use; null when no translation exists
 // (logged once per key). Thread: the submission thread.
