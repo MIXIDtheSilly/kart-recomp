@@ -25,6 +25,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <regex>
 #include <windows.h>
 #include <windowsx.h>
 #include <d2d1.h>
@@ -996,6 +997,14 @@ static float draw_progress(float x0, float x1, float y) {
     return y + 46;
 }
 
+// A log line that reports a failure (shown red): it says error or failed, but not only as a zero count ("0 Error(s)",
+// "failed so far 0", "0 failed").
+static bool bad_line(const std::wstring& lo) {
+    static const std::wregex zero(L"(^|[^0-9.])0 +(errors?|error\\(s\\)|failed|failures?)|(errors?|failed|failures?)( so far)?:? +0($|[^0-9.])");
+    const std::wstring rest = std::regex_replace(lo, zero, L" ");
+    return rest.find(L"error") != std::wstring::npos || rest.find(L"failed") != std::wstring::npos;
+}
+
 static void draw_log(D2D1_RECT_F r) {
     g_log_rect = r;
     fill_round(r, R_LOG, col::inset);
@@ -1017,7 +1026,7 @@ static void draw_log(D2D1_RECT_F r) {
         const std::wstring lo = lower(l);
         uint32_t c = col::log;
         if (l.rfind(L"> ", 0) == 0) c = col::accent;
-        else if (lo.find(L"error") != std::wstring::npos || lo.find(L"failed") != std::wstring::npos) c = col::red;
+        else if (bad_line(lo)) c = col::red;
         text(l, F_MONO, {in.left, in.top + k * lh, in.right, in.top + (k + 1) * lh}, c);
     }
     g_rt->PopAxisAlignedClip();
