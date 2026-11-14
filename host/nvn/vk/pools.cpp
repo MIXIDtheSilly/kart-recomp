@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,7 +40,9 @@ struct Pool {
     VkDeviceAddress gpu = 0; // of the pool's first byte
     bool own = false;        // im is the pool's own import
     bool pending = false;    // not imported yet: at its first pool_find (lazy_import)
-    bool failed = false;     // its import was refused: pool_find finds nothing in it
+    bool failed = false;     // its import was refused: pool_find finds nothing in it (until fail_frame + RetryFrames)
+    u64 fail_frame = 0;
+    u32 win = 0;             // the import window it lies in, k + 1 (0: none, or an import of its own)
     Imported im;
     // A copy in device memory, read instead of the import: see mirror_make.
     u32 flags = 0;
@@ -96,6 +99,23 @@ u64 win_step() {
     return s;
 }
 u64 win_span() { return ctx().feat.lean_imports ? win_step() : 2 * win_step(); }
+
+// When each window was last given out (pool_find): the submission being recorded then, and the frame. By k, never freed
+// (pool_find's per-thread cache touches it without a lock).
+struct WinUse {
+    std::atomic<u64> sub{0};
+    std::atomic<u64> frame{0};
+};
+WinUse* win_uses() {
+    static const std::unique_ptr<WinUse[]> a{new WinUse[mem::phys_pool_bytes() / win_step() + 2]};
+    return a.get();
+}
+void win_touch(u32 win) {
+    if (!win) return;
+    WinUse& u = win_uses()[win - 1];
+    u.sub.store(submission_recording(), std::memory_order_relaxed);
+    u.frame.store(nvn::g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
 
 // The window holding physical [phys, phys + size); imports it the first time.
 const Imported* window(u64 phys, u64 size) {
@@ -454,26 +474,94 @@ bool lazy_import() {
     return on;
 }
 
-// Gives <p> (the pool at <addr>) its buffer: a share of an import window, else an import of its own. False if the
-// driver refuses (logged).
-bool import_pool(u64 addr, Pool& p) {
+// Room for imports, when the driver refuses one (lazy_import only: under g_lock, held uniquely). The import windows are
+// never released otherwise, and over a session they cover more and more of the guest's memory: on a PC with 16 GB of
+// RAM (an 8 GB host heap on NVIDIA) the imports filled it, the pools imported after that got no GPU memory and their
+// content was missing (issue 4). Windows not given out for IdleFrames go, oldest first, until `want` bytes are free;
+// their pools are imported again at their next use. A window under a pool with a device copy stays (the copy is
+// refreshed from or written back to it). One the GPU is done with is released at once, others when it is. Returns
+// the bytes released at once.
+constexpr u64 IdleFrames = 120, RetryFrames = 60, EvictSlack = 256ull << 20;
+u64 g_evicted_n = 0, g_evicted_bytes = 0;
+u64 evict_windows(u64 want) {
+    const u64 frame = nvn::g_frame.load(std::memory_order_relaxed);
+    std::unordered_set<u64> held;   // k: a pool there has a device copy
+    for (const auto& [a, p] : g_pools)
+        if (p.win && (p.mirror || p.owned || p.promote_queued)) held.insert(p.win - 1);
+    struct Cand {
+        u64 frame, k;
+    };
+    std::vector<Cand> cand;
+    std::vector<std::pair<u64, Imported>> gone;
+    u64 freed = 0;
+    {
+        std::scoped_lock lk{g_window_lock};
+        for (const auto& [k, im] : g_windows) {
+            const u64 used = win_uses()[k].frame.load(std::memory_order_relaxed);
+            if (frame - used >= IdleFrames && !held.count(k)) cand.push_back({used, k});
+        }
+        std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.frame < b.frame; });
+        for (const Cand& c : cand) {
+            if (freed >= want) break;
+            auto it = g_windows.find(c.k);
+            freed += it->second.size;
+            gone.emplace_back(c.k, it->second);
+            g_windows.erase(it);
+        }
+    }
+    if (gone.empty()) return 0;
+    std::unordered_set<u64> is_gone;
+    for (const auto& g : gone) is_gone.insert(g.first);
+    for (auto& [a, p] : g_pools)
+        if (p.win && is_gone.count(p.win - 1)) p.buffer = VK_NULL_HANDLE, p.offset = 0, p.gpu = 0, p.win = 0, p.pending = true;
+    u64 now_bytes = 0;
+    for (auto& [k, im] : gone) {
+        if (submission_done(win_uses()[k].sub.load(std::memory_order_relaxed))) {
+            now_bytes += im.size;
+            release_import(im);
+        } else {
+            defer([im]() mutable { release_import(im); });
+        }
+    }
+    g_pools_gen.fetch_add(1, std::memory_order_release);
+    bind_epoch_bump();   // (the windows' buffers go)
+    g_evicted_n += gone.size(), g_evicted_bytes += freed;
+    static u64 at = 0;
+    if (const u64 t = host_ns(); t - at > 5'000'000'000ull) {
+        at = t;
+        LOG("nvk: imports full: %llu import windows not used for %llu frames released (%llu MB, %llu MB of it at once; %llu, %llu MB "
+            "so far), %llu MB imported now",
+            static_cast<unsigned long long>(gone.size()), static_cast<unsigned long long>(IdleFrames),
+            static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(now_bytes >> 20),
+            static_cast<unsigned long long>(g_evicted_n), static_cast<unsigned long long>(g_evicted_bytes >> 20),
+            static_cast<unsigned long long>(imported_bytes() >> 20));
+    }
+    return now_bytes;
+}
+
+// One try at giving <p> (the pool at <addr>) its buffer: a share of an import window, else an import of its own.
+bool try_import(u64 addr, Pool& p, const char** why) {
     const u64 lo = addr & ~0xfffull, hi = (addr + p.size + 0xfff) & ~0xfffull;
     const auto runs = mem::phys_runs(lo, hi - lo);
     const bool one_run = runs.size() == 1 && runs[0].size == hi - lo;
-    const Imported* w = one_run && hi - lo <= win_step() ? window(runs[0].phys, hi - lo) : nullptr;
-    if (w) {
+    const bool in_window = one_run && hi - lo <= win_step() &&
+                           runs[0].phys + (hi - lo) <= runs[0].phys / win_step() * win_step() + win_span();
+    if (in_window) {
+        const Imported* w = window(runs[0].phys, hi - lo);
+        if (!w) {
+            *why = "its import window was refused";
+            return false;
+        }
         p.buffer = w->buffer;
         p.offset = runs[0].phys - w->addr + (addr - lo);
         p.gpu = w->gpu + p.offset;
+        p.win = lazy_import() ? static_cast<u32>(runs[0].phys / win_step() + 1) : 0;   // (only there are windows released)
+        win_touch(p.win);
         return true;
     }
     const u64 t0 = host_ns();
-    const char* why = nullptr;
-    const bool ok = one_run ? import_host(mem::phys_ptr(runs[0].phys), hi - lo, p.im, &why) : import_guest(lo, hi - lo, p.im, &why);
-    if (!ok) {
-        LOG("[RED] nvk: memory pool %#llx+%#llx could not be imported for the GPU (%s)", addr, p.size, why ? why : "?");
-        return false;
-    }
+    const bool ok = one_run ? import_host(mem::phys_ptr(runs[0].phys), hi - lo, p.im, why) : import_guest(lo, hi - lo, p.im, why);
+    if (!ok) return false;
     LOG("nvk: memory pool %#llx+%#llx imported on its own (%s) in %llu ms (%llu MB imported in all)", addr, p.size,
         one_run ? "large" : "several physical runs", static_cast<unsigned long long>((host_ns() - t0) / 1000000),
         static_cast<unsigned long long>(imported_bytes() >> 20));
@@ -482,6 +570,37 @@ bool import_pool(u64 addr, Pool& p) {
     p.offset = addr - lo;
     p.gpu = p.im.gpu + p.offset;
     return true;
+}
+
+// Gives <p> (the pool at <addr>) its buffer. False if the driver refuses (logged), also after making room (lazy_import).
+bool import_pool(u64 addr, Pool& p) {
+    const char* why = nullptr;
+    bool ok = try_import(addr, p, &why);
+    if (!ok && lazy_import() && evict_windows(std::max(win_span(), p.size) + EvictSlack)) ok = try_import(addr, p, &why);
+    if (!ok) {
+        static u64 n = 0, n_at = 20, at = 0;
+        if (n++ < 20) {
+            LOG("[RED] nvk: memory pool %#llx+%#llx could not be imported for the GPU (%s)%s", addr, p.size, why ? why : "?",
+                lazy_import() ? ": tried again in a while" : "");
+        } else if (const u64 t = host_ns(); t - at > 10'000'000'000ull) {
+            LOG("[RED] nvk: memory pools that could not be imported for the GPU: %llu more (%llu so far), %llu MB imported now (%s)",
+                static_cast<unsigned long long>(n - n_at), static_cast<unsigned long long>(n), static_cast<unsigned long long>(imported_bytes() >> 20),
+                why ? why : "?");
+            at = t, n_at = n;
+        }
+    }
+    return ok;
+}
+
+// Whether pool_find should try to import p now. While the heap is full every try costs a refused driver call and finds
+// nothing to release: a pool whose import was refused tries again RetryFrames after that, or after the last import
+// refused even after making room, whichever is later; a pool not tried yet tries, unless one was refused this frame.
+static std::atomic<u64> g_full_at{0};   // frame + 1 of the last import refused (0: none)
+static bool import_due(const Pool& p, u64 frame) {
+    const u64 full = g_full_at.load(std::memory_order_relaxed);
+    if (p.pending) return !full || full - 1 != frame;
+    if (!p.failed || !lazy_import()) return false;
+    return frame - std::max(p.fail_frame, full ? full - 1 : 0) >= RetryFrames;
 }
 
 void pool_add(u64 addr, u64 size, u32 flags) {
@@ -590,6 +709,7 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
     struct Last {
         u64 gen = 0, start = 0, next = 0, end = 0, offset = 0;
         Pool* refresh = nullptr;   // the pool, if it is copied each submission
+        u32 win = 0;               // its import window (win_touch)
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceAddress gpu = 0;
     };
@@ -599,6 +719,7 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
     const u64 gen = g_pools_gen.load(std::memory_order_acquire);
     if (l.gen == gen && addr >= l.start && addr < l.next && addr + len <= l.end) {
         if (l.refresh) refresh_touch(l.start, *l.refresh, addr, use);
+        win_touch(l.win);
         out.buffer = l.buffer;
         out.offset = l.offset + (addr - l.start);
         out.size = l.end - addr;
@@ -616,13 +737,14 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
         --it;
         Pool& p = it->second;
         if (addr >= it->first && addr + len <= it->first + p.size) {
-            if (p.failed) return false;
-            if (p.pending) {
+            if (p.failed && !import_due(p, nvn::g_frame.load(std::memory_order_relaxed))) return false;
+            if (p.pending || p.failed) {
                 to_import = it->first;
                 break;
             }
             mirror_make(it->first, p);
             if (p.refresh) refresh_touch(it->first, p, addr, use);
+            win_touch(p.win);
             const VkBuffer buffer = p.mirror ? p.mirror : p.buffer;
             const u64 offset = p.mirror ? 0 : p.offset;
             const VkDeviceAddress gpu = p.mirror ? p.mirror_gpu : p.gpu;
@@ -630,7 +752,7 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
             out.offset = offset + (addr - it->first);
             out.size = p.size - (addr - it->first);
             out.gpu = gpu + (addr - it->first);
-            if (tries == 0) l = {g_pools_gen.load(std::memory_order_acquire), it->first, next, it->first + p.size, offset, p.refresh ? &p : nullptr, buffer, gpu};
+            if (tries == 0) l = {g_pools_gen.load(std::memory_order_acquire), it->first, next, it->first + p.size, offset, p.refresh ? &p : nullptr, p.win, buffer, gpu};
             return true;
         }
     }
@@ -639,10 +761,17 @@ bool pool_find(u64 addr, u64 len, BufferRef& out, u64 use) {
     {
         std::unique_lock lk{g_lock};
         auto it = g_pools.find(to_import);
-        if (it != g_pools.end() && it->second.pending) {   // (another thread may have done it meanwhile)
-            it->second.pending = false;
-            it->second.failed = !import_pool(it->first, it->second);
-            g_pools_gen.fetch_add(1, std::memory_order_release);
+        const u64 frame = nvn::g_frame.load(std::memory_order_relaxed);
+        if (it != g_pools.end() && (it->second.pending || it->second.failed)) {   // (another thread may have done it meanwhile)
+            Pool& p = it->second;
+            if (import_due(p, frame)) {
+                p.pending = false;
+                p.failed = !import_pool(it->first, p);
+                if (p.failed) p.fail_frame = frame, g_full_at.store(frame + 1, std::memory_order_relaxed);
+                else g_pools_gen.fetch_add(1, std::memory_order_release);   // (pending and failed pools are in no lookup cache)
+            } else if (p.pending) {
+                p.pending = false, p.failed = true, p.fail_frame = frame;
+            }
         }
     }
     return pool_find(addr, len, out, use);   // (no longer pending: found, or failed)

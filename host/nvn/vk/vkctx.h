@@ -95,6 +95,10 @@ u64 imported_bytes();
 // Runs fn (on the completion thread) once the GPU has finished everything submitted so far: for objects
 // the game released that a submission in flight may still use (replay_vk.cpp).
 void defer(std::function<void()> fn);
+// The timeline value of the submission being recorded (or the next one), and whether the GPU has finished the one with
+// value v: what is used only by submissions up to v can be destroyed at once (replay_vk.cpp).
+u64 submission_recording();
+bool submission_done(u64 v);
 // defer, for images and views (`bytes` of memory): also not before the descriptor sets kept across submissions that may
 // hold them are gone (draw.cpp, keep_find), so a view's handle is never reused while one may still be found.
 void defer_past_kept(std::function<void()> fn, u64 bytes);

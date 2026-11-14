@@ -545,6 +545,9 @@ void nvk::defer(std::function<void()> fn) {
     g_deferred.emplace_back(after, std::move(fn));
 }
 
+u64 nvk::submission_recording() { return nvn::g_submitted.load(std::memory_order_acquire) + 1; }
+bool nvk::submission_done(u64 v) { return nvn::g_done.load(std::memory_order_acquire) >= v; }
+
 namespace nvn {
 
 // ---------------------------------------------------------------- device state
