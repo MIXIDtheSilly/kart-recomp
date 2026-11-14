@@ -681,7 +681,9 @@ static std::vector<Stage> stages() {
          {g_root / "host" / "**", g_root / "runtime" / "*.h", g_root / "third_party" / "**", t / "build_host.py",
           lib_dir(a / "build") / (std::wstring(L"*") + lib_ext()), a / "gen" / "aot_modules.cpp"},
          true, [=] { return path_exists(exe); },
-         [=] { return std::vector<Cmd>{{L"cmd /c build.bat", (g_root / "host").wstring()}}; }},
+         // By its full path: with NoDefaultCurrentDirectoryInExePath set (some security setups) cmd does not look in
+         // the current folder
+         [=] { return std::vector<Cmd>{{L"cmd /c \"\"" + (g_root / "host" / "build.bat").wstring() + L"\"\"", (g_root / "host").wstring()}}; }},
     };
 }
 
