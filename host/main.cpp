@@ -609,6 +609,8 @@ int main(int argc, char** argv) {
     // kart-<version>.exe (another game version) keeps its saves, caches and logs apart: user-<version>.
     const std::string variant = host_exe_variant();
     g_config.user_dir = fs::current_path() / (variant.empty() ? std::string("user") : "user-" + variant);
+    // HOST_USER_DIR: another folder for saves and logs (a second instance on this PC, for LAN play).
+    if (const char* e = getenv("HOST_USER_DIR"); e && *e) g_config.user_dir = fs::path(e);
     fs::create_directories(g_config.user_dir);
     g_log_file = _wfopen((g_config.user_dir / "host.log").c_str(), L"w");
     LOG("game %s", game.string().c_str());

@@ -72,32 +72,30 @@ void read_keyboard(PadInput& in) {
 
 // HOST_INPUT_SCRIPT="<seconds>:<buttons>:<duration>;..." presses buttons at given times since
 // the first hid update (for test runs), e.g. "40:L+R:0.3;50:A:0.2". Buttons: A B X Y L R ZL ZR
-// Plus Minus Left Up Right Down.
+// Plus Minus Left Up Right Down LS RS (stick clicks).
 struct ScriptStep {
     double at, until;
     u64 buttons;
 };
-std::vector<ScriptStep> load_script() {
+// Steps of `s` ("<seconds>:<buttons>:<duration>;..."), their times offset by `base`.
+std::vector<ScriptStep> parse_script(const std::string& s, double base) {
     std::vector<ScriptStep> steps;
-    const char* env = std::getenv("HOST_INPUT_SCRIPT");
-    if (!env) return steps;
     const struct { const char* name; u64 b; } names[] = {
         {"A", A},   {"B", B},       {"X", X},
         {"Y", Y},   {"L", L},       {"R", R},
         {"ZL", ZL}, {"ZR", ZR},     {"Plus", Plus},
         {"Minus", Minus}, {"Left", Left}, {"Up", Up},
-        {"Right", Right}, {"Down", Down},
+        {"Right", Right}, {"Down", Down}, {"LS", StickL}, {"RS", StickR},
     };
-    std::string s = env;
     size_t pos = 0;
     while (pos < s.size()) {
-        size_t end = s.find(';', pos);
+        size_t end = s.find_first_of(";\n", pos);
         if (end == std::string::npos) end = s.size();
         const std::string step = s.substr(pos, end - pos);
         pos = end + 1;
         const size_t c1 = step.find(':'), c2 = step.rfind(':');
         if (c1 == std::string::npos || c2 == c1) continue;
-        ScriptStep st{std::atof(step.c_str()), 0, 0};
+        ScriptStep st{base + std::atof(step.c_str()), 0, 0};
         st.until = st.at + std::atof(step.c_str() + c2 + 1);
         const std::string btns = step.substr(c1 + 1, c2 - c1 - 1);
         size_t b = 0;
@@ -113,6 +111,35 @@ std::vector<ScriptStep> load_script() {
     }
     return steps;
 }
+std::vector<ScriptStep> load_script() {
+    const char* env = std::getenv("HOST_INPUT_SCRIPT");
+    return env ? parse_script(env, 0) : std::vector<ScriptStep>{};
+}
+
+// HOST_INPUT_FILE=<file>: lines appended to it while the game runs are script steps timed from when they are read
+// ("0:A:0.2" presses A now), for driving test runs (two instances in LAN play) step by step.
+struct LiveScript {
+    const char* path = std::getenv("HOST_INPUT_FILE");
+    size_t done = 0;
+    double next_check = 0;
+    void poll(std::vector<ScriptStep>& steps, double t) {
+        if (!path || t < next_check) return;
+        next_check = t + 0.1;
+        FILE* f = std::fopen(path, "rb");
+        if (!f) return;
+        std::string text;
+        char buf[4096];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+        if (text.size() < done) done = 0;  // the file was replaced
+        const size_t end = text.rfind('\n');
+        if (end == std::string::npos || end + 1 <= done) return;
+        const auto add = parse_script(text.substr(done, end + 1 - done), t);
+        for (const auto& st : add) LOG("hid: input file step 0x%llx in %.2f s for %.2f s", st.buttons, st.at - t, st.until - st.at);
+        steps.insert(steps.end(), add.begin(), add.end());
+        done = end + 1;
+    }
+};
 
 void add_stick_buttons(PadInput& in) {
     constexpr s32 t = StickMax / 2;
@@ -200,7 +227,8 @@ void push_state(NpadInternalState& np, const PadInput& in, bool handheld) {
 // first button press), as Pro Controllers.
 void input_thread() {
     SetThreadDescription(GetCurrentThread(), L"hid");
-    const auto script = load_script();
+    auto script = load_script();
+    LiveScript live;
     const u64 start = host_ns();
     const u32 styles = g_supported_styles.load();
     const bool handheld = !(styles & StyleFullkey) && (styles & StyleHandheld);
@@ -229,10 +257,11 @@ void input_thread() {
         PadInput& in = players.state[0];
         if (!kb_joins && focused) read_keyboard(in);
         const double t = (host_ns() - start) / 1e9;
+        live.poll(script, t);
         for (const auto& s : script)
             if (t >= s.at && t < s.until) in.buttons |= s.buttons;
         add_stick_buttons(in);
-        if (in.buttons != last_buttons && !script.empty()) LOG("hid: buttons 0x%llx at %.2f s", in.buttons, t);
+        if (in.buttons != last_buttons && (!script.empty() || live.path)) LOG("hid: buttons 0x%llx at %.2f s", in.buttons, t);
         last_buttons = in.buttons;
         push_state(np, in, handheld);
 
