@@ -598,7 +598,7 @@ std::unordered_map<std::wstring, Press> g_presses;
 
 }  // namespace
 
-void read(Players& out) {
+void read(Players& out, const State* keyboard) {
     std::vector<Source> now;
     read_xinput(now);
     {
@@ -609,6 +609,7 @@ void read(Players& out) {
             now.push_back({p->path, p->name, p->state, p});
         }
     }
+    if (keyboard) now.push_back({L"keyboard", "Keyboard", *keyboard, nullptr});
     const auto find = [&](const std::wstring& key) {
         return std::find_if(now.begin(), now.end(), [&](const Source& s) { return s.key == key; });
     };

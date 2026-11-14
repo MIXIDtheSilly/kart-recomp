@@ -196,7 +196,8 @@ void push_state(NpadInternalState& np, const PadInput& in, bool handheld) {
 }
 
 // Player 1 is always connected (the keyboard drives it too, and whichever pad joins first). Players 2-4 (npads No2-No4)
-// are connected while a pad holds them (gamepads.h: a pad joins on its first button press), as Pro Controllers.
+// are connected while a pad (or the keyboard, with HOST_KEYBOARD_JOINS=1) holds them (gamepads.h: a pad joins on its
+// first button press), as Pro Controllers.
 void input_thread() {
     SetThreadDescription(GetCurrentThread(), L"hid");
     const auto script = load_script();
@@ -211,13 +212,22 @@ void input_thread() {
 
     gamepads::start();
 
+    // HOST_KEYBOARD_JOINS=1: the keyboard is a player of its own, joining on its first key press like a pad (one pad
+    // and the keyboard make two players). Otherwise it drives player 1 alongside the first pad.
+    const char* kb_env = std::getenv("HOST_KEYBOARD_JOINS");
+    const bool kb_joins = kb_env && kb_env[0] == '1';
+    if (kb_joins) LOG("hid: the keyboard joins as a player of its own");
+
     u64 last_buttons = 0;
     std::array<bool, gamepads::MaxPlayers> connected{true};
     for (;;) {
+        const bool focused = window_focused();
+        PadInput keyboard;
+        if (kb_joins && focused) read_keyboard(keyboard);
         gamepads::Players players;
-        gamepads::read(players);
+        gamepads::read(players, kb_joins ? &keyboard : nullptr);
         PadInput& in = players.state[0];
-        if (window_focused()) read_keyboard(in);
+        if (!kb_joins && focused) read_keyboard(in);
         const double t = (host_ns() - start) / 1e9;
         for (const auto& s : script)
             if (t >= s.at && t < s.until) in.buttons |= s.buttons;

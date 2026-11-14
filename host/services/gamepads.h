@@ -25,8 +25,9 @@ struct Players {
 
 // Opens the pads connected now, and from then on those that connect (checked every 2 s).
 void start();
-// Every player's state (one call a tick: the joins happen here).
-void read(Players& out);
+// Every player's state (one call a tick: the joins happen here). `keyboard`: the keyboard as one more pad, which joins
+// like the others (HOST_KEYBOARD_JOINS=1), or null.
+void read(Players& out, const State* keyboard = nullptr);
 // The pad of `player` (0-based) leaves; it joins again on its next button press (the game's DisconnectNpad).
 void leave(int player);
 // How many players are connected: player 1 always (the keyboard drives it without a pad), and each of 2-4 a pad holds.
