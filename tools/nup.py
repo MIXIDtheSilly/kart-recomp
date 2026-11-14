@@ -33,7 +33,11 @@ def _zstd_decompress(data, size):
             zstd = None
     if zstd:
         return zstd.decompress(data)
-    import zstandard
+    try:
+        import zstandard
+    except ImportError:
+        sys.exit("this .nup holds zstd-compressed files and Python %d.%d has no zstd module: run Set up in the "
+                 "launcher's Dependencies step, or: python -m pip install backports.zstd" % sys.version_info[:2])
     return zstandard.ZstdDecompressor().decompress(data, max_output_size=size)
 NO_DIR = 0xFFFFFFFF
 

@@ -32,7 +32,8 @@ def main():
     ap.add_argument('--min-bytes', type=int, default=150000)
     ap.add_argument('--all', action='store_true')
     a = ap.parse_args()
-    keys = set(FIXES)
+    # The listed shaders only where this build has them: a game version or dump without one is no failure
+    keys = {k for k in FIXES if os.path.exists(os.path.join(a.dir, k + '.spv'))}
     for f in os.listdir(a.dir):
         k, ext = os.path.splitext(f)
         if ext != '.spv' or '.' in k or (not a.all and os.path.getsize(os.path.join(a.dir, f)) < a.min_bytes):

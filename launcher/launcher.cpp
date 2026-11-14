@@ -1461,6 +1461,14 @@ static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& 
 static void open_nup() {
     const std::wstring file = pick(false, L"The game as a .nup file", fs::path(g_game).parent_path().wstring());
     if (file.empty()) return;
+    // This comes before the Dependencies step, but unpacking needs Python and its zstd package
+    check_python();
+    if (g_tools.python.empty()) {
+        MessageBoxW(g_hwnd, L"Unpacking a .nup needs Python, which is not installed yet. Run Set up in the Dependencies "
+                            L"step (2) first, then open the .nup again.", L"Open .nup", MB_ICONINFORMATION);
+        return;
+    }
+    const bool install_pkgs = !g_tools.py_missing.empty();
     const std::wstring nup_py = L"python \"" + (g_root / "tools" / "nup.py").wstring() + L"\"";
     DWORD code;
     const std::string out = capture(nup_py + L" info \"" + file + L"\"", &code);
@@ -1500,7 +1508,11 @@ static void open_nup() {
     }
     g_nup_dest = dest.wstring();
     g_unpack_log = true;
-    start_job(L"Unpacking version " + version, {{nup_py + L" extract \"" + file + L"\" \"" + g_nup_dest + L"\"", g_root.wstring()}});
+    std::vector<Cmd> cmds;
+    if (install_pkgs) cmds.push_back({L"python tools\\deps.py install", g_root.wstring(), L"Python packages"});
+    cmds.push_back({nup_py + L" extract \"" + file + L"\" \"" + g_nup_dest + L"\"", g_root.wstring(), L"Unpacking"});
+    for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
+    start_job(L"Unpacking version " + version, cmds);
 }
 
 static void click(int id) {
