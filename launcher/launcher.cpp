@@ -1713,8 +1713,14 @@ static bool bring_over_from(const fs::path& picked, bool interactive) {
             c.fn = [src, dst]() -> DWORD {
                 std::error_code e;
                 fs::create_directories(dst.parent_path(), e);
-                if (MoveFileExW(src.c_str(), dst.c_str(), 0)) return 0;
-                const DWORD err = GetLastError();
+                // A file inside still open for a moment (a virus scanner, Explorer listing it): a few tries
+                DWORD err = 0;
+                for (int i = 0; i < 10; i++) {
+                    if (MoveFileExW(src.c_str(), dst.c_str(), 0)) return 0;
+                    err = GetLastError();
+                    if (err != ERROR_ACCESS_DENIED && err != ERROR_SHARING_VIOLATION) break;
+                    Sleep(1000);
+                }
                 log_line(L"could not move it (Windows error " + std::to_wstring(err) + L"): is a program using it?");
                 return err ? err : 1;
             };
