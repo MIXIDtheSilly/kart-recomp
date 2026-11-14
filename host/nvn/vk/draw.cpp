@@ -1139,6 +1139,16 @@ std::vector<PipeDesc> load_descs() {
     if (!f.read(reinterpret_cast<char*>(h), sizeof h) || h[0] != KeysMagic || h[1] != KeysVersion || h[2] > 200000) return list;
     list.resize(h[2]);
     if (!f.read(reinterpret_cast<char*>(list.data()), static_cast<std::streamsize>(list.size() * sizeof(PipeDesc)))) list.clear();
+    // Pipelines with a shader this build has no translation of are dropped (and so left out when the list is saved again):
+    // the list of an older build or another game version, whose shaders the warm-up would report as missing ("has no
+    // translation") although the game never asks for them.
+    const size_t listed = list.size();
+    std::erase_if(list, [](const PipeDesc& d) {
+        return !d.vs || !shader_known(d.vs) || (d.ts && !shader_known(d.ts)) || (d.ps && !shader_known(d.ps));
+    });
+    if (list.size() != listed)
+        LOG("nvk: pipeline list: %zu of %zu pipelines dropped, their shaders are not in this build (an older build's list)",
+            listed - list.size(), listed);
     std::scoped_lock lk{g_warm_mu};
     for (const PipeDesc& d : list)
         if (g_desc_keys.insert(desc_key(d)).second) g_descs.push_back(d);

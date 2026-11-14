@@ -83,6 +83,8 @@ const Shader* shader_by_key(u64 key);
 std::string shader_folder();
 // Number of shaders in the reflection table (0: table missing).
 size_t shader_count();
+// Whether the table has a translation of key (no load, no log). Any thread.
+bool shader_known(u64 key);
 
 // Set index of a stage: vertex 0, pixel 1, geometry 2, task 3, mesh 4; compute 0.
 u32 stage_set(ShStage s);

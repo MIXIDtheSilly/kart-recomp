@@ -760,6 +760,12 @@ size_t shader_count() {
     return g_rows.size();
 }
 
+bool shader_known(u64 key) {
+    std::scoped_lock lk{g_mu};
+    load_table();
+    return g_rows.count(key) != 0;
+}
+
 const Shader* shader(const u8 k[8]) { return shader_by_key(key_u64(k)); }
 
 // Loaded outside g_mu (file reads, the driver): the warm-up threads load shaders while the renderer looks them up.
