@@ -6,7 +6,9 @@ look like, how the recompiled code runs, what the host does, every setting, and 
 ## Playing
 
 Plug in an Xbox controller, DualShock 4, DualSense or Switch Pro Controller (USB or Bluetooth), or use
-the keyboard:
+the keyboard. Up to 4 players: each controller joins as the next player when it first presses a button
+(that press is not passed on), so have every player press one before picking multiplayer. The keyboard
+always drives player 1.
 
 | Switch | Keyboard |
 |--------|----------|
@@ -122,7 +124,7 @@ Verification so far: 2,481 integer and 997 SIMD leaf functions identical to Unic
 | `kernel.cpp` | system calls. Guest threads run under a per-core priority scheduler; mutexes, condition variables, the address arbiter and events share one kernel lock |
 | `ipc.cpp` | HIPC with CMIF, TIPC, domains (shared by cloned sessions) and control commands |
 | `services\` | sm, applet (appletOE), fs (a RomFS image built over the loose `romfs\` folder; saves in `user\save`), hid, audren, hwopus, time, acc, pctl, nifm (offline), friend, chat, lm |
-| `services\hid.cpp`, `gamepads.cpp` | one Pro Controller on player 1 (Handheld when the game doesn't take Fullkey), written into nn::hid's shared memory (`hid_shared.h`) every 4 ms. Input comes from Xbox pads (XInput), DualShock 4, DualSense and the Switch Pro Controller (raw HID reports, over USB and Bluetooth) and the keyboard |
+| `services\hid.cpp`, `gamepads.cpp` | player 1 as a Pro Controller (Handheld when the game doesn't take Fullkey) and players 2-4 as Pro Controllers, one gamepad each (a pad joins as the next player on its first button press; `ShowControllerSupport` answers with the players joined), written into nn::hid's shared memory (`hid_shared.h`) every 4 ms. Input comes from Xbox pads (XInput), DualShock 4, DualSense and the Switch Pro Controller (raw HID reports, over USB and Bluetooth) and the keyboard |
 | `audio_core\`, `services\audio.cpp` | audren: Eden's audio renderer (voices, mixes, effects), adapted to the host and played through WASAPI. The output stream sets the pace |
 | `services\opus.cpp` | `hwopus` on libopus (the movies' audio) |
 | `services\gsv.cpp`, `vdec_mf.cpp` | the Switch 2 graphics server (`nx2:gsv`: syncpoints, native memory and images, the video decoder). Movies are VP9, decoded with Media Foundation |

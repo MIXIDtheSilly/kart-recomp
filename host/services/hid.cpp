@@ -1,6 +1,7 @@
-// hid: input. One Pro Controller on player 1 (Handheld when the game doesn't take Fullkey), fed by
-// every gamepad (gamepads.cpp: XInput, DualShock 4, DualSense) and the keyboard while the game window has
-// the focus. The state goes into the shared memory in nn::hid's layout (hid_shared.h).
+// hid: input. Player 1 as a Pro Controller (Handheld when the game doesn't take Fullkey), fed by the first gamepad
+// to press a button and the keyboard while the game window has the focus; players 2-4 as Pro Controllers, one more
+// gamepad each (gamepads.cpp: XInput, DualShock 4, DualSense, Switch Pro Controller). The state goes into the shared
+// memory in nn::hid's layout (hid_shared.h).
 #include <windows.h>
 
 #include <algorithm>
@@ -155,6 +156,47 @@ void connect(NpadInternalState& np, bool handheld) {
     }
 }
 
+// A player whose pad left: no style, no device, and a last entry that says so.
+void disconnect(NpadInternalState& np) {
+    np.style = 0;
+    np.device_type = 0;
+    np.fullkey_color_attribute = ColorNoController;
+    np.joycon_color_attribute = ColorNoController;
+    np.battery_dual = 0;
+    np.applet_footer_type = 0;
+    std::fill(std::begin(np.sixaxis_properties), std::end(np.sixaxis_properties), u8(0));
+    const NpadGenericState empty{};
+    for (auto* lifo : {&np.fullkey_lifo, &np.handheld_lifo, &np.joy_dual_lifo, &np.joy_left_lifo, &np.joy_right_lifo,
+                       &np.palma_lifo, &np.system_ext_lifo})
+        lifo_push(*lifo, empty);
+}
+
+// One player's state into its npad: the style's lifo gets it, the others advance with empty entries, as in Eden.
+void push_state(NpadInternalState& np, const PadInput& in, bool handheld) {
+    NpadGenericState st{};
+    st.buttons = in.buttons;
+    st.l = in.l;
+    st.r = in.r;
+    st.attributes = Connected | Wired;
+    if (handheld) {
+        st.attributes |= LeftConnected | RightConnected | LeftWired | RightWired;
+        lifo_push(np.handheld_lifo, st);
+    } else {
+        lifo_push(np.fullkey_lifo, st);
+    }
+    NpadGenericState empty{};
+    if (handheld) lifo_push(np.fullkey_lifo, empty);
+    else lifo_push(np.handheld_lifo, empty);
+    lifo_push(np.joy_dual_lifo, empty);
+    lifo_push(np.joy_left_lifo, empty);
+    lifo_push(np.joy_right_lifo, empty);
+    lifo_push(np.palma_lifo, empty);
+    lifo_push(np.system_ext_lifo, empty);
+    lifo_push(np.gc_trigger_lifo, NpadGcTriggerState{});
+}
+
+// Player 1 is always connected (the keyboard drives it too, and whichever pad joins first). Players 2-4 (npads No2-No4)
+// are connected while a pad holds them (gamepads.h: a pad joins on its first button press), as Pro Controllers.
 void input_thread() {
     SetThreadDescription(GetCurrentThread(), L"hid");
     const auto script = load_script();
@@ -170,9 +212,11 @@ void input_thread() {
     gamepads::start();
 
     u64 last_buttons = 0;
+    std::array<bool, gamepads::MaxPlayers> connected{true};
     for (;;) {
-        PadInput in;
-        gamepads::read(in);
+        gamepads::Players players;
+        gamepads::read(players);
+        PadInput& in = players.state[0];
         if (window_focused()) read_keyboard(in);
         const double t = (host_ns() - start) / 1e9;
         for (const auto& s : script)
@@ -180,28 +224,26 @@ void input_thread() {
         add_stick_buttons(in);
         if (in.buttons != last_buttons && !script.empty()) LOG("hid: buttons 0x%llx at %.2f s", in.buttons, t);
         last_buttons = in.buttons;
+        push_state(np, in, handheld);
 
-        NpadGenericState st{};
-        st.buttons = in.buttons;
-        st.l = in.l;
-        st.r = in.r;
-        st.attributes = Connected | Wired;
-        if (handheld) {
-            st.attributes |= LeftConnected | RightConnected | LeftWired | RightWired;
-            lifo_push(np.handheld_lifo, st);
-        } else {
-            lifo_push(np.fullkey_lifo, st);
+        // Players 2-4: only as Pro Controllers (a game that takes only handheld has no room for them)
+        bool changed = false;
+        for (int p = 1; p < gamepads::MaxPlayers; p++) {
+            const bool on = players.joined[p] && (styles & StyleFullkey);
+            auto& other = shared_format().npad(p);
+            if (on != connected[p]) {
+                connected[p] = on;
+                changed = true;
+                if (on) connect(other, false);
+                else disconnect(other);
+                LOG("hid: player %d %s", p + 1, on ? "connected as Pro Controller" : "disconnected");
+            }
+            if (on) {
+                add_stick_buttons(players.state[p]);
+                push_state(other, players.state[p], false);
+            }
         }
-        // The other styles' lifos advance with empty entries, as in Eden.
-        NpadGenericState empty{};
-        if (handheld) lifo_push(np.fullkey_lifo, empty);
-        else lifo_push(np.handheld_lifo, empty);
-        lifo_push(np.joy_dual_lifo, empty);
-        lifo_push(np.joy_left_lifo, empty);
-        lifo_push(np.joy_right_lifo, empty);
-        lifo_push(np.palma_lifo, empty);
-        lifo_push(np.system_ext_lifo, empty);
-        lifo_push(np.gc_trigger_lifo, NpadGcTriggerState{});
+        if (changed) style_event().signal();
         Sleep(4);
     }
 }
@@ -232,6 +274,11 @@ struct Hid : Service {
         });
         on(102, [](Request&) {});  // SetSupportedNpadIdType
         on(103, [](Request&) {});  // ActivateNpad
+        on(107, [](Request& r) {   // DisconnectNpad(u32 npad id, aruid): players 2-4's pad leaves until its next press
+            const u32 id = r.arg<u32>(0);
+            if (id >= 1 && id < u32(gamepads::MaxPlayers)) gamepads::leave(static_cast<int>(id));
+            else LOG("hid: DisconnectNpad(%#x) kept", id);
+        });
         on(109, [](Request&) {});  // ActivateNpadWithRevision
         on(106, [](Request& r) { r.out_copy.push_back(style_event().new_handle()); });  // AcquireNpadStyleSetUpdateEventHandle
         on(120, [](Request&) {});  // SetNpadJoyHoldType

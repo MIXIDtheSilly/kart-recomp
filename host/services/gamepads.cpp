@@ -43,21 +43,21 @@ Stick radial(float x, float y) {
     return {c(x), c(y)};
 }
 
-void merge(Stick& to, Stick s) {
-    if (std::abs(s.x) + std::abs(s.y) > std::abs(to.x) + std::abs(to.y)) to = s;
-}
+struct PsPad;
 
-void add(State& in, const State& s) {
-    in.buttons |= s.buttons;
-    merge(in.l, s.l);
-    merge(in.r, s.r);
-}
+// One connected pad this tick. `key` names it for as long as it stays connected.
+struct Source {
+    std::wstring key;
+    std::string name;
+    State state;
+    std::shared_ptr<PsPad> pad;  // HID pads (player lights)
+};
 
 // ------------------------------------------------------------------ XInput
 
 std::atomic<u32> g_xinput_slots{0};  // bit per slot that had a pad at the last look
 
-void read_xinput(State& in) {
+void read_xinput(std::vector<Source>& out) {
     const u32 slots = g_xinput_slots.load(std::memory_order_relaxed);
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
         if (!(slots & (1u << i))) continue;
@@ -90,7 +90,7 @@ void read_xinput(State& in) {
         if (g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) s.buttons |= ZR;
         s.l = radial(g.sThumbLX / 32767.0f, g.sThumbLY / 32767.0f);
         s.r = radial(g.sThumbRX / 32767.0f, g.sThumbRY / 32767.0f);
-        add(in, s);
+        out.push_back({L"xinput:" + std::to_wstring(i), "Xbox pad " + std::to_string(i + 1), s, nullptr});
     }
 }
 
@@ -174,7 +174,9 @@ struct PsPad {
     // Switch Pro Controller: the handle is overlapped (replies are waited for with a timeout)
     bool nintendo = false, usb = false;
     u32 out_size = 0;
-    u8 counter = 0;
+    std::atomic<u8> counter{0};
+    std::atomic<bool> ready{false};  // set up: player lights can be sent
+    std::atomic<int> player{-1};     // the player it joined as (-1: not joined)
     StickCal cal[2];
     std::atomic<bool> alive{true};
     std::mutex lock;
@@ -352,14 +354,29 @@ void read_switch(std::shared_ptr<PsPad> pad) {
     }
     read_calibration(p);
     if (!subcommand(p, 0x03, {0x30})) LOG("hid: %s: full report mode not acknowledged", p.name.c_str());
-    subcommand(p, 0x30, {0x01});  // player 1 light
+    const int player = p.player;
+    subcommand(p, 0x30, {u8(player < 0 ? 0 : 1u << player)});  // its player's light (none before it joins)
+    p.ready = true;
     LOG("hid: gamepad ready: %s", p.name.c_str());
 
     std::vector<u8> buf(std::max<u32>(p.report_size, 64));
     bool logged = false;
+    ULONGLONG last_reset = 0;
     for (;;) {
         DWORD n = 0;
         if (!hid_io(p.handle, false, buf.data(), static_cast<DWORD>(buf.size()), n, INFINITE)) break;
+        // 0x3f: the pad is back in its simple HID mode (it was reset: a Bluetooth reconnect, or another program
+        // such as Steam talking to it). Full reports again, and its player light; at most once a second.
+        if (n > 0 && buf[0] == 0x3f) {
+            if (GetTickCount64() - last_reset >= 1000) {
+                last_reset = GetTickCount64();
+                const bool ok = subcommand(p, 0x03, {0x30});
+                const int player = p.player;
+                subcommand(p, 0x30, {u8(player < 0 ? 0 : 1u << player)});
+                LOG("hid: %s: back in simple mode, full reports %s", p.name.c_str(), ok ? "again" : "not acknowledged");
+            }
+            continue;
+        }
         if (n < 12 || (buf[0] != 0x30 && buf[0] != 0x21)) {
             if (!logged && n > 0) LOG("hid: %s: report 0x%02x of %lu bytes not understood", p.name.c_str(), buf[0], n);
             logged = true;
@@ -503,14 +520,101 @@ void start() {
     }).detach();
 }
 
-void read(State& in) {
-    read_xinput(in);
-    std::lock_guard lk{g_pads_lock};
-    for (const auto& p : g_pads) {
-        if (!p->alive) continue;
-        std::lock_guard plk{p->lock};
-        add(in, p->state);
+namespace {
+
+// Player lights (subcommand 0x30: bit n lights LED n+1) without waiting for the reply: the pad's reader thread gets it.
+void show_player(PsPad& p, int player) {
+    p.player = player;
+    if (!p.nintendo || !p.ready) return;  // set up later with the current player
+    std::vector<u8> out(p.out_size);
+    static constexpr u8 rumble[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
+    out[0] = 0x01;
+    out[1] = p.counter++ & 0xf;
+    std::copy(std::begin(rumble), std::end(rumble), out.begin() + 2);
+    out[10] = 0x30;
+    out[11] = u8(player < 0 ? 0 : 1u << player);
+    DWORD n = 0;
+    hid_io(p.handle, true, out.data(), static_cast<DWORD>(out.size()), n, 500);
+}
+
+struct Slot {
+    std::wstring key;  // empty: free
+    std::string name;
+    std::shared_ptr<PsPad> pad;
+    bool holding = false;  // the joining press: nothing reaches the game until every button is up
+};
+
+std::mutex g_slots_lock;
+std::array<Slot, MaxPlayers> g_slots;
+std::vector<std::wstring> g_left;  // pads sent away by leave(): they join again on a new press, not the one held now
+
+}  // namespace
+
+void read(Players& out) {
+    std::vector<Source> now;
+    read_xinput(now);
+    {
+        std::lock_guard lk{g_pads_lock};
+        for (const auto& p : g_pads) {
+            if (!p->alive) continue;
+            std::lock_guard plk{p->lock};
+            now.push_back({p->path, p->name, p->state, p});
+        }
     }
+    const auto find = [&](const std::wstring& key) {
+        return std::find_if(now.begin(), now.end(), [&](const Source& s) { return s.key == key; });
+    };
+
+    std::lock_guard lk{g_slots_lock};
+    // Pads that are gone free their player
+    for (int i = 0; i < MaxPlayers; i++) {
+        Slot& s = g_slots[i];
+        if (s.key.empty() || find(s.key) != now.end()) continue;
+        LOG("hid: player %d left (%s disconnected)", i + 1, s.name.c_str());
+        s = {};
+    }
+    // A pad sent away by leave() may join again once its buttons are up
+    std::erase_if(g_left, [&](const std::wstring& key) {
+        auto it = find(key);
+        return it == now.end() || it->state.buttons == 0;
+    });
+    // Pads without a player join on a button press, as the lowest free player
+    for (const Source& src : now) {
+        if (!src.state.buttons) continue;
+        if (std::any_of(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return s.key == src.key; })) continue;
+        if (std::find(g_left.begin(), g_left.end(), src.key) != g_left.end()) continue;
+        auto free = std::find_if(g_slots.begin(), g_slots.end(), [](const Slot& s) { return s.key.empty(); });
+        if (free == g_slots.end()) continue;
+        *free = {src.key, src.name, src.pad, true};
+        const int player = static_cast<int>(free - g_slots.begin());
+        LOG("hid: player %d: %s", player + 1, src.name.c_str());
+        if (src.pad) show_player(*src.pad, player);
+    }
+    for (int i = 0; i < MaxPlayers; i++) {
+        Slot& s = g_slots[i];
+        out.joined[i] = !s.key.empty();
+        out.state[i] = {};
+        if (s.key.empty()) continue;
+        const State& st = find(s.key)->state;
+        if (s.holding && st.buttons == 0) s.holding = false;
+        if (!s.holding) out.state[i] = st;
+    }
+}
+
+void leave(int player) {
+    if (player < 0 || player >= MaxPlayers) return;
+    std::lock_guard lk{g_slots_lock};
+    Slot& s = g_slots[player];
+    if (s.key.empty()) return;
+    LOG("hid: player %d left (the game disconnected it): %s joins again on its next press", player + 1, s.name.c_str());
+    g_left.push_back(s.key);
+    if (s.pad) show_player(*s.pad, -1);
+    s = {};
+}
+
+int connected_players() {
+    std::lock_guard lk{g_slots_lock};
+    return 1 + static_cast<int>(std::count_if(g_slots.begin() + 1, g_slots.end(), [](const Slot& s) { return !s.key.empty(); }));
 }
 
 }  // namespace gamepads
