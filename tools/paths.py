@@ -8,7 +8,7 @@ a comment; the file is not committed), else from the default below.
   NVN_XLATE  folder the shader translator (dmsh_xlate.exe, from tools/xlate) is built into   (work/xlate)
   BUILD_CC   the C++ compiler: mingw (clang from llvm-mingw, which the launcher's Set up downloads: no Visual Studio
              needed), cl (Visual Studio) or clang (clang-cl with Visual Studio's libraries)
-                                                             (mingw when MINGW holds it, else cl)
+                                                             (mingw)
   MINGW      the llvm-mingw toolchain (python tools\toolchain.py install puts it there)    (tools\llvm-mingw)
   VCVARS     Visual Studio's vcvars64.bat, for BUILD_CC=cl or clang         (found with vswhere)
   CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\Program Files\LLVM\bin)
@@ -83,7 +83,7 @@ def get(key):
     if key == "MINGW":
         return str(ROOT / "tools" / "llvm-mingw")
     if key == "BUILD_CC":
-        return "mingw" if (Path(get("MINGW")) / "bin" / "clang++.exe").exists() else "cl"
+        return "mingw"   # ~50% faster game than cl (race ~150 fps against ~100); mingw_env says how to get it
     if key == "VCVARS":
         return _find_vcvars()
     if key == "CLANG":

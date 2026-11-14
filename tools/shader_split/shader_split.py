@@ -712,13 +712,19 @@ def cpk_shaders(path, rel, ents, out):
         scan_blob(d, f'/{rel}/{e[0]}', out)
 
 ZIP = b'PK\x03\x04'
+def head4(p):   # a file's first 4 bytes (b'' when it cannot be read)
+    try:
+        with open(p, 'rb') as f: return f.read(4)
+    except OSError: return b''
+
 def zip_jobs(files, parts=64):
     """Every member of every zip archive in ranges of about equal length (Portal: the whole game in game.zip, 41,416 members, 4.6 GB inflated, Deflate or stored; its GLSLC outputs are the
     221 nxcontent/nvsb/*.nvsb files, but no name is relied on). → ([(path, rel, (ZIP, members)), …], the zip paths). An archive zipfile cannot read is scanned as one file, as before"""
     import zipfile
     zs = []
-    for p, r in files:
-        with open(p, 'rb') as f: h = f.read(4)
+    # the first 4 bytes of every file, read on threads: one at a time, the opens alone took minutes (Mario Kart World: 206,202 files, longer still on a cold disk)
+    with cf.ThreadPoolExecutor(32) as tp: heads = list(tp.map(head4, [p for p, _ in files]))
+    for (p, r), h in zip(files, heads):
         if h != ZIP: continue
         try:
             with open(p, 'rb') as source, zipfile.ZipFile(source) as z: zs.append((p, r, [(i.filename, i.file_size) for i in z.infolist() if not i.is_dir()]))

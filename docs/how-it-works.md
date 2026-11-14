@@ -19,13 +19,15 @@ always drives player 1.
 | + / - | M or Enter / N |
 
 On a gamepad, buttons go by position: the bottom face button is B and the right one is A. F3 shows
-an overlay with FPS, frame time and memory. The first races can stutter while pipelines and
+an overlay with FPS, frame time and memory, and F11 switches to borderless fullscreen and back. The first races can stutter while pipelines and
 textures are prepared; **Bake textures** in the launcher decodes every texture ahead of time.
 Integrated GPUs and handheld PCs get a unified-memory mode automatically. Saves and logs live in
 `host\out\user\` (or `user-1.8.0\`). Settings: see [Every setting](#every-setting).
 
 The optional VP9 Video Extensions (Microsoft Store) play the movies; without them they're skipped.
-The launcher's **Set up** downloads the C++ compiler (LLVM MinGW, into `tools\llvm-mingw\`; see
+The launcher's **Set up** installs Python 3.13 and the .NET 10 SDK into `tools\python\` and
+`tools\dotnet\` when the PC has none (`tools\bootstrap.ps1`, no admin rights; the launcher puts them
+first on PATH for what it runs), downloads the C++ compiler (LLVM MinGW, into `tools\llvm-mingw\`; see
 [Build options](#build-options)), installs the Python packages (`requirements.txt`) and builds the
 shader translator from the NuGet packages in `tools\xlate\packages\`; the SPIR-V tools are in
 `third_party\spirv\`. Keep the repository in a path without spaces.

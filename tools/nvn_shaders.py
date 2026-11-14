@@ -104,10 +104,20 @@ def run_split():
     cmd = [sys.executable, os.path.join(OUT, 'split_driver.py'), ROMFS, MAIN, os.path.join(SPLIT, 'pkg'), os.path.join(SPLIT, 'shader_map.tsv'),
            os.path.join(SPLIT, 'shader_facts.tsv'), os.path.join(SPLIT, 'shader_pairs.tsv'), os.path.join(SPLIT, 'pso_pairs.tsv')]
     print('split:', ' '.join(cmd), flush=True)
-    with open(os.path.join(SPLIT, 'split.log'), 'w') as log:
-        r = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-    if r.returncode:
-        sys.exit(f'shader_split.py failed ({r.returncode}); see {SPLIT}/split.log')
+    # Its output goes to split.log; its 'progress: <done>/<total>' lines (files scanned) also to the launcher's bar, and its
+    # [RED] lines to the console. The bar shows from the start: listing and sorting the game files comes first.
+    what = 'finding the shaders in the game files'
+    paths.progress(0, 1, what)
+    with open(os.path.join(SPLIT, 'split.log'), 'w', encoding='utf-8') as log:
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+        for line in p.stdout:
+            log.write(line)
+            m = re.match(r'progress: (\d+)/(\d+)', line)
+            if m: paths.progress(int(m[1]), int(m[2]), what)
+            elif line.startswith('[RED]'): print(line.rstrip(), flush=True)
+        p.wait()
+    if p.returncode:
+        sys.exit(f'shader_split.py failed ({p.returncode}); see {SPLIT}/split.log')
 
 
 def load_tables():
