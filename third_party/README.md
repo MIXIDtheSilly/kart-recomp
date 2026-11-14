@@ -16,7 +16,7 @@ carry libc++, libunwind (Apache-2.0 with LLVM exceptions) and winpthreads (MIT-s
 | `lz4\` | LZ4 block format (`lz4.c`): the renderer's decoded-texture cache on disk | 1.10.0 (ebb370ca83) | BSD-2-Clause (`LICENSE`) |
 | `zstd\` | Zstandard, the decoder only (`common\`, `decompress\`): the game's `.zs` files, read by the texture bake | 1.5.8 (33618c8) | BSD-3-Clause (`LICENSE`) |
 | `opus\` | Opus: the float build in plain C, without the SIMD paths, for the `hwopus` service (movie audio) | a3f0ec02b3 | BSD-3-Clause (`COPYING`) |
-| `spirv\bin\` | Khronos SPIR-V tools, prebuilt for Windows x64 (from the Vulkan SDK): `spirv-val`, `spirv-opt`, `spirv-dis` (SPIRV-Tools v2026.4), `spirv-cross`, `glslangValidator` (16.6.0). The shader tools run them; they need only the VC++ runtime | SDK 1.4.363.0 | Apache-2.0 (`LICENSE-SPIRV-Tools`, `LICENSE-SPIRV-Cross`); glslang: BSD-3-Clause and others (`LICENSE-glslang.txt`) |
+| `spirv\bin\` | Khronos SPIR-V tools, prebuilt for Windows x64 (from the Vulkan SDK): `spirv-val`, `spirv-opt`, `spirv-dis` (SPIRV-Tools v2026.4), `spirv-cross`, `glslangValidator` (16.6.0). The shader tools run them. `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` beside them are the Visual C++ runtime they need (14.51.36231, from the Visual Studio redist folder), so PCs without the VC++ redistributable can run them too | SDK 1.4.363.0 | Apache-2.0 (`LICENSE-SPIRV-Tools`, `LICENSE-SPIRV-Cross`); glslang: BSD-3-Clause and others (`LICENSE-glslang.txt`); VC++ runtime: Microsoft Visual Studio redistributable files (`redist.txt`), app-local deployment |
 | `stb\` | stb_dxt by Fabian Giesen: BC1/BC3 block encoding. This is Eden's copy, split into a header and a source file | 1.12 | MIT or public domain |
 
 ## Code adapted into `host\`
