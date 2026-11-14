@@ -35,7 +35,7 @@ OPUS = ["-DOPUS_BUILD", "-DUSE_ALLOCA", "-DHAVE_LRINT", "-DHAVE_LRINTF", "-DDISA
         *(f"-I{TP / 'opus' / d}" for d in ("", "include", "celt", "silk", "silk/float"))]
 LIBS = ["user32", "gdi32", "shell32", "ole32", "oleaut32", "advapi32", "winmm", "bcrypt", "ntdll", "ws2_32", "uuid",
         "version", "setupapi", "dbghelp", "imm32", "cfgmgr32", "avrt", "ksuser", "hid", "xinput1_4", "synchronization",
-        "mfplat", "mfuuid"]   # xinput1_4: mingw's libxinput.a is XINPUT1_3.dll, which Windows does not have
+        "mfplat", "mfuuid", "iphlpapi"]   # xinput1_4: mingw's libxinput.a is XINPUT1_3.dll, which Windows does not have
 
 
 def sources(art):

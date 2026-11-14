@@ -77,6 +77,23 @@ void boot_graphics_system(Ctx* c) {
     LOG("nn::gs::sdk::BootGraphicsSystem(%#llx, %#llx): skipped, graphics are native", c->x[0], c->x[1]);
 }
 
+// HOST_NET_TRACE=2: every non-zero nn::Result the game wraps for an error message (nn::err::ErrorResultVariant), with
+// the call stack, and from Pia's logger (main+0x25649e0, Pia result in x20) Pia's own code and source location tag:
+// finds the check behind a network error.
+GuestFn g_error_result_variant;
+void error_result_variant(Ctx* c) {
+    const u32 res = ld<u32>(c->x[1]);
+    if (res != 0) {
+        LOG("err: Result %#x (%04u-%04u) from %s", res, 2000 + (res & 0x1ff), (res >> 9) & 0x1fff, describe_guest(c->x[30]).c_str());
+        if (c->x[30] == module_base("main") + 0x2564a88) {
+            const u64 pr = c->x[20];
+            LOG("err:   pia result %#x, location %#llx", ld<u32>(pr), static_cast<unsigned long long>(ld<u64>(pr + 0x10)));
+        }
+        dump_guest_stack(c);
+    }
+    g_error_result_variant(c);
+}
+
 }  // namespace
 
 u64 sdk_export(const char* name) {
@@ -88,6 +105,11 @@ void host_install_overrides() {
     LOG("sdk exports: %zu", sdk_exports().size());
     override_sdk("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
                  show_controller_support);
+    if (const char* v = std::getenv("HOST_NET_TRACE"); v && std::atoi(v) >= 2) {
+        const char* erv = "_ZN2nn3err18ErrorResultVariantC1ERKNS_6ResultE";
+        g_error_result_variant = recompiled_fn(sdk_export(erv));
+        if (g_error_result_variant) override_sdk(erv, error_result_variant);
+    }
     // HOST_HLE_GRAPHICS=1: the old native nv::/nn::vi/NVN stand-ins (no GPU).
     if (const char* v = std::getenv("HOST_HLE_GRAPHICS"); v && v[0] == '1') {
         override_sdk("_ZN2nn2gs3sdk18BootGraphicsSystemEPvm", boot_graphics_system);

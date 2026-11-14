@@ -1,4 +1,6 @@
 // am (appletOE): the application's view of the applet manager.
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -21,6 +23,7 @@ struct AppletState {
     kern::ServiceEvent message_event;
     kern::ServiceEvent gpu_error_event, suspended_tick_event, launch_param_event;
     kern::ServiceEvent operation_mode_refresh_event;  // never signalled: the operation mode does not change
+    kern::ServiceEvent launchable_event;
     // Handheld (undocked, lower resolution) by default; HOST_HANDHELD=0: docked
     bool docked = [] {
         const char* v = std::getenv("HOST_HANDHELD");
@@ -63,6 +66,69 @@ struct Storage : Service {
     std::shared_ptr<std::vector<u8>> data;
 };
 
+// ------------------------------------------------------------------ library applets
+
+// A library applet (error viewer, network connection dialog, ...): its input is logged and it completes as soon as it
+// starts, as if the player closed it at once. Without one the game waited forever on GetLibraryAppletLaunchableEvent.
+struct LibraryAppletAccessor : Service {
+    u32 id, mode;
+    kern::ServiceEvent state_event, out_event, interactive_event;
+    bool started = false;
+
+    LibraryAppletAccessor(u32 id_, u32 mode_) : Service("ILibraryAppletAccessor"), id(id_), mode(mode_) {
+        on(0, [this](Request& r) { r.out_copy.push_back(state_event.new_handle()); });  // GetAppletStateChangedEvent
+        on(1, [this](Request& r) { r.push<u8>(started); });                             // IsCompleted
+        on(10, [this](Request&) {                                                       // Start
+            LOG("am: library applet %#x (mode %u) started; it closes at once", id, mode);
+            started = true;
+            state_event.signal();
+        });
+        for (u32 c : {20u, 25u}) on(c, [this](Request&) { started = true; state_event.signal(); });  // RequestExit, Terminate
+        on(30, [](Request&) {});                                                         // GetResult: success
+        auto push = [this](Request& r, const char* what) {
+            std::string hex;
+            if (!r.in_services.empty() && r.in_services[0] && r.in_services[0]->name == "IStorage") {
+                const auto& d = *static_cast<Storage*>(r.in_services[0].get())->data;
+                for (size_t i = 0; i < d.size() && i < 64; i++) {
+                    char b[4];
+                    std::snprintf(b, sizeof b, "%02x", d[i]);
+                    hex += b;
+                    if (i % 4 == 3) hex += ' ';
+                }
+                LOG("am: library applet %#x %s (%zu bytes): %s", id, what, d.size(), hex.c_str());
+            }
+        };
+        on(100, [push](Request& r) { push(r, "in data"); });              // PushInData
+        on(103, [push](Request& r) { push(r, "interactive in data"); });  // PushInteractiveInData
+        for (u32 c : {101u, 104u}) on(c, [](Request& r) { r.result = MakeResult(128, 3); });  // PopOutData: none
+        on(105, [this](Request& r) { r.out_copy.push_back(out_event.new_handle()); });
+        on(106, [this](Request& r) { r.out_copy.push_back(interactive_event.new_handle()); });
+        on(110, [](Request& r) { r.push<u8>(0); });  // NeedsToExitProcess
+        on(120, [this](Request& r) {                 // GetLibraryAppletInfo
+            r.push<u32>(id);
+            r.push<u32>(mode);
+        });
+        for (u32 c : {50u, 60u, 102u, 150u}) on(c, [](Request&) {});
+    }
+};
+
+struct LibraryAppletCreator : Service {
+    LibraryAppletCreator() : Service("ILibraryAppletCreator") {
+        // CreateLibraryApplet (0) and its Switch 2 form (3): applet id, mode, then (3) more words
+        auto create = [](Request& r) {
+            LOG("am: CreateLibraryApplet(%u): %08x %08x %08x %08x %08x %08x", r.cmd, r.arg<u32>(0), r.arg<u32>(4), r.arg<u32>(8),
+                r.arg<u32>(12), r.arg<u32>(16), r.arg<u32>(20));
+            if (kern::KThread* t = kern::current_thread(); t && std::getenv("HOST_NET_TRACE")) dump_guest_stack(&t->ctx);
+            r.push_object(std::make_shared<LibraryAppletAccessor>(r.arg<u32>(0), r.arg<u32>(4)));
+        };
+        on(0, create);
+        on(3, create);
+        on(10, [](Request& r) {  // CreateStorage
+            r.push_object(std::make_shared<Storage>(std::vector<u8>(static_cast<size_t>(std::clamp<s64>(r.arg<s64>(0), 0, 1 << 26)))));
+        });
+    }
+};
+
 struct CommonStateGetter : Service {
     CommonStateGetter() : Service("ICommonStateGetter") {
         on(0, [](Request& r) { r.out_copy.push_back(applet().message_event.new_handle()); });
@@ -89,6 +155,10 @@ struct CommonStateGetter : Service {
 struct SelfController : Service {
     SelfController() : Service("ISelfController") {
         for (u32 id : {1u, 2u, 11u, 12u, 13u, 14u, 16u, 19u, 40u, 68u}) on(id, [](Request&) {});
+        on(9, [](Request& r) {  // GetLibraryAppletLaunchableEvent: always launchable
+            applet().launchable_event.signal();
+            r.out_copy.push_back(applet().launchable_event.new_handle());
+        });
         on(91, [](Request& r) { r.out_copy.push_back(applet().suspended_tick_event.new_handle()); });
         on(2000, [](Request& r) {  // GetGraphicsSystemSession: a plain session (copy handle) even inside the am domain
             r.out_copy.push_back(new_session(make_service("nx2:gsv")));
@@ -154,7 +224,7 @@ struct ApplicationProxy : Service {
         on(3, [](Request& r) { r.push_object(stub("IAudioController")); });
         on(4, [](Request& r) { r.push_object(stub("IDisplayController")); });
         on(10, [](Request& r) { r.push_object(stub("IProcessWindingController")); });
-        on(11, [](Request& r) { r.push_object(stub("ILibraryAppletCreator")); });
+        on(11, [](Request& r) { r.push_object(std::make_shared<LibraryAppletCreator>()); });
         on(20, [](Request& r) { r.push_object(std::make_shared<ApplicationFunctions>()); });
         for (u32 id : {40u, 50u, 70u, 80u, 90u}) {  // Switch 2 getters with unknown interfaces
             on(id, [id](Request& r) { r.push_object(stub("IApplicationProxy.getter" + std::to_string(id))); });

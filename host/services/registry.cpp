@@ -5,6 +5,7 @@ namespace ipc {
 void register_sm();
 void register_applet();
 void register_misc();
+void register_net();
 void register_fs();
 void register_hid();
 void register_audio();
@@ -15,6 +16,7 @@ void register_all_services() {
     register_sm();
     register_applet();
     register_misc();
+    register_net();  // nifm, bsd: LAN play
     register_fs();
     register_hid();
     register_audio();

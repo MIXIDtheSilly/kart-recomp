@@ -25,6 +25,20 @@ textures are prepared; **Bake textures** in the launcher decodes every texture a
 Integrated GPUs and handheld PCs get a unified-memory mode automatically. Saves and logs live in
 `host\out\user\` (or `user-1.8.0\`). Settings: see [Every setting](#every-setting).
 
+### LAN Play
+
+Races between PCs on the same network use the game's own LAN Play. The main menu's **Wireless Play**
+entry is already **LAN Play**: a game patch (`tools/patches.py`) switches it on at start whenever the PC has a network
+adapter, which on the console takes holding L and R and clicking the left stick. That combo (Q+E and F on the
+keyboard) still switches back to Wireless Play, which has no service behind it here. One player picks
+**Create Room**, the others see that room and join it. Every PC needs its own copy of the game and this port, on the
+same network (Wi-Fi or cable; the router needs no internet connection), and all of them the same game version (1.0.0
+and 1.8.0 most likely don't see each other's rooms). The first time, Windows asks whether the game (`kart.exe` or
+`kart-1.8.0.exe`) may use the network: allow it on private networks, or the PCs never see each other. With several
+network adapters (a VPN, virtual machines), `HOST_LAN_IP` picks the right one. `HOST_PLAYER_NAME` sets the name the
+other players see. Online Play stays off: there is no internet service behind it, so the game returns to the menu.
+Two copies on one PC can't play together (they would share the game's ports, and each needs about 14 GB of RAM).
+
 The optional VP9 Video Extensions (Microsoft Store) play the movies; without them they're skipped.
 The launcher's **Set up** installs Python 3.13 and the .NET 10 SDK into `tools\python\` and
 `tools\dotnet\` when the PC has none (`tools\bootstrap.ps1`, no admin rights; the launcher puts them
@@ -126,7 +140,8 @@ Verification so far: 2,481 integer and 997 SIMD leaf functions identical to Unic
 | `memory.cpp` | the 512 GiB guest view over a physical pool, and the kernel's block map (`svcQueryMemory`) |
 | `kernel.cpp` | system calls. Guest threads run under a per-core priority scheduler; mutexes, condition variables, the address arbiter and events share one kernel lock |
 | `ipc.cpp` | HIPC with CMIF, TIPC, domains (shared by cloned sessions) and control commands |
-| `services\` | sm, applet (appletOE), fs (a RomFS image built over the loose `romfs\` folder; saves in `user\save`), hid, audren, hwopus, time, acc, pctl, nifm (offline), friend, chat, lm |
+| `services\` | sm, applet (appletOE; library applets such as the error viewer close as soon as they start), fs (a RomFS image built over the loose `romfs\` folder; saves in `user\save`), hid, audren, hwopus, time, acc, pctl, friend, chat, csrng, lm |
+| `services\net.cpp` | LAN Play: nifm accepts local-network requests (the game's "no internet check" ones) when the PC has a network adapter, and bsd is nn::socket on Winsock (BSD layouts with Linux errno values, blocking calls emulated on non-blocking sockets; the raw ICMP socket Pia pings the gateway with is emulated with `IcmpSendEcho`) |
 | `services\hid.cpp`, `gamepads.cpp` | player 1 as a Pro Controller (Handheld when the game doesn't take Fullkey) and players 2-4 as Pro Controllers, one gamepad each (a pad joins as the next player on its first button press; `ShowControllerSupport` answers with the players joined), written into nn::hid's shared memory (`hid_shared.h`) every 4 ms. Input comes from Xbox pads (XInput), DualShock 4, DualSense and the Switch Pro Controller (raw HID reports, over USB and Bluetooth) and the keyboard |
 | `audio_core\`, `services\audio.cpp` | audren: Eden's audio renderer (voices, mixes, effects), adapted to the host and played through WASAPI. The output stream sets the pace |
 | `services\opus.cpp` | `hwopus` on libopus (the movies' audio) |
@@ -175,10 +190,15 @@ Set them in the environment, or as `HOST_*` lines in `local.cfg`.
 | `HOST_NO_OVERLAY=1` | no performance overlay |
 | `HOST_PLAYERS=<1-4>` | at most that many local players (4); 1: every controller drives player 1 |
 | `HOST_KEYBOARD_JOINS=1` | the keyboard is a player of its own, joining on its first key press like a controller |
+| `HOST_LAN=0`, `HOST_LAN_IP=<address>` | LAN Play: no network (the menu shows Wireless Play again) / the network adapter with that address (by default the one the default route uses) |
+| `HOST_PLAYER_NAME=<name>` | the account nickname other LAN players see ("Player" by default) |
+| `HOST_USER_DIR=<dir>` | saves and logs in that folder instead of `host\out\user\` |
 | `HOST_NVN_TEXCACHE=<dir>\|0` | decoded texture cache folder, or none; `HOST_NVN_TEXCACHE_MB` caps it (64 GiB) |
 | `HOST_NVN_PIPELINE_CACHE=<file>` | where the pipeline cache lives (its `.keys` and `.primed` lists sit beside it) |
 | `HOST_TRANSCODE_THREADS=<n>` | threads for ASTC decoding / BC encoding (a quarter of the cores by default) |
-| `HOST_RENDER_HIDDEN=1`, `HOST_INPUT_SCRIPT="<s>:<buttons>:<duration>;..."` | hidden test runs with scripted presses, e.g. `30:L+R:0.4;35:A:0.2` |
+| `HOST_RENDER_HIDDEN=1`, `HOST_INPUT_SCRIPT="<s>:<buttons>:<duration>;..."` | hidden test runs with scripted presses, e.g. `30:L+R:0.4;35:A:0.2` (buttons also `LS`, `RS`: stick clicks) |
+| `HOST_INPUT_FILE=<file>` | lines appended to the file while the game runs are pressed from when they are read (`0:A:0.2`): driving a test run step by step |
+| `HOST_NET_TRACE=1\|2\|3` | LAN diagnostics: nifm and socket calls; 2 also every IPC request from LAN Play's start and the results behind error messages; 3 also every packet |
 | `HOST_STALL_DUMP_S=<s>` | after frames stop for this long, log every guest thread's state and stack (10 s by default) |
 | `HOST_TIMELINE=<file>`, `HOST_SCHED_STATS=1`, `HOST_DUMP_AFTER=<s>` | diagnostics: timed events, guest core use, thread states |
 | `HOST_NVN_CHECKPOINTS=1`, `HOST_VK_VALIDATION=1` | GPU diagnostics: the last draws before a device loss, Vulkan validation |

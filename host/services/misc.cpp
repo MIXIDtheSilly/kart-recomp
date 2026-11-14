@@ -1,5 +1,8 @@
-// Small system services: lm, pctl, time, acc, aoc, nifm, friend, prepo.
+// Small system services: lm, pctl, time, acc, friend, chat, csrng (nifm: net.cpp).
+#include <algorithm>
+#include <cstdlib>
 #include <ctime>
+#include <random>
 
 #include "../ipc.h"
 
@@ -184,7 +187,10 @@ struct Profile : Service {
             std::memcpy(b, UserId, 16);
             const u64 ts = 1700000000;
             std::memcpy(b + 0x10, &ts, 8);
-            std::strcpy(reinterpret_cast<char*>(b + 0x18), "Player");
+            // HOST_PLAYER_NAME: the account nickname (up to 32 bytes of UTF-8), so LAN players can tell each other apart
+            const char* name = std::getenv("HOST_PLAYER_NAME");
+            if (!name || !*name) name = "Player";
+            std::strncpy(reinterpret_cast<char*>(b + 0x18), name, 0x20);
             r.push_bytes(b, sizeof b);
         };
         on(0, [base](Request& r) {
@@ -226,36 +232,6 @@ struct Acc : Service {
     }
 };
 
-// ------------------------------------------------------------------ nifm: no network
-
-struct NifmRequest : Service {
-    NifmRequest() : Service("IRequest") {
-        on(0, [](Request& r) { r.push<u32>(1); });  // GetRequestState: not submitted / error
-        on(1, [](Request& r) { r.result = MakeResult(110, 3400); });  // GetResult: no internet connection
-        on(2, [this](Request& r) {
-            r.out_copy.push_back(ev1.new_handle());
-            r.out_copy.push_back(ev2.new_handle());
-        });
-        for (u32 id : {3u, 4u, 6u, 11u}) on(id, [](Request&) {});
-    }
-    kern::ServiceEvent ev1, ev2;
-};
-
-struct GeneralService : Service {
-    GeneralService() : Service("IGeneralService") {
-        on(4, [](Request& r) { r.push_object(std::make_shared<NifmRequest>()); });
-        on(18, [](Request& r) { r.push<u32>(0); });  // GetInternetConnectionStatus
-        on(21, [](Request& r) { r.push<u8>(0); });   // IsAnyInternetRequestAccepted
-    }
-};
-
-struct Nifm : Service {
-    explicit Nifm(std::string n) : Service(std::move(n)) {
-        on(4, [](Request& r) { r.push_object(std::make_shared<GeneralService>()); });
-        on(5, [](Request& r) { r.push_object(std::make_shared<GeneralService>()); });
-    }
-};
-
 // ------------------------------------------------------------------ friends
 
 struct FriendService : Service {
@@ -294,6 +270,24 @@ struct Chat : Service {
     }
 };
 
+// ------------------------------------------------------------------ csrng
+
+// nn::os::GenerateRandomBytes. Zeros (the unknown-command answer) gave every PC the same "random" values: Pia's LAN
+// session and station ids come from them.
+struct Csrng : Service {
+    Csrng() : Service("csrng") {
+        on(0, [](Request& r) {  // GenerateRandomBytes
+            static std::random_device dev;
+            std::vector<u8> b(r.out_buf(0).size);
+            for (size_t i = 0; i < b.size(); i += 4) {
+                const u32 v = dev();
+                std::memcpy(b.data() + i, &v, std::min<size_t>(4, b.size() - i));
+            }
+            r.write_out(0, b.data(), b.size());
+        });
+    }
+};
+
 }  // namespace
 
 void register_misc() {
@@ -307,13 +301,11 @@ void register_misc() {
     for (const char* n : {"acc:u0", "acc:u1"}) {
         register_service(n, [n] { return std::make_shared<Acc>(n); });
     }
-    for (const char* n : {"nifm:u", "nifm:a", "nifm:s"}) {
-        register_service(n, [n] { return std::make_shared<Nifm>(n); });
-    }
     for (const char* n : {"friend:u", "friend:a"}) {
         register_service(n, [n] { return std::make_shared<Friend>(n); });
     }
     register_service("chat:u", [] { return std::make_shared<Chat>(); });
+    register_service("csrng", [] { return std::make_shared<Csrng>(); });
 }
 
 }  // namespace ipc

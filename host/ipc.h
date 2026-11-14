@@ -20,6 +20,7 @@ struct Request {
     bool tipc = false;
     u64 pid = 0;
     std::vector<u32> copy_handles, move_handles, in_objects;
+    std::vector<ServicePtr> in_services;  // the objects passed in (domain ids, or session handles outside a domain)
     std::vector<Buffer> x, a, b, w, c;
     const u8* data = nullptr;  // arguments after the CMIF header (or the TIPC header)
     size_t data_size = 0;
@@ -62,7 +63,8 @@ struct Service : std::enable_shared_from_this<Service> {
     // Default: log the command once per service and answer success with zeroed output.
     virtual void handle(Request& r);
     std::string name;
-    std::mutex lock;  // serializes this object's requests
+    std::mutex lock;          // serializes this object's requests
+    bool concurrent = false;  // requests run in parallel (blocking socket calls): no `lock`
 
   protected:
     using Handler = std::function<void(Request&)>;
@@ -82,5 +84,7 @@ u32 connect_named_port(const std::string& name, u32* out_handle);
 u32 send_sync_request(u32 handle, u64 msg_addr);
 
 void register_all_services();  // services/*.cpp
+// Logs every request from now on, as HOST_IPC_TRACE does from the start (net.cpp: from LAN play's start with HOST_NET_TRACE=2).
+void start_ipc_trace();
 
 }  // namespace ipc

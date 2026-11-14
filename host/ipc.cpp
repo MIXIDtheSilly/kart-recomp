@@ -1,5 +1,6 @@
 #include "ipc.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <set>
 #include <unordered_map>
@@ -49,9 +50,10 @@ u32 clone_session(const KSession& s) {
 std::mutex g_registry_lock;
 std::map<std::string, std::function<ServicePtr()>> g_registry;
 
+std::atomic<bool> g_trace_started{false};
 bool ipc_trace() {
     static const bool on = std::getenv("HOST_IPC_TRACE") != nullptr;
-    return on;
+    return on || g_trace_started.load(std::memory_order_relaxed);
 }
 
 struct Parsed {
@@ -223,6 +225,8 @@ void Service::handle(Request& r) {
 
 ServicePtr stub(std::string name) { return std::make_shared<Service>(std::move(name)); }
 
+void start_ipc_trace() { g_trace_started = true; }
+
 void register_service(const std::string& name, std::function<ServicePtr()> make) {
     std::scoped_lock lk{g_registry_lock};
     g_registry[name] = std::move(make);
@@ -281,7 +285,9 @@ u32 send_sync_request(u32 handle, u64 msg_addr) {
         r.data_size = p.data_words * 4;
         ServicePtr svc = sess->root;
         if (ipc_trace()) LOG("tipc %s::%u", svc->name.c_str(), r.cmd);
-        {
+        if (svc->concurrent) {
+            svc->handle(r);
+        } else {
             std::scoped_lock lk{svc->lock};
             svc->handle(r);
         }
@@ -315,6 +321,8 @@ u32 send_sync_request(u32 handle, u64 msg_addr) {
             u32 id;
             std::memcpy(&id, cmif + 16 + dsize + 4 * k, 4);
             r.in_objects.push_back(id);
+            std::scoped_lock lk{sess->d->lock};
+            r.in_services.push_back(sess->d->object(id));
         }
         if (!target) {
             LOG("ipc: domain object %u does not exist", object_id);
@@ -324,6 +332,9 @@ u32 send_sync_request(u32 handle, u64 msg_addr) {
         r.data_size = dsize >= 16 ? dsize - 16 : 0;
     } else {
         r.data_size = p.data_words * 4 > (off - p.data_word * 4) + 16 ? p.data_words * 4 - (off - p.data_word * 4) - 16 : 0;
+        for (u32 h : r.move_handles) {
+            if (auto in = kern::get<KSession>(h)) r.in_services.push_back(in->root);
+        }
     }
     u32 magic;
     std::memcpy(&magic, cmif, 4);
@@ -348,7 +359,9 @@ u32 send_sync_request(u32 handle, u64 msg_addr) {
     }
 
     if (ipc_trace()) LOG("ipc %s::%u", target->name.c_str(), r.cmd);
-    {
+    if (target->concurrent) {
+        target->handle(r);
+    } else {
         std::scoped_lock lk{target->lock};
         target->handle(r);
     }

@@ -66,4 +66,4 @@ if not exist %TO%\opus\opus_decoder.obj (
 rem /INCREMENTAL:NO: incremental linking pads data sections, which breaks clang PGO profile writing (BUILD_PGO=gen).
 link /nologo /DEBUG /INCREMENTAL:NO /OUT:out\%KART_EXE% /SUBSYSTEM:CONSOLE /IGNORE:4099 /NODEFAULTLIB:LIBCMT out\obj\*.obj out\obj\nvn\*.obj @out\audio_objs.rsp ^
   %TO%\lz4\*.obj %TO%\zstd\*.obj %TO%\stb\*.obj %TO%\opus\*.obj @"%ART%\gen\aot_libs.rsp" ^
-  user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib bcrypt.lib ntdll.lib ws2_32.lib uuid.lib version.lib setupapi.lib dbghelp.lib imm32.lib cfgmgr32.lib avrt.lib ksuser.lib hid.lib xinput.lib %KART_LINK_EXTRA% || exit /b 1
+  user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib bcrypt.lib ntdll.lib ws2_32.lib uuid.lib version.lib setupapi.lib dbghelp.lib imm32.lib cfgmgr32.lib avrt.lib ksuser.lib hid.lib xinput.lib iphlpapi.lib %KART_LINK_EXTRA% || exit /b 1
