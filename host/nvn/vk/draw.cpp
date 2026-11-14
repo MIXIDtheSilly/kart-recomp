@@ -1438,7 +1438,8 @@ VkImageView texture_view(u32 id, VkImageViewType want, bool storage, Image** img
         g_used_placeholder = true;
         return placeholder_view(want);
     }
-    const VkImageView v = view_of(img, e.has_v ? &e.v : nullptr, false, want);
+    view_t tv;
+    const VkImageView v = view_of(img, tex_view(&e.t, img, e.has_v ? &e.v : nullptr, tv), false, want);
     if (!dump_active() && !dump_tracing()) {
         static const bool sticky_on = [] {
             const char* v = getenv("HOST_NVN_VIEW_STICKY");

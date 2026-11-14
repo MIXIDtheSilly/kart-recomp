@@ -78,6 +78,10 @@ inline void bind_epoch_bump(bool objects = true) {
 // the image can be seen that way.
 VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageViewType want = VK_IMAGE_VIEW_TYPE_MAX_ENUM);
 
+// The view texture object t asks for with its view v (null = the whole texture): v, or, when t shares an image made in another
+// (compatible) format (textures.cpp format_class), v in t's format. tmp holds the latter.
+const nvn::view_t* tex_view(const nvn::tex_t* t, const Image* img, const nvn::view_t* v, nvn::view_t& tmp);
+
 VkImageSubresourceRange full_range(const Image* img);
 // The Vulkan format a view of img as NVN view v (null = whole texture) has.
 VkFormat view_format(const Image* img, const nvn::view_t* v);
