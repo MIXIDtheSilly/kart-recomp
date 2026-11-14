@@ -1,5 +1,5 @@
 r"""Builds host\out\kart.exe (kart-<KART_VER>.exe) with llvm-mingw's clang: what host\build.bat does with Visual Studio.
-host\build.bat runs it when BUILD_CC=mingw (the default once tools\toolchain.py has downloaded llvm-mingw; see paths.py).
+host\build.bat runs it when BUILD_CC=mingw (the default; tools\toolchain.py downloads llvm-mingw; see paths.py).
 
 Objects go to host\out\obj-mingw. A file is compiled again only when it, a header it includes (clang's .d files) or the
 flags changed. The exe links the module libraries build_lib.py made (<art>\build\mingw\<module>.a) and everything

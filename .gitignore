@@ -21,8 +21,10 @@ __pycache__/
 /deps/
 /local.cfg
 
-# The C++ toolchain tools/toolchain.py downloads (the launcher's Set up)
+# What the launcher's Set up downloads: the C++ toolchain (tools/toolchain.py), Python and the .NET SDK when missing (tools/bootstrap.ps1)
 /tools/llvm-mingw/
+/tools/python/
+/tools/dotnet/
 /tools/llvm-mingw.tmp/
 /tools/llvm-mingw-*.zip
 

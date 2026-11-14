@@ -1,10 +1,12 @@
 // The launcher: the way from a game dump to a running kart.exe, one step per dot at the top.
 //
 //   1 Game          the dump folder (exefs\ and romfs\), its module ids checked, saved as KART_GAME in local.cfg
-//   2 Dependencies  the tools the build needs (Python, the .NET SDK); Set up downloads the C++ compiler (llvm-mingw,
+//   2 Dependencies  the tools the build needs; Set up installs Python and the .NET SDK into tools\ when the machine
+//                   has none (tools\bootstrap.ps1), downloads the C++ compiler (llvm-mingw,
 //                   tools\toolchain.py: no Visual Studio needed), installs the Python packages (tools\deps.py) and builds
 //                   the shader translator from tools\xlate and its packages\ (the SPIR-V tools and everything else
-//                   the host uses are in third_party\). BUILD_CC=cl or clang in local.cfg builds with Visual Studio.
+//                   the host uses are in third_party\). Its C++ compiler switch writes BUILD_CC to local.cfg: mingw, or
+//                   cl for Visual Studio (clang, clang-cl with Visual Studio, counts as Visual Studio there).
 //   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
 //                   the first stage whose output is missing; the tools' @@progress lines are drawn as a bar
 //   4 Play          host\out\kart.exe on the dump
@@ -435,14 +437,14 @@ static int dump_version(const fs::path& dir) {
     return -1;
 }
 
-// The C++ compiler, as tools\paths.py picks it: BUILD_CC when it is set (mingw, cl, clang), else mingw once Set up has
-// downloaded llvm-mingw into MINGW, else cl (Visual Studio)
+// The C++ compiler, as tools\paths.py picks it: BUILD_CC when it is set (mingw, cl, clang), else mingw (llvm-mingw,
+// which Set up downloads into MINGW)
 static bool mingw_ok() { return path_exists(fs::path(setting(L"MINGW")) / "bin" / "clang++.exe"); }
 static bool build_cc_set() { return !setting(L"BUILD_CC").empty(); }
 static std::wstring build_cc() {
     std::wstring cc = setting(L"BUILD_CC");
     for (auto& ch : cc) ch = (wchar_t)towlower(ch);
-    if (cc.empty()) return mingw_ok() ? L"mingw" : L"cl";
+    if (cc.empty()) return L"mingw";
     return cc == L"clang-cl" ? L"clang" : cc;
 }
 // Where build_lib.py puts the module libraries for that compiler, and their extension
@@ -478,7 +480,36 @@ static bool spirv_tools() {
     return false;
 }
 
+// Python and the .NET SDK that Set up installs into the repository when the machine has none (tools\bootstrap.ps1):
+// first on PATH for everything the launcher runs, so they take over from a missing or too old one
+static fs::path local_python() { return g_root / "tools" / "python"; }
+static fs::path local_dotnet() { return g_root / "tools" / "dotnet"; }
+static void use_local_tools() {
+    static bool on_path_done = false;
+    if (!on_path_done) {
+        on_path_done = true;
+        SetEnvironmentVariableW(L"PATH", (local_python().wstring() + L";" + (local_python() / "Scripts").wstring() + L";" +
+                                          local_dotnet().wstring() + L";" + env_var(L"PATH")).c_str());
+    }
+    // A dotnet outside Program Files: the translator it builds finds the runtime through DOTNET_ROOT
+    if (path_exists(local_dotnet() / "dotnet.exe")) {
+        SetEnvironmentVariableW(L"DOTNET_ROOT", local_dotnet().c_str());
+        SetEnvironmentVariableW(L"DOTNET_MULTILEVEL_LOOKUP", L"0");
+        SetEnvironmentVariableW(L"DOTNET_CLI_TELEMETRY_OPTOUT", L"1");
+        SetEnvironmentVariableW(L"DOTNET_NOLOGO", L"1");
+    }
+}
+static void check_dotnet() {
+    use_local_tools();
+    g_tools.dotnet = false;
+    if (on_path(L"dotnet.exe")) {
+        const std::string sdks = capture(L"dotnet --list-sdks");
+        g_tools.dotnet = sdks.rfind("10.", 0) == 0 || sdks.find("\n10.") != std::string::npos;
+    }
+}
+
 static void check_tools() {
+    use_local_tools();
     const fs::path vswhere = fs::path(env_var(L"ProgramFiles(x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe";
     if (path_exists(vswhere)) {
         const std::string out = capture(L"\"" + vswhere.wstring() + L"\" -latest -products * -requires "
@@ -493,10 +524,7 @@ static void check_tools() {
     }
     // Microsoft's VP9 Video Extensions (a Store package): Media Foundation decodes the movies with it
     g_tools.vp9 = !trim(widen(capture(L"powershell -NoProfile -Command \"(Get-AppxPackage Microsoft.VP9VideoExtensions).Version\""))).empty();
-    if (on_path(L"dotnet.exe")) {
-        const std::string sdks = capture(L"dotnet --list-sdks");
-        g_tools.dotnet = sdks.rfind("10.", 0) == 0 || sdks.find("\n10.") != std::string::npos;
-    }
+    check_dotnet();
     check_python();
 }
 
@@ -589,17 +617,18 @@ static void refresh() {
     const bool ms = build_cc_set() && build_cc() != L"mingw";
     const bool vs = ms && !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
     const bool cc = ms ? vs : mingw_ok();
-    if (ms) deps.push_back({L"Visual Studio", vs ? L"C++ tools found (BUILD_CC=" + build_cc() + L")" :
+    if (ms) deps.push_back({L"Visual Studio", vs ? (build_cc() == L"clang" ? L"C++ tools found (clang-cl)" : L"C++ tools found") :
                             L"install it with \"Desktop development with C++\", or remove BUILD_CC from local.cfg", vs ? ST_OK : ST_BAD});
-    else deps.push_back({L"C++ compiler", cc ? L"LLVM MinGW (tools\\llvm-mingw)" : L"Set up downloads LLVM MinGW (190 MB): no Visual Studio needed",
+    else deps.push_back({L"C++ compiler", cc ? L"LLVM MinGW" : L"Set up installs it (190 MB)",
                          cc ? ST_OK : ST_MISSING});
     const bool py = !g_tools.python.empty(), pkgs = py && g_tools.py_missing.empty();
-    if (!py) deps.push_back({L"Python", L"install Python 3.13 from python.org, with \"Add to PATH\"", ST_BAD});
-    else deps.push_back({L"Python", L"", ST_OK, g_tools.python});
-    deps.push_back({L"Python packages", !py ? L"" : pkgs ? L"installed" : L"Set up installs " + g_tools.py_missing,
+    if (!py) deps.push_back({L"Python", L"Set up installs it (15 MB)", ST_MISSING});
+    else deps.push_back({L"Python", path_exists(local_python() / "python.exe") ? L"tools\\python" : L"", ST_OK, g_tools.python});
+    deps.push_back({L"Python packages", !py ? L"Set up installs them" : pkgs ? L"installed" : L"Set up installs " + g_tools.py_missing,
                     pkgs ? ST_OK : ST_MISSING});
-    deps.push_back({L".NET 10 SDK", g_tools.dotnet ? L"found" : L"install it from dot.net (winget install Microsoft.DotNet.SDK.10)",
-                    g_tools.dotnet ? ST_OK : ST_BAD});
+    deps.push_back({L".NET 10 SDK", !g_tools.dotnet ? L"Set up installs it (220 MB)"
+                                    : path_exists(local_dotnet() / "dotnet.exe") ? L"tools\\dotnet" : L"found",
+                    g_tools.dotnet ? ST_OK : ST_MISSING});
     const bool spirv = spirv_tools();
     deps.push_back({L"SPIR-V tools", spirv ? L"included (third_party\\spirv)" : L"missing: third_party\\spirv\\bin or the Vulkan SDK",
                     spirv ? ST_OK : ST_BAD});
@@ -608,7 +637,7 @@ static void refresh() {
     const bool xlate = path_exists(fs::path(setting(L"NVN_XLATE")) / "dmsh_xlate.exe");
     deps.push_back({L"Shader translator", xlate ? L"built" : L"Set up builds it", xlate ? ST_OK : ST_MISSING});
     g_done[1] = cc && pkgs && g_tools.dotnet && spirv && xlate;
-    g_can_setup = (cc || !ms) && py && g_tools.dotnet;
+    g_can_setup = cc || !ms;   // everything else Set up installs itself
 
     auto& build = g_rows[2];
     build.clear();
@@ -781,7 +810,7 @@ static void stroke_circle(float x, float y, float r, uint32_t color, float width
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_VER = 50, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_VER = 50, B_CC = 60, B_DOT = 100,
 };
 struct Hit {
     int id;
@@ -800,18 +829,10 @@ static bool g_unpack_log = false;  // the Game step shows the unpacking's status
 static const wchar_t* STEP_NAMES[4] = {L"Game", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TEXT[4] = {
-    L"Pick the folder of your own dump of the game, the one holding exefs\\ and romfs\\, or a .nup file of it, which "
-    L"is unpacked into a folder you choose. Versions 1.0.0 and 1.8.0 work, each built and played on its own (the "
-    L"version buttons above).",
-    L"Python and the .NET SDK you install yourself. Set up does the rest, in a few minutes: it downloads the C++ compiler "
-    L"(LLVM MinGW: no Visual Studio needed), installs the Python packages (pip) and builds the shader translator from the "
-    L"packages in the repository. The SPIR-V tools and the third-party code the host uses come with the repository "
-    L"(third_party\\).",
-    L"The game's modules are unpacked, lifted to C++ and compiled, its shaders translated to SPIR-V, and kart.exe "
-    L"linked. The first build takes about half an hour (the game is close to 1 GB of C++; the bar below shows how far it is); "
-    L"later ones redo only what is missing.",
-    L"Starts kart.exe on your dump. Pipelines are made ahead of time over the first runs; baking decodes every "
-    L"texture into the cache ahead of time, so the first races do not hitch.",
+    L"Pick your own dump of the game (the folder with exefs\\ and romfs\\) or a .nup file of it.",
+    L"Set up installs what is missing into the repository. No admin rights or Visual Studio needed.",
+    L"Lifts the game to C++, compiles it and translates its shaders. The first build takes about half an hour.",
+    L"Starts the game. Bake textures once so the first races do not hitch.",
 };
 
 static void redraw() {
@@ -1050,6 +1071,40 @@ static float draw_versions(float x1, float y, bool enabled) {
     return box.left - lw - 24;
 }
 
+// The C++ compiler: a segmented control at (x0, y), BUILD_CC=mingw or cl in local.cfg; returns the y below it.
+// clang (clang-cl) counts as Visual Studio, whose tools it builds with.
+static const wchar_t* const CC_NAMES[] = {L"LLVM MinGW", L"Visual Studio"};
+static float draw_compiler(float x0, float x1, float y, bool enabled) {
+    const int cur = build_cc() == L"mingw" ? 0 : 1;
+    text(L"C++ compiler", F_LABEL, {x0, y, x1, y + 18}, col::muted);
+    y += 24;
+    float seg[2], total = 6;
+    for (int i = 0; i < 2; i++) total += seg[i] = measure(CC_NAMES[i], F_LABEL, 300).width + 30;
+    const D2D1_RECT_F box{x0, y, x0 + total, y + 32};
+    fill_round(box, R_CTRL, col::inset);
+    stroke_round(box, R_CTRL, col::line);
+    float x = box.left + 3;
+    for (int i = 0; i < 2; i++) {
+        const D2D1_RECT_F r{x, box.top + 3, x + seg[i], box.bottom - 3};
+        if (i == cur) {
+            fill_round(r, R_CTRL - 2, col::accent);
+            text(CC_NAMES[i], F_LABEL, r, col::accent_ink, T_CENTER | T_VCENTER);
+        } else {
+            const float h = enabled ? ease(anim(B_CC + i).hov) : 0;
+            if (h > 0) fill_round(r, R_CTRL - 2, mix(col::inset, col::btn_hover, h));
+            text(CC_NAMES[i], F_LABEL, r, enabled ? mix(col::muted, col::text, h) : col::dim, T_CENTER | T_VCENTER);
+            if (enabled) g_hits.push_back({B_CC + i, r});
+        }
+        x += seg[i];
+    }
+    const std::wstring note = !env_var(L"BUILD_CC").empty()
+        ? L"BUILD_CC=" + env_var(L"BUILD_CC") + L" is set in the environment: it is used instead of local.cfg."
+        : cur == 0 ? L"Default. About 50% faster."
+                   : L"Needs Visual Studio. Slower game.";
+    text(note, F_SMALL, {box.right + 14, box.top, x1, box.bottom}, col::muted, T_VCENTER | T_WRAP);
+    return box.bottom + 22;
+}
+
 static void paint_steps(D2D1_RECT_F p) {
     const float x0 = p.left + 36, x1 = p.right - 36;
     float y = p.top + 30;
@@ -1092,6 +1147,7 @@ static void paint_steps(D2D1_RECT_F p) {
         break;
     }
     case 1: {
+        y = draw_compiler(x0, x1, y, !busy);
         y = draw_rows(g_rows[1], 2, x0, x1, y) + 18;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -1113,7 +1169,8 @@ static void paint_steps(D2D1_RECT_F p) {
         }
         y = draw_rows(rows, 2, x0, x1, y);
         const std::wstring mp = env_var(L"BUILD_MP");
-        text(L"Up to " + mp + L" compiler processes at once (BUILD_MP in local.cfg or the environment)", F_SMALL,
+        text(std::wstring(CC_NAMES[build_cc() == L"mingw" ? 0 : 1]) + L" (chosen in Dependencies), up to " + mp +
+                 L" compiler processes at once (BUILD_MP)", F_SMALL,
              {x0, y + 6, x1, y + 26}, col::muted);
         y += 40;
         float x = x0;
@@ -1295,7 +1352,7 @@ static void job_done(DWORD code, bool cancelled) {
         g_status = L"Unpacked in " + took + L" into " + dest;
     }
     const int step = g_step;
-    if (step == 1) check_python();   // packages Set up just installed
+    if (step == 1) check_dotnet(), check_python();   // what Set up just installed
     refresh();
     if (!cancelled && code == 0 && (step == 1 || step == 2) && g_done[step]) g_step = step + 1, g_status.clear();
     redraw();
@@ -1444,6 +1501,13 @@ static void click(int id) {
         refresh();
     } else if (id >= B_VER && id < B_VER + VERSION_COUNT) {
         select_version(id - B_VER);
+    } else if (id == B_CC || id == B_CC + 1) {
+        // Each compiler keeps its own module libraries (build\mingw\*.a, build\*.lib), so switching back costs
+        // nothing; switching to one not built yet makes Build compile the game with it (the Build step shows that)
+        if (!save_setting(L"BUILD_CC", id == B_CC ? L"mingw" : L"cl"))
+            MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+        g_status.clear();
+        refresh();
     } else if (id == B_BROWSE) {
         browse();
     } else if (id == B_NUP) {
@@ -1453,12 +1517,16 @@ static void click(int id) {
         g_status.clear();
         refresh();
     } else if (id == B_SETUP) {
-        // The C++ compiler (llvm-mingw, from GitHub, checked against its SHA-256), the Python packages (pip, from
-        // PyPI), then the translator from the NuGet packages in tools\xlate\packages
+        // Python (python.org's build from NuGet, checked against its SHA-256) and the .NET SDK (dotnet-install.ps1)
+        // when the machine has none, the C++ compiler (llvm-mingw, from GitHub, checked against its SHA-256), the
+        // Python packages (pip, from PyPI), then the translator from the NuGet packages in tools\xlate\packages
         std::vector<Cmd> cmds;
+        const std::wstring bootstrap = L"powershell -NoProfile -ExecutionPolicy Bypass -File tools\\bootstrap.ps1 ";
+        if (g_tools.python.empty()) cmds.push_back({bootstrap + L"python", root, L"Python"});
+        if (!g_tools.dotnet) cmds.push_back({bootstrap + L"dotnet", root, L".NET SDK"});
         if (!mingw_ok() && !(build_cc_set() && build_cc() != L"mingw"))
             cmds.push_back({L"python tools\\toolchain.py install", root, L"C++ compiler"});
-        if (!g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages"});
+        if (g_tools.python.empty() || !g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages"});
         cmds.push_back({L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj",
                         root, L"Shader translator"});
         for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
@@ -1667,14 +1735,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
 
-    // For the tools it runs: Python output as it comes, in UTF-8; builds on about half the cores unless BUILD_MP says
+    // For the tools it runs: Python output as it comes, in UTF-8; builds on every core unless BUILD_MP says
     SetEnvironmentVariableW(L"PYTHONUNBUFFERED", L"1");
     SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
     SetEnvironmentVariableW(L"PYTHONUTF8", L"1");      // files in UTF-8 too, whatever the system code page (cp950: issue #7)
     SetEnvironmentVariableW(L"KART_PROGRESS", L"1");   // the tools' @@progress lines, drawn as a bar
     if (env_var(L"BUILD_MP").empty()) {
         std::wstring mp = local_cfg()[L"BUILD_MP"];
-        if (mp.empty()) mp = std::to_wstring(std::max(1u, std::thread::hardware_concurrency() / 2));
+        if (mp.empty()) mp = std::to_wstring(std::max(1u, std::thread::hardware_concurrency()));
         SetEnvironmentVariableW(L"BUILD_MP", mp.c_str());
     }
 

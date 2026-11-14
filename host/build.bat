@@ -5,7 +5,7 @@ rem Paths (the compiler, the game version's module libraries) come from tools\pa
 rem BUILD_MP=<n>: at most n compiler processes (default: one per core).
 cd /d %~dp0
 for /f "usebackq delims=" %%L in (`python ..\tools\paths.py bat`) do set "%%L"
-rem BUILD_CC=mingw (the default once the launcher's Set up has downloaded llvm-mingw): no Visual Studio needed,
+rem BUILD_CC=mingw (the default; the launcher's Set up downloads llvm-mingw): no Visual Studio needed,
 rem tools\build_host.py builds the same exe with clang. Below: Visual Studio (BUILD_CC=cl or clang).
 if /i "%BUILD_CC%"=="mingw" (
   python ..\tools\build_host.py

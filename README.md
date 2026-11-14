@@ -12,9 +12,9 @@ emulated CPU or GPU. Versions 1.0.0 and 1.8.0 work.
 
 ## Run it
 
-You need Windows 10/11, a Vulkan 1.3 GPU, Python 3.13+ and the .NET 10 SDK. No Visual Studio: the
-C++ compiler (LLVM MinGW) is downloaded on first use. The launcher installs the Python packages and
-builds the rest; everything else is in the repository.
+You need Windows 10/11 and a Vulkan 1.3 GPU. Nothing else to install: the launcher's Set up puts
+what is missing into the repository (Python and the .NET 10 SDK when the PC has none, the C++
+compiler LLVM MinGW, the Python packages), with no admin rights and no Visual Studio.
 
 ```
 launcher\build.bat

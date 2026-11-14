@@ -3,8 +3,8 @@
 Usage: python build_lib.py <gen dir> <module> <build dir> [--opt /O2]
 
 Produces <build dir>/<module>.lib from <gen dir>/<module>_*.cpp with MSVC (BUILD_CC=cl), <build dir>/clang/<module>.lib
-with clang-cl (BUILD_CC=clang) or <build dir>/mingw/<module>.a with llvm-mingw's clang (BUILD_CC=mingw, the default once
-tools/toolchain.py has downloaded it; see paths.py). Objects are only rebuilt when their source is newer, so re-running
+with clang-cl (BUILD_CC=clang) or <build dir>/mingw/<module>.a with llvm-mingw's clang (BUILD_CC=mingw, the default;
+tools/toolchain.py downloads it; see paths.py). Objects are only rebuilt when their source is newer, so re-running
 after lifting a subset is cheap.
 """
 import argparse
