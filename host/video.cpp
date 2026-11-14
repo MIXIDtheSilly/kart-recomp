@@ -134,6 +134,31 @@ void update_overlay() {
 
 // ------------------------------------------------------------------ window
 
+// F11: borderless fullscreen on the window's monitor, and back to the window as it was. The swapchain follows the
+// new size (present.cpp recreates it when it is out of date).
+WINDOWPLACEMENT g_windowed{sizeof g_windowed};
+bool g_fullscreen = false;
+
+void toggle_fullscreen(HWND hwnd) {
+    const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (!g_fullscreen) {
+        MONITORINFO mi{sizeof mi};
+        if (!GetWindowPlacement(hwnd, &g_windowed) || !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        const RECT& m = mi.rcMonitor;
+        SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
+        g_fullscreen = true;
+    } else {
+        SetWindowLongW(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &g_windowed);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
+    LOG("window: %s", g_fullscreen ? "fullscreen" : "windowed");
+}
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_SIZE:
@@ -144,6 +169,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_F3) {
             g_overlay_on = !g_overlay_on;
+            update_overlay();
+            return 0;
+        }
+        if (wp == VK_F11 && !(lp & (1 << 30))) {  // not the key's auto-repeat
+            toggle_fullscreen(hwnd);
             update_overlay();
             return 0;
         }

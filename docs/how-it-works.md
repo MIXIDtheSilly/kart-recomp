@@ -16,7 +16,7 @@ Plug in an Xbox controller, DualShock 4 or DualSense (USB or Bluetooth), or use 
 | + / - | M or Enter / N |
 
 On a gamepad, buttons go by position: the bottom face button is B and the right one is A. F3 shows
-an overlay with FPS, frame time and memory. The first races can stutter while pipelines and
+an overlay with FPS, frame time and memory, and F11 switches to borderless fullscreen and back. The first races can stutter while pipelines and
 textures are prepared; **Bake textures** in the launcher decodes every texture ahead of time.
 Integrated GPUs and handheld PCs get a unified-memory mode automatically. Saves and logs live in
 `host\out\user\` (or `user-1.8.0\`). Settings: see [Every setting](#every-setting).
