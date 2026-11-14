@@ -98,6 +98,14 @@ Device& ctx() {
 
 namespace {
 
+// Tests of smaller PCs: HOST_NVN_TEST_VRAM_MB caps the device-local heaps (an 8 GB card: 8192), HOST_NVN_TEST_HOST_HEAP_MB
+// the heap host imports go to (half the RAM on NVIDIA: 16 GB of RAM gives ~8081). 0: the real size.
+u64 test_heap_bytes(bool device_local) {
+    static const u64 vram = [] { const char* e = std::getenv("HOST_NVN_TEST_VRAM_MB"); return e && *e ? std::strtoull(e, nullptr, 0) << 20 : 0; }();
+    static const u64 host = [] { const char* e = std::getenv("HOST_NVN_TEST_HOST_HEAP_MB"); return e && *e ? std::strtoull(e, nullptr, 0) << 20 : 0; }();
+    return device_local ? vram : host;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT,
                                         const VkDebugUtilsMessengerCallbackDataEXT* d, void*) {
     static std::atomic<int> count{0};
@@ -318,6 +326,18 @@ void create_device(Device& c) {
     // ~1.4 GB of 256 MB blocks unused but held, pushing new ones into system memory; anything over 32 MB gets its own.
     ai.preferredLargeHeapBlockSize = 64ull << 20;
     ai.pVulkanFunctions = &vf;
+    VkDeviceSize limits[VK_MAX_MEMORY_HEAPS];
+    bool limited = false;
+    for (u32 h = 0; h < c.mem_props.memoryHeapCount; h++) {
+        const u64 cap = test_heap_bytes(c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+        limits[h] = cap && cap < c.mem_props.memoryHeaps[h].size ? cap : VK_WHOLE_SIZE;
+        if (limits[h] != VK_WHOLE_SIZE) {
+            limited = true;
+            LOG("nvk: test: heap %u capped at %llu MB (of %llu)", h, static_cast<unsigned long long>(cap >> 20),
+                static_cast<unsigned long long>(c.mem_props.memoryHeaps[h].size >> 20));
+        }
+    }
+    if (limited) ai.pHeapSizeLimit = limits;
     check(vmaCreateAllocator(&ai, &c.vma), "vmaCreateAllocator");
 
     c.feat.uma = c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
@@ -325,6 +345,7 @@ void create_device(Device& c) {
     u64 host_heap = 0;   // the largest heap that is not device-local: where host imports go on a dedicated GPU
     for (u32 h = 0; h < c.mem_props.memoryHeapCount; h++)
         if (!(c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) host_heap = std::max(host_heap, c.mem_props.memoryHeaps[h].size);
+    if (const u64 cap = test_heap_bytes(false); cap && host_heap) host_heap = std::min(host_heap, cap);
     c.feat.lean_imports = c.feat.uma || (host_heap && host_heap < (12ull << 30));
     if (const char* e = std::getenv("HOST_NVN_LEAN_IMPORTS"); e && *e) c.feat.lean_imports = std::strcmp(e, "0") != 0;
     if (c.feat.lean_imports && !c.feat.uma)
@@ -440,6 +461,16 @@ bool import_host(void* host, u64 size, Imported& out, const char** why) {
     Imported im;
     im.addr = lo;
     im.size = hi - lo;
+    if (const u64 cap = test_heap_bytes(c.mem_props.memoryHeaps[c.mem_props.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+        // (the driver counts imports and allocations alike against the heap)
+        VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(c.vma, b);
+        const u64 used = g_import_bytes.load() + b[c.mem_props.memoryTypes[type].heapIndex].statistics.blockBytes;   // (VMA's own)
+        if (used + im.size > cap) {
+            *why = "vkAllocateMemory: out of device memory (test heap cap)";
+            return false;
+        }
+    }
     if (const VkResult r = vkAllocateMemory(c.dev, &mai, nullptr, &im.memory); r != VK_SUCCESS) {
         *why = r == VK_ERROR_INVALID_EXTERNAL_HANDLE ? "vkAllocateMemory: invalid external handle (pages not mapped?)"
                : r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? "vkAllocateMemory: out of device memory"
