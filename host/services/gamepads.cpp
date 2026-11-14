@@ -11,11 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../common.h"
@@ -175,8 +178,8 @@ struct PsPad {
     bool nintendo = false, usb = false;
     u32 out_size = 0;
     std::atomic<u8> counter{0};
-    std::atomic<bool> ready{false};  // set up: player lights can be sent
-    std::atomic<int> player{-1};     // the player it joined as (-1: not joined)
+    std::atomic<int> player{-1};         // the player it joined as (-1: not joined)
+    std::atomic<bool> lights_due{true};  // its reader thread sends `player`'s light (show_player sets it)
     StickCal cal[2];
     std::atomic<bool> alive{true};
     std::mutex lock;
@@ -219,10 +222,16 @@ void read_reports(std::shared_ptr<PsPad> pad) {
 // with 0x30 switches it to the full report, 0x10 reads its SPI flash (the stick calibration), 0x30 sets the player
 // lights. Over USB the pad first needs the 0x80 commands (handshake, baud rate, handshake, USB only).
 
-// Overlapped read or write that gives up after `ms`: false on error or timeout
+// Overlapped read or write that gives up after `ms`: false on error or timeout. Only the pad's reader thread does
+// I/O on its handle; one event a thread (ReadFile and WriteFile reset it when they start).
 bool hid_io(HANDLE h, bool write, u8* buf, DWORD size, DWORD& n, DWORD ms) {
+    struct Event {
+        HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~Event() { CloseHandle(h); }
+    };
+    thread_local Event ev;
     OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ov.hEvent = ev.h;
     BOOL ok = write ? WriteFile(h, buf, size, nullptr, &ov) : ReadFile(h, buf, size, nullptr, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         if (WaitForSingleObject(ov.hEvent, ms) != WAIT_OBJECT_0) CancelIoEx(h, &ov);
@@ -230,7 +239,6 @@ bool hid_io(HANDLE h, bool write, u8* buf, DWORD size, DWORD& n, DWORD ms) {
     } else if (ok) {
         ok = GetOverlappedResult(h, &ov, &n, TRUE);
     }
-    CloseHandle(ov.hEvent);
     return ok;
 }
 
@@ -254,19 +262,31 @@ bool send_usb(PsPad& p, u8 cmd, bool reply) {
     return !reply || await_report(p, 0x81, -1, in, 500);
 }
 
+// Sends a subcommand without waiting for its 0x21 reply
+bool write_subcommand(PsPad& p, u8 id, std::initializer_list<u8> args) {
+    static constexpr u8 rumble[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};  // neutral
+    std::vector<u8> out(p.out_size);
+    out[0] = 0x01;
+    out[1] = p.counter++ & 0xf;
+    std::copy(std::begin(rumble), std::end(rumble), out.begin() + 2);
+    out[10] = id;
+    std::copy(args.begin(), args.end(), out.begin() + 11);
+    DWORD n = 0;
+    return hid_io(p.handle, true, out.data(), static_cast<DWORD>(out.size()), n, 500);
+}
+
+// The player lights (subcommand 0x30: bit n lights LED n+1; none before it joins). The reply arrives as an ordinary
+// 0x21 report in the reader loop.
+void send_lights(PsPad& p) {
+    const int player = p.player;
+    write_subcommand(p, 0x30, {u8(player < 0 ? 0 : 1u << player)});
+}
+
 // A subcommand, retried 3 times; `reply` gets the 0x21 report
 bool subcommand(PsPad& p, u8 id, std::initializer_list<u8> args, std::vector<u8>* reply = nullptr) {
-    std::vector<u8> out(p.out_size), in(std::max<u32>(p.report_size, 64));
-    static constexpr u8 rumble[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};  // neutral
+    std::vector<u8> in(std::max<u32>(p.report_size, 64));
     for (int attempt = 0; attempt < 3; attempt++) {
-        std::fill(out.begin(), out.end(), 0);
-        out[0] = 0x01;
-        out[1] = p.counter++ & 0xf;
-        std::copy(std::begin(rumble), std::end(rumble), out.begin() + 2);
-        out[10] = id;
-        std::copy(args.begin(), args.end(), out.begin() + 11);
-        DWORD n = 0;
-        if (!hid_io(p.handle, true, out.data(), static_cast<DWORD>(out.size()), n, 500)) continue;
+        if (!write_subcommand(p, id, args)) continue;
         if (await_report(p, 0x21, id, in, 500)) {
             if (reply) *reply = in;
             return true;
@@ -354,15 +374,15 @@ void read_switch(std::shared_ptr<PsPad> pad) {
     }
     read_calibration(p);
     if (!subcommand(p, 0x03, {0x30})) LOG("hid: %s: full report mode not acknowledged", p.name.c_str());
-    const int player = p.player;
-    subcommand(p, 0x30, {u8(player < 0 ? 0 : 1u << player)});  // its player's light (none before it joins)
-    p.ready = true;
     LOG("hid: gamepad ready: %s", p.name.c_str());
 
     std::vector<u8> buf(std::max<u32>(p.report_size, 64));
     bool logged = false;
     ULONGLONG last_reset = 0;
     for (;;) {
+        // A new player light (joined or left): sent from here, so the hid thread never waits on the pad. The full
+        // report comes 60-120 times a second, so it goes out within a few ms.
+        if (p.lights_due.exchange(false)) send_lights(p);
         DWORD n = 0;
         if (!hid_io(p.handle, false, buf.data(), static_cast<DWORD>(buf.size()), n, INFINITE)) break;
         // 0x3f: the pad is back in its simple HID mode (it was reset: a Bluetooth reconnect, or another program
@@ -371,8 +391,7 @@ void read_switch(std::shared_ptr<PsPad> pad) {
             if (GetTickCount64() - last_reset >= 1000) {
                 last_reset = GetTickCount64();
                 const bool ok = subcommand(p, 0x03, {0x30});
-                const int player = p.player;
-                subcommand(p, 0x30, {u8(player < 0 ? 0 : 1u << player)});
+                p.lights_due = true;
                 LOG("hid: %s: back in simple mode, full reports %s", p.name.c_str(), ok ? "again" : "not acknowledged");
             }
             continue;
@@ -522,19 +541,47 @@ void start() {
 
 namespace {
 
-// Player lights (subcommand 0x30: bit n lights LED n+1) without waiting for the reply: the pad's reader thread gets it.
+// The pad's player; a Pro Controller's reader thread lights it (this never waits on the pad).
 void show_player(PsPad& p, int player) {
     p.player = player;
-    if (!p.nintendo || !p.ready) return;  // set up later with the current player
-    std::vector<u8> out(p.out_size);
-    static constexpr u8 rumble[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
-    out[0] = 0x01;
-    out[1] = p.counter++ & 0xf;
-    std::copy(std::begin(rumble), std::end(rumble), out.begin() + 2);
-    out[10] = 0x30;
-    out[11] = u8(player < 0 ? 0 : 1u << player);
-    DWORD n = 0;
-    hid_io(p.handle, true, out.data(), static_cast<DWORD>(out.size()), n, 500);
+    p.lights_due = true;
+}
+
+// HOST_PLAYERS=<1-4>: at most that many players (4 by default). 1: every pad drives player 1, nobody joins.
+int max_players() {
+    static const int n = [] {
+        const char* v = std::getenv("HOST_PLAYERS");
+        return std::clamp(v && *v ? std::atoi(v) : MaxPlayers, 1, MaxPlayers);
+    }();
+    return n;
+}
+
+// HOST_PLAYERS=1: buttons are combined, the stick pushed furthest wins.
+void merge(Stick& to, Stick s) {
+    if (std::abs(s.x) + std::abs(s.y) > std::abs(to.x) + std::abs(to.y)) to = s;
+}
+
+void add(State& in, const State& s) {
+    in.buttons |= s.buttons;
+    merge(in.l, s.l);
+    merge(in.r, s.r);
+}
+
+// When each pad last pressed a button. One controller can show up twice: Steam Input or DS4Windows add a virtual
+// Xbox pad and the controller is still read through HID. The copy presses what the original presses, a few ms
+// apart (either one first), so a pad joins MirrorMs after its press, and not when a joined player pressed the same
+// buttons within MirrorMs of it.
+struct Press {
+    u64 buttons = 0;     // now
+    u64 pressed = 0;     // the buttons down when one last went down
+    u64 at_ms = 0;       // when that was
+    bool pending = false;  // a press of a pad without a player: it joins once MirrorMs have passed
+};
+constexpr u64 MirrorMs = 60;
+
+u64 now_ms() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 struct Slot {
@@ -547,6 +594,7 @@ struct Slot {
 std::mutex g_slots_lock;
 std::array<Slot, MaxPlayers> g_slots;
 std::vector<std::wstring> g_left;  // pads sent away by leave(): they join again on a new press, not the one held now
+std::unordered_map<std::wstring, Press> g_presses;
 
 }  // namespace
 
@@ -564,8 +612,37 @@ void read(Players& out) {
     const auto find = [&](const std::wstring& key) {
         return std::find_if(now.begin(), now.end(), [&](const Source& s) { return s.key == key; });
     };
+    out = {};
+    if (max_players() == 1) {
+        for (const Source& src : now) add(out.state[0], src.state);
+        return;
+    }
 
     std::lock_guard lk{g_slots_lock};
+    const u64 t = now_ms();
+    const auto joined = [&](const std::wstring& key) {
+        return std::any_of(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return s.key == key; });
+    };
+    std::erase_if(g_presses, [&](const auto& kv) { return find(kv.first) == now.end(); });
+    for (const Source& src : now) {
+        Press& p = g_presses[src.key];
+        if (src.state.buttons & ~p.buttons) {
+            p.pressed = src.state.buttons;
+            p.at_ms = t;
+            p.pending = !joined(src.key);
+        }
+        p.buttons = src.state.buttons;
+    }
+    // The joined player whose press `mine` copies, or null
+    const auto copy_of = [&](const Press& mine) -> const Slot* {
+        for (const Slot& s : g_slots) {
+            if (s.key.empty()) continue;
+            const Press& other = g_presses[s.key];
+            const u64 apart = mine.at_ms > other.at_ms ? mine.at_ms - other.at_ms : other.at_ms - mine.at_ms;
+            if (other.pressed == mine.pressed && apart <= MirrorMs) return &s;
+        }
+        return nullptr;
+    };
     // Pads that are gone free their player
     for (int i = 0; i < MaxPlayers; i++) {
         Slot& s = g_slots[i];
@@ -578,13 +655,20 @@ void read(Players& out) {
         auto it = find(key);
         return it == now.end() || it->state.buttons == 0;
     });
-    // Pads without a player join on a button press, as the lowest free player
+    // Pads without a player join on a button press (MirrorMs later), as the lowest free player
     for (const Source& src : now) {
-        if (!src.state.buttons) continue;
-        if (std::any_of(g_slots.begin(), g_slots.end(), [&](const Slot& s) { return s.key == src.key; })) continue;
-        if (std::find(g_left.begin(), g_left.end(), src.key) != g_left.end()) continue;
-        auto free = std::find_if(g_slots.begin(), g_slots.end(), [](const Slot& s) { return s.key.empty(); });
-        if (free == g_slots.end()) continue;
+        Press& p = g_presses[src.key];
+        if (!p.pending || t - p.at_ms < MirrorMs) continue;
+        p.pending = false;
+        if (joined(src.key) || std::find(g_left.begin(), g_left.end(), src.key) != g_left.end()) continue;
+        const auto last = g_slots.begin() + max_players();
+        auto free = std::find_if(g_slots.begin(), last, [](const Slot& s) { return s.key.empty(); });
+        if (free == last) continue;
+        if (const Slot* orig = copy_of(p)) {
+            LOG("hid: %s pressed with %s: the same controller twice (Steam Input, DS4Windows?), not a new player",
+                src.name.c_str(), orig->name.c_str());
+            continue;
+        }
         *free = {src.key, src.name, src.pad, true};
         const int player = static_cast<int>(free - g_slots.begin());
         LOG("hid: player %d: %s", player + 1, src.name.c_str());

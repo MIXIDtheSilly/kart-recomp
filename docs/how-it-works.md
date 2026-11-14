@@ -8,7 +8,7 @@ look like, how the recompiled code runs, what the host does, every setting, and 
 Plug in an Xbox controller, DualShock 4, DualSense or Switch Pro Controller (USB or Bluetooth), or use
 the keyboard. Up to 4 players: each controller joins as the next player when it first presses a button
 (that press is not passed on), so have every player press one before picking multiplayer. The keyboard
-always drives player 1.
+always drives player 1. `HOST_PLAYERS=1` makes every controller drive player 1 instead.
 
 | Switch | Keyboard |
 |--------|----------|
@@ -172,6 +172,7 @@ Set them in the environment, or as `HOST_*` lines in `local.cfg`.
 | `HOST_FPS_MODE=dynamic\|60\|30\|game` | the game's present interval; dynamic keeps the game clock at real time when frames run late |
 | `HOST_AUDIO_MUTE=1`, `HOST_AUDIO_LEVEL=1` | silence the output / log its peak level |
 | `HOST_NO_OVERLAY=1` | no performance overlay |
+| `HOST_PLAYERS=<1-4>` | at most that many local players (4); 1: every controller drives player 1 |
 | `HOST_NVN_TEXCACHE=<dir>\|0` | decoded texture cache folder, or none; `HOST_NVN_TEXCACHE_MB` caps it (64 GiB) |
 | `HOST_NVN_PIPELINE_CACHE=<file>` | where the pipeline cache lives (its `.keys` and `.primed` lists sit beside it) |
 | `HOST_TRANSCODE_THREADS=<n>` | threads for ASTC decoding / BC encoding (a quarter of the cores by default) |

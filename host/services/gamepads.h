@@ -14,7 +14,9 @@ struct State {
 
 // Up to 4 players, one pad each. A pad that connects waits until it presses a button, then joins as the lowest free
 // player (the first pad to press is player 1); that press reaches the game only once every button is up again. A pad
-// keeps its player while it stays connected.
+// keeps its player while it stays connected. A pad that presses what a joined one presses, at the same moment, is that
+// controller twice (Steam Input, DS4Windows) and doesn't join. HOST_PLAYERS=<n> caps the players; 1: every pad drives
+// player 1 and nobody joins.
 constexpr int MaxPlayers = 4;
 struct Players {
     std::array<State, MaxPlayers> state;
