@@ -23,6 +23,14 @@ struct Players {
     std::array<bool, MaxPlayers> joined{};  // a pad holds that player
 };
 
+// One motor's vibration as the game sends it (nn::hid::VibrationValue): a low and a high band, amplitude 0..1 and
+// frequency in Hz.
+struct Vibration {
+    float amp_low = 0, freq_low = 160, amp_high = 0, freq_high = 320;
+    bool operator==(const Vibration&) const = default;
+};
+static_assert(sizeof(Vibration) == 16);
+
 // Opens the pads connected now, and from then on those that connect (checked every 2 s).
 void start();
 // Every player's state (one call a tick: the joins happen here). `keyboard`: the keyboard as one more pad, which joins
@@ -32,5 +40,10 @@ void read(Players& out, const State* keyboard = nullptr);
 void leave(int player);
 // How many players are connected: player 1 always (the keyboard drives it without a pad), and each of 2-4 a pad holds.
 int connected_players();
+// Vibration for motor 0 (left) or 1 (right) of `player`'s pad. Xbox and PlayStation pads have one low and one high
+// band motor: they get the stronger of the two motors' bands.
+void vibrate(int player, int motor, const Vibration& v);
+// Stops every pad's vibration now (the game is closing).
+void stop_vibration();
 
 }  // namespace gamepads

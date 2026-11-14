@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "memory.h"
+#include "services/gamepads.h"
 #include "video.h"
 
 namespace video {
@@ -180,6 +181,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_CLOSE:
         LOG("window closed");
+        gamepads::stop_vibration();
         std::fflush(nullptr);
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
