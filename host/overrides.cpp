@@ -3,9 +3,12 @@
 #include <cstring>
 #include <unordered_map>
 
+#include <algorithm>
+
 #include "graphics.h"
 #include "host.h"
 #include "nvn/nvn_host.h"
+#include "services/gamepads.h"
 
 namespace {
 
@@ -48,6 +51,26 @@ void override_sdk(const char* name, GuestFn fn) {
     host_override(it->second, fn);
 }
 
+// nn::hid::ShowControllerSupport(ControllerSupportResultInfo*, const ControllerSupportArg&): the console's "connect
+// controllers" applet, through the library applet services (not here). Its answer instead: the players with a pad
+// (services/gamepads.h: a pad joins on a button press; player 1 is there with the keyboard alone), at most the
+// arg's player_count_max (byte 1), and npad No1 as the one selected. ResultInfo: s8 player_count, u32 selected npad
+// id at +4 (main+0x292e99c reads both: a count of 0 or a failed result is "cancelled", id 0x20 is handheld).
+void show_controller_support(Ctx* c) {
+    const u64 info = c->x[0], arg = c->x[1];
+    const int min = ld<s8>(arg), max = ld<s8>(arg + 1);
+    int players = gamepads::connected_players();
+    if (max > 0) players = std::min(players, max);
+    if (players < min)
+        LOG("hid: controller applet wants %d-%d players, %d have joined (a pad joins on a button press)", min, max,
+            players);
+    else
+        LOG("hid: controller applet (%d-%d players): %d", min, max, players);
+    st<s8>(info, static_cast<s8>(players));
+    st<u32>(info + 4, 0);  // No1
+    c->x[0] = 0;
+}
+
 // nn::gs::sdk::BootGraphicsSystem(void*, size_t): boots the console's graphics servers
 // (gsv, nvsrv, syncpt, vi). The native renderer needs none of them.
 void boot_graphics_system(Ctx* c) {
@@ -63,6 +86,8 @@ u64 sdk_export(const char* name) {
 
 void host_install_overrides() {
     LOG("sdk exports: %zu", sdk_exports().size());
+    override_sdk("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
+                 show_controller_support);
     // HOST_HLE_GRAPHICS=1: the old native nv::/nn::vi/NVN stand-ins (no GPU).
     if (const char* v = std::getenv("HOST_HLE_GRAPHICS"); v && v[0] == '1') {
         override_sdk("_ZN2nn2gs3sdk18BootGraphicsSystemEPvm", boot_graphics_system);
