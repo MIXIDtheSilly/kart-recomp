@@ -24,6 +24,10 @@ launcher\out\launcher.exe
 The launcher takes you from your dump (or `.nup`) to playing. The first build takes about
 half an hour on an 8-core CPU, with a progress bar. Controls, settings and how it all works: [docs/how-it-works.md](docs/how-it-works.md).
 
+Updating: unzip the new release into a new folder and click **Bring over an older version…** on
+the launcher's first step. It moves your build, tools, saves and settings over from the old folder,
+and Build then only redoes what changed. Scripted: `launcher.exe --bring-over <old folder> --build --quit`.
+
 ## License
 
 GPL-3.0-or-later. Third-party code and its licenses are listed in `third_party\README.md`.
