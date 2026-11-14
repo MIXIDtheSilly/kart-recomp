@@ -46,15 +46,42 @@ def ref_module(name):
         sys.path.pop(0)
 
 
+def xlate_source_key():
+    """tools/xlate's sources (not its bin/obj build output), as a hash."""
+    top = os.path.join(RECOMP, 'tools', 'xlate')
+    h = hashlib.blake2b(digest_size=16)
+    for d, dirs, files in os.walk(top):
+        dirs[:] = sorted(x for x in dirs if x.lower() not in ('bin', 'obj'))
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            h.update(os.path.relpath(p, top).replace(os.sep, '/').lower().encode() + bytes(1))
+            with open(p, 'rb') as fh:
+                h.update(fh.read())
+    return h.hexdigest()
+
+
+XLATE_KEY = os.path.join(XLATE_DIR, 'source.key')   # the sources the translator there was built from
+
+
+def xlate_current():
+    try:
+        return os.path.exists(XLATE_EXE) and open(XLATE_KEY).read().strip() == xlate_source_key()
+    except OSError:
+        return False
+
+
 def build_xlate():
     """The translator into XLATE_DIR (work/xlate unless NVN_XLATE says otherwise), from tools/xlate."""
     print(f'building the shader translator into {XLATE_DIR}', flush=True)
+    key = xlate_source_key()
     try:
         r = subprocess.run(['dotnet', 'build', '-c', 'Release', '-o', XLATE_DIR, XLATE_PROJ])
     except FileNotFoundError:
         sys.exit('dotnet not found: install the .NET 10 SDK (https://dotnet.microsoft.com/download)')
     if r.returncode or not os.path.exists(XLATE_EXE):
         sys.exit(f'building the shader translator failed ({r.returncode})')
+    with open(XLATE_KEY, 'w') as f:
+        f.write(key)
 
 
 def ctl_key_bytes(ctl):
@@ -283,7 +310,7 @@ def main():
     ap.add_argument('--out', default=OUT)
     a = ap.parse_args()
     outdir = a.out; os.makedirs(outdir, exist_ok=True)
-    if not os.path.exists(XLATE_EXE):
+    if not xlate_current():   # missing, or built from other sources (an update changed tools/xlate)
         build_xlate()
     if a.split or not os.path.exists(os.path.join(SPLIT, 'shader_map.tsv')):
         if not ROMFS or not MAIN:

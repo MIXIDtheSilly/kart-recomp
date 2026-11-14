@@ -7,8 +7,10 @@
 //                   the shader translator from tools\xlate and its packages\ (the SPIR-V tools and everything else
 //                   the host uses are in third_party\). Its C++ compiler switch writes BUILD_CC to local.cfg: mingw, or
 //                   cl for Visual Studio (clang, clang-cl with Visual Studio, counts as Visual Studio there).
-//   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat, from
-//                   the first stage whose output is missing; the tools' @@progress lines are drawn as a bar
+//   3 Build         nso.py, scan.py + funcs.py, build_all.py, gen_glue.py, the shader tools and host\build.bat: the
+//                   stages whose output is missing or whose tools changed since they last ran (Stage::stamp), and
+//                   the ones after them; the tools' @@progress lines are drawn as a bar. A new release unzipped beside
+//                   an older one takes that one's build over on the Game step (bring_over), so only what changed builds
 //   4 Play          host\out\kart.exe on the dump
 //
 // The game version (buttons at the top right of every step) picks what each step reads and writes: 1.0.0 builds into
@@ -32,6 +34,7 @@
 #include <dwrite_3.h>
 #include <dwmapi.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -252,6 +255,8 @@ struct Cmd {
     std::wstring line, cwd;
     std::wstring stage;     // the build stage it belongs to (shown while it runs), '' for none
     int stage_i = 0, stage_n = 0;
+    std::function<DWORD()> fn;       // instead of a process: done on the job's thread (line is only logged)
+    std::function<void()> after;     // when it succeeded (a build stage's last command: the stage's stamp)
 };
 
 // What the running job is at: its stage, and the last "@@progress <done> <total> <what>" line a tool printed
@@ -272,6 +277,7 @@ static std::deque<std::wstring> g_log;   // under g_mx
 static size_t g_log_added = 0;           // under g_mx: lines since the UI last looked
 static HANDLE g_job = nullptr;           // under g_mx: the running command's job object
 static std::atomic<bool> g_running{false}, g_cancel{false}, g_log_posted{false};
+static FILE* g_log_file = nullptr;       // under g_mx: --log <file>, every output line also goes there
 
 static void log_line(std::wstring s) {
     if (s.rfind(L"@@progress ", 0) == 0) {
@@ -290,6 +296,10 @@ static void log_line(std::wstring s) {
     }
     {
         std::lock_guard lk(g_mx);
+        if (g_log_file) {
+            fputs((narrow(s) + "\n").c_str(), g_log_file);
+            fflush(g_log_file);
+        }
         g_log.push_back(std::move(s));
         g_log_added++;
         while (g_log.size() > 5000) g_log.pop_front();
@@ -300,6 +310,7 @@ static void log_line(std::wstring s) {
 // One command, its output into the log; everything it starts is in a job object, so Stop ends the whole tree
 static DWORD run_cmd(const Cmd& c) {
     log_line(L"> " + c.line);
+    if (c.fn) return c.fn();
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE rd, wr;
     if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) return 1;
@@ -529,18 +540,104 @@ static void check_tools() {
     check_python();
 }
 
+// What a build stage is made from, as a hash: the tools it runs (their contents), or for the exe its sources' names,
+// sizes and times. A stage stamps the hash into <art>\build\stages\<id>.txt when it finishes, and Build runs it again
+// only when the hash changed (or its output is missing): after an update (a new release unzipped over the old one, or
+// an older install brought over) only what the changed tools make is built again, and each tool itself only redoes
+// what changed (lift.py writes only the chunks that differ, build_lib.py and build_host.py compile only those).
+struct Hasher {
+    uint64_t h = 1469598103934665603ull;
+    void add(const void* p, size_t n) {
+        for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)p)[i]) * 1099511628211ull;
+    }
+    void add(const std::wstring& s) { add(s.data(), (s.size() + 1) * sizeof(wchar_t)); }
+};
+
+// <dir>\<file>, <dir>\*.<ext> (that folder) or <dir>\** (everything under it, but build output: bin, obj, out,
+// __pycache__); names relative to the repository, so a moved install keeps its hashes
+static void hash_inputs(Hasher& hs, const fs::path& spec, bool contents) {
+    std::vector<fs::path> files;
+    std::error_code ec;
+    const std::wstring leaf = spec.filename().wstring();
+    if (leaf == L"**") {
+        for (auto it = fs::recursive_directory_iterator(spec.parent_path(), ec); !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
+            const std::wstring n = lower(it->path().filename().wstring());
+            if (it->is_directory(ec)) {
+                if (n == L"bin" || n == L"obj" || n == L"out" || n == L"__pycache__" || n == L".vs") it.disable_recursion_pending();
+            } else files.push_back(it->path());
+        }
+    } else if (leaf.find(L'*') != std::wstring::npos) {
+        WIN32_FIND_DATAW fd;
+        const HANDLE h = FindFirstFileExW(spec.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            do
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(spec.parent_path() / fd.cFileName);
+            while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    } else files.push_back(spec);
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+        hs.add(lower(f.lexically_relative(g_root).wstring()));
+        if (contents) {
+            std::ifstream in(f, std::ios::binary);
+            if (!in) {
+                hs.add(L"(missing)");
+                continue;
+            }
+            char buf[1 << 16];
+            while (in.read(buf, sizeof buf) || in.gcount()) hs.add(buf, (size_t)in.gcount());
+        } else {
+            WIN32_FILE_ATTRIBUTE_DATA fa{};
+            if (!GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &fa)) fa = {};
+            hs.add(&fa.ftLastWriteTime, sizeof fa.ftLastWriteTime);
+            hs.add(&fa.nFileSizeLow, sizeof fa.nFileSizeLow);
+            hs.add(&fa.nFileSizeHigh, sizeof fa.nFileSizeHigh);
+        }
+    }
+}
+
+enum StageState { S_TODO, S_DONE, S_CHANGED, S_UNSTAMPED };
+
 struct Stage {
-    std::wstring name;
-    std::function<bool()> done;
+    std::wstring name, id;
+    int chain;                          // a stage that runs makes the later ones of its chain run too
+    std::vector<fs::path> inputs;
+    bool by_time;                       // inputs by name, size and time instead of contents
+    std::function<bool()> built;        // its output is there
     std::function<std::vector<Cmd>()> cmds;
+
+    fs::path stamp_file() const { return art() / "build" / "stages" / (id + L".txt"); }
+    std::wstring hash() const {
+        Hasher hs;
+        for (const auto& p : inputs) hash_inputs(hs, p, !by_time);
+        wchar_t b[17];
+        swprintf(b, 17, L"%016llx", (unsigned long long)hs.h);
+        return b;
+    }
+    StageState state() const {
+        if (!built()) return S_TODO;
+        const auto l = read_lines(stamp_file());
+        if (l.empty()) return S_UNSTAMPED;
+        return widen(l[0]) == hash() ? S_DONE : S_CHANGED;
+    }
+    bool done() const { return state() == S_DONE; }
+    void stamp() const {
+        std::error_code ec;
+        fs::create_directories(stamp_file().parent_path(), ec);
+        std::ofstream(stamp_file(), std::ios::binary | std::ios::trunc) << narrow(hash()) << "\r\n";
+    }
 };
 
 static std::wstring g_game;   // KART_GAME (KART_GAME_<version> for another version)
 
-// For the chosen version: the tools write to art() and shader_dir() through KART_VER (apply_version)
+// For the chosen version: the tools write to art() and shader_dir() through KART_VER (apply_version). Chains: 0 the
+// code (each stage reads what the one before wrote), 1 the shaders (from the dump alone), 2 the exe (runs every Build:
+// it compiles only what changed and links).
 static std::vector<Stage> stages() {
     const std::wstring root = g_root.wstring();
-    const fs::path a = art(), sh = shader_dir(), exe = g_root / "host" / "out" / exe_name();
+    const fs::path a = art(), sh = shader_dir(), exe = g_root / "host" / "out" / exe_name(), t = g_root / "tools";
     const std::wstring out = L"\"" + (a / "out").wstring() + L"\"";
     const std::vector<Module> mods = ver().modules;
     const auto all = [mods](const fs::path& dir, const wchar_t* ext) {
@@ -549,9 +646,9 @@ static std::vector<Stage> stages() {
         return true;
     };
     return {
-        {L"Unpack the modules", [=] { return all(a / "out", L".json"); },
+        {L"Unpack the modules", L"unpack", 0, {t / "nso.py"}, false, [=] { return all(a / "out", L".json"); },
          [=] { return std::vector<Cmd>{{L"python tools\\nso.py \"" + g_game + L"\\exefs\" " + out, root}}; }},
-        {L"Find the functions", [=] { return all(a / "out", L".funcs.json"); },
+        {L"Find the functions", L"funcs", 0, {t / "scan.py", t / "funcs.py"}, false, [=] { return all(a / "out", L".funcs.json"); },
          [=] {
              std::vector<Cmd> v;
              for (const auto& m : mods) {
@@ -560,22 +657,43 @@ static std::vector<Stage> stages() {
              }
              return v;
          }},
-        {L"Lift and compile", [=] { return all(lib_dir(a / "build"), lib_ext()); },
+        // runtime\*.h: build_lib.py compiles everything again when they changed
+        {L"Lift and compile", L"lift", 0,
+         {t / "build_all.py", t / "lift.py", t / "a64.py", t / "neon.py", t / "patches.py", t / "build_lib.py", t / "hot_*.txt",
+          g_root / "runtime" / "*.h"},
+         false, [=] { return all(lib_dir(a / "build"), lib_ext()); },
          [=] { return std::vector<Cmd>{{L"python tools\\build_all.py", root}}; }},
-        {L"Module glue", [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
+        {L"Module glue", L"glue", 0, {t / "gen_glue.py"}, false, [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
          [=] { return std::vector<Cmd>{{L"python tools\\gen_glue.py", root}}; }},
-        // The translation, then the renderer's reflection table (nothing is drawn without it), the mesh shaders'
-        // per-vertex variants, the shaders the NVIDIA driver miscompiles as they are, and the compute shaders whose
-        // barriers hang Intel GPUs (.bar.spv)
-        {L"Translate the shaders", [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv") && any_file(sh, L"*.bar.spv"); },
+        // The translation (nvn_shaders.py builds the translator again when tools\xlate changed), then the renderer's
+        // reflection table (nothing is drawn without it), the mesh shaders' per-vertex variants, the shaders the
+        // NVIDIA driver miscompiles as they are, and the compute shaders whose barriers hang Intel GPUs (.bar.spv)
+        {L"Translate the shaders", L"shaders", 1,
+         {t / "nvn_shaders.py", t / "nvn_refl.py", t / "nvn_mesh.py", t / "nvn_spvfix.py", t / "nvn_barfix.py",
+          t / "shader_split" / "*.py", t / "xlate" / "**"},
+         false, [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv") && any_file(sh, L"*.bar.spv"); },
          [=] {
              return std::vector<Cmd>{{L"python tools\\nvn_shaders.py", root}, {L"python tools\\nvn_refl.py", root},
                                      {L"python tools\\nvn_mesh.py --flat", root}, {L"python tools\\nvn_spvfix.py --all", root},
                                      {L"python tools\\nvn_barfix.py", root}};
          }},
-        {L"Link " + exe_name(), [=] { return path_exists(exe); },
+        {L"Link " + exe_name(), L"link-" + fs::path(exe_name()).stem().wstring(), 2,
+         {g_root / "host" / "**", g_root / "runtime" / "*.h", g_root / "third_party" / "**", t / "build_host.py",
+          lib_dir(a / "build") / (std::wstring(L"*") + lib_ext()), a / "gen" / "aot_modules.cpp"},
+         true, [=] { return path_exists(exe); },
          [=] { return std::vector<Cmd>{{L"cmd /c build.bat", (g_root / "host").wstring()}}; }},
     };
+}
+
+// What an older install hands over to a new release beside it (all of it gitignored, none of it in the release zip):
+// the game unpacked, lifted, compiled and its shaders translated (out, gen, build, ver, work), kart.exe with its
+// objects, saves and pipeline cache (host\out), and what Set up installed
+static const wchar_t* BRING_OVER[] = {L"out", L"gen", L"build", L"ver", L"work", L"host\\out",
+                                      L"tools\\llvm-mingw", L"tools\\python", L"tools\\dotnet"};
+static bool fresh_install() {
+    for (const auto* d : {L"out", L"build", L"ver", L"host\\out"})
+        if (path_exists(g_root / d)) return false;
+    return true;
 }
 
 static std::vector<Row> g_rows[4];
@@ -644,9 +762,11 @@ static void refresh() {
     build.clear();
     bool all = true;
     for (const auto& s : stages()) {
-        const bool d = s.done();
-        build.push_back({s.name, d ? L"done" : L"to do", d ? ST_OK : ST_MISSING});
-        all &= d;
+        const StageState st = s.state();
+        build.push_back({s.name, st == S_DONE ? L"done" : st == S_CHANGED ? (s.by_time ? L"sources changed: compiled again" : L"its tools changed: built again")
+                                 : st == S_UNSTAMPED ? L"built by an older version: checked again" : L"to do",
+                         st == S_DONE ? ST_OK : ST_MISSING});
+        all &= st == S_DONE;
     }
     g_done[2] = all;
     g_can_build = g_done[0] && g_done[1];
@@ -811,7 +931,7 @@ static void stroke_circle(float x, float y, float r, uint32_t color, float width
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_VER = 50, B_CC = 60, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_VER = 50, B_CC = 60, B_DOT = 100,
 };
 struct Hit {
     int id;
@@ -826,13 +946,22 @@ static uint32_t g_status_color = col::muted;
 static ULONGLONG g_job_start = 0;
 static std::wstring g_nup_dest;    // the folder a .nup is being unpacked into (saved as the dump once that finishes)
 static bool g_unpack_log = false;  // the Game step shows the unpacking's status and output
+static bool g_bringing = false;    // an older version being brought over (bring_over)
+
+// A scripted run, launcher.exe [--bring-over <older folder>] [--build] [--quit] [--log <file>]: what the buttons do,
+// one action after the other, each once the one before finished well. --quit closes the launcher at the end, or at
+// the first failure, with exit code 0 or 1 (--log keeps the output).
+static std::deque<std::pair<std::wstring, std::wstring>> g_script;
+static bool g_scripting = false, g_script_quit = false;
+static int g_exit_code = 0;
+static void run_script();
 
 static const wchar_t* STEP_NAMES[4] = {L"Game", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TEXT[4] = {
     L"Pick your own dump of the game (the folder with exefs\\ and romfs\\) or a .nup file of it.",
     L"Set up installs what is missing into the repository. No admin rights or Visual Studio needed.",
-    L"Lifts the game to C++, compiles it and translates its shaders. The first build takes about half an hour.",
+    L"Lifts the game to C++, compiles it and translates its shaders. The first build takes about half an hour; after an update only what changed is built again.",
     L"Starts the game. Bake textures once so the first races do not hitch.",
 };
 
@@ -1152,7 +1281,17 @@ static void paint_steps(D2D1_RECT_F p) {
             draw_status(x + 4, x1, y);
             y += 56;
             draw_log({x0, y, x1, p.bottom - 30});
-        } else if (g_done[0]) button(B_CONTINUE, L"Continue", x0, y + 18, true, true);
+        } else {
+            float x = x0;
+            if (g_done[0]) x = button(B_CONTINUE, L"Continue", x, y + 18, true, true);
+            // A new release unzipped beside an older one: that one's build, tools and settings come over, and Build
+            // then does only what changed
+            if (fresh_install()) {
+                x = button(B_IMPORT, L"Bring over an older version…", x, y + 18, false, true);
+                text(L"Built an older release? Pick its folder: only what changed gets built again.", F_SMALL,
+                     {x + 4, y + 18, x1, y + 58}, col::muted, T_VCENTER | T_WRAP);
+            }
+        }
         break;
     }
     case 1: {
@@ -1322,6 +1461,7 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
             }
             code = run_cmd(c);
             if (code || g_cancel) break;
+            if (c.after) c.after();
         }
         PostMessageW(g_hwnd, WM_APP_DONE, code, g_cancel ? 1 : 0);
     }).detach();
@@ -1360,11 +1500,24 @@ static void job_done(DWORD code, bool cancelled) {
         if (!save_setting(game_key(), dest)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
         g_status = L"Unpacked in " + took + L" into " + dest;
     }
+    // An older version brought over: its game version, Python and .NET (tools\python, tools\dotnet) are here now
+    if (std::exchange(g_bringing, false) && !cancelled && code == 0) {
+        const std::wstring want = local_cfg()[L"LAUNCHER_VERSION"];
+        for (int v = 0; v < VERSION_COUNT; v++)
+            if (want == VERSIONS[v].name && env_var(L"KART_VER").empty()) g_ver = v;
+        apply_version();
+        check_dotnet(), check_python();
+        g_status = L"Brought over in " + took + L": Build now does only what changed";
+    }
     const int step = g_step;
     if (step == 1) check_dotnet(), check_python();   // what Set up just installed
     refresh();
     if (!cancelled && code == 0 && (step == 1 || step == 2) && g_done[step]) g_step = step + 1, g_status.clear();
     redraw();
+    if (g_scripting) {
+        if (cancelled || code) g_exit_code = 1;
+        run_script();
+    }
 }
 
 static void select_version(int v) {
@@ -1515,6 +1668,130 @@ static void open_nup() {
     start_job(L"Unpacking version " + version, cmds);
 }
 
+// An older release's folder: its build, tools and settings come over (moved on the same drive, which is instant;
+// copied from another one), so Build only redoes the stages whose tools changed since. local.cfg: the keys this one
+// lacks, with paths into the old folder pointed here.
+// interactive: the questions and errors as message boxes; scripted (--bring-over): no questions, errors in the log.
+// False when nothing started.
+static bool bring_over_from(const fs::path& picked, bool interactive) {
+    const auto fail = [&](const wchar_t* why) {
+        if (interactive) MessageBoxW(g_hwnd, why, L"Bring over", MB_ICONINFORMATION);
+        else log_line(std::wstring(L"bring over: ") + why);
+        return false;
+    };
+    fs::path old;
+    for (fs::path d = picked;; d = d.parent_path()) {   // launcher\out or another folder inside it picked: the one above
+        if (path_exists(d / "tools" / "paths.py")) {
+            old = d;
+            break;
+        }
+        if (d == d.parent_path()) return fail(L"That is not a kart-recomp folder (it has no tools\\paths.py).");
+    }
+    std::error_code ec;
+    if (fs::equivalent(old, g_root, ec)) return fail(L"That is this folder. Pick the older version's folder.");
+    std::vector<std::wstring> items;
+    for (const auto* d : BRING_OVER)
+        if (path_exists(old / d) && !path_exists(g_root / d)) items.push_back(d);
+    const bool cfg = path_exists(old / "local.cfg");
+    if (items.empty() && !cfg) return fail(L"Nothing to bring over: that folder has no build and no local.cfg.");
+    wchar_t va[MAX_PATH] = {}, vb[MAX_PATH] = {};
+    GetVolumePathNameW(old.c_str(), va, MAX_PATH);
+    GetVolumePathNameW(g_root.c_str(), vb, MAX_PATH);
+    const bool same = lower(va) == lower(vb);
+    const std::wstring ask = std::wstring(same ? L"Move" : L"Copy") +
+        L" the build, the tools Set up installed, your saves and settings from\n\n" + old.wstring() + L"\n\ninto this folder?\n\n" +
+        (same ? L"Moving is instant (same drive). The older version will not run afterwards."
+              : L"It is on another drive, so this copies (it can take a few minutes). The older version stays as it is.");
+    if (interactive && MessageBoxW(g_hwnd, ask.c_str(), L"Bring over an older version", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return false;
+
+    std::vector<Cmd> cmds;
+    for (const auto& d : items) {
+        const fs::path src = old / d, dst = g_root / d;
+        Cmd c{std::wstring(same ? L"move " : L"copy ") + src.wstring(), g_root.wstring(), L"Bringing over " + d};
+        if (same) {
+            c.fn = [src, dst]() -> DWORD {
+                std::error_code e;
+                fs::create_directories(dst.parent_path(), e);
+                if (MoveFileExW(src.c_str(), dst.c_str(), 0)) return 0;
+                const DWORD err = GetLastError();
+                log_line(L"could not move it (Windows error " + std::to_wstring(err) + L"): is a program using it?");
+                return err ? err : 1;
+            };
+        } else {
+            // robocopy keeps the files' times (build_lib.py and build_host.py go by them); below 8 is success
+            c.fn = [src, dst]() -> DWORD {
+                const DWORD code = run_cmd({L"robocopy \"" + src.wstring() + L"\" \"" + dst.wstring() +
+                                                L"\" /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NFL /NDL /NJH /NP", L""});
+                return code < 8 ? 0 : code;
+            };
+        }
+        cmds.push_back(c);
+    }
+    if (cfg) {
+        Cmd c{L"settings from " + (old / "local.cfg").wstring(), g_root.wstring(), L"Settings"};
+        c.fn = [old]() -> DWORD {
+            const auto have = local_cfg();
+            const std::wstring from = lower(old.wstring());
+            int n = 0;
+            for (const auto& l : read_lines(old / "local.cfg")) {
+                std::wstring w = widen(l);
+                w = w.substr(0, w.find(L'#'));
+                const size_t eq = w.find(L'=');
+                if (eq == std::wstring::npos) continue;
+                const std::wstring k = trim(w.substr(0, eq));
+                std::wstring v = trim(w.substr(eq + 1));
+                if (k.empty() || have.count(k)) continue;
+                if (lower(v).rfind(from, 0) == 0 && (v.size() == from.size() || v[from.size()] == L'\\' || v[from.size()] == L'/'))
+                    v = g_root.wstring() + v.substr(from.size());   // into the old folder: here
+                if (!save_setting(k, v)) return 1;
+                n++;
+            }
+            log_line(std::to_wstring(n) + L" settings taken over");
+            return 0;
+        };
+        cmds.push_back(c);
+    }
+    for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
+    g_unpack_log = true;
+    g_bringing = true;
+    start_job(L"Bringing over " + old.filename().wstring(), cmds);
+    return true;
+}
+static void bring_over() {
+    const std::wstring picked = pick(true, L"The older version's folder (the one holding launcher, tools and host)",
+                                     g_root.parent_path().wstring());
+    if (!picked.empty()) bring_over_from(picked, true);
+}
+
+static void click(int id);
+static void run_script() {
+    while (!g_running) {
+        if (g_script.empty() || g_exit_code) {
+            log_line(g_exit_code ? L"script: failed" : L"script: done");
+            if (g_script_quit) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+            g_scripting = false;
+            return;
+        }
+        const auto [what, arg] = g_script.front();
+        g_script.pop_front();
+        log_line(L"script: " + what + (arg.empty() ? L"" : L" " + arg));
+        if (what == L"bring-over") {
+            if (!bring_over_from(arg, false)) g_exit_code = 1;
+        } else if (what == L"build") {
+            refresh();
+            if (!g_can_build) {
+                log_line(!g_done[0] ? L"script: cannot build: the game dump is not set or does not match"
+                                    : L"script: cannot build: the dependencies are not set up");
+                g_exit_code = 1;
+            } else {
+                g_step = 2;
+                click(B_BUILD);
+            }
+        }
+    }
+}
+
 static void click(int id) {
     const std::wstring root = g_root.wstring();
     if (id >= B_DOT) {
@@ -1533,6 +1810,8 @@ static void click(int id) {
         browse();
     } else if (id == B_NUP) {
         open_nup();
+    } else if (id == B_IMPORT) {
+        bring_over();
     } else if (id == B_CONTINUE) {
         g_step = std::min(3, g_step + 1);
         g_status.clear();
@@ -1558,21 +1837,28 @@ static void click(int id) {
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
             return;
         const auto st = stages();
-        size_t from = 0;
-        if (id == B_BUILD) {
-            // From the first stage whose output is missing (everything later depends on it); with nothing missing,
-            // the host alone, which rebuilds only what changed
-            while (from < st.size() && st[from].done()) from++;
-            if (from == st.size()) from = st.size() - 1;
+        // Build: in each chain, from the first stage that is not done (its output missing, or its tools changed:
+        // the later ones read what it writes), and the exe every time (it compiles only what changed). Rebuild
+        // everything: every stage.
+        std::vector<size_t> run;
+        int started = -1;   // the chain that already has a stage to run
+        for (size_t i = 0; i < st.size(); i++) {
+            if (id == B_REBUILD || st[i].chain == 2 || started == st[i].chain || !st[i].done()) {
+                run.push_back(i);
+                started = st[i].chain;
+            }
         }
         std::vector<Cmd> cmds;
-        for (size_t i = from; i < st.size(); i++)
-            for (auto& c : st[i].cmds()) {
-                c.stage = st[i].name;
-                c.stage_i = (int)(i - from) + 1;
-                c.stage_n = (int)(st.size() - from);
-                cmds.push_back(c);
+        for (size_t k = 0; k < run.size(); k++) {
+            auto cs = st[run[k]].cmds();
+            for (auto& c : cs) {
+                c.stage = st[run[k]].name;
+                c.stage_i = (int)k + 1;
+                c.stage_n = (int)run.size();
             }
+            cs.back().after = [s = st[run[k]]] { s.stamp(); };
+            cmds.insert(cmds.end(), cs.begin(), cs.end());
+        }
         start_job(id == B_BUILD ? L"Building" : L"Rebuilding everything", cmds);
     } else if (id == B_PLAY || id == B_BAKE) {
         const std::wstring exe = (g_root / "host" / "out" / exe_name()).wstring();
@@ -1704,7 +1990,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
-        PostQuitMessage(0);
+        PostQuitMessage(g_exit_code);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1754,6 +2040,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             MessageBoxW(nullptr, L"Run the launcher from inside the repository (launcher\\out\\launcher.exe).", L"Launcher", MB_ICONERROR);
             return 1;
         }
+    }
+
+    // A scripted run (g_script)
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; argv && i < argc; i++) {
+            const std::wstring a = argv[i];
+            if (a == L"--bring-over" && i + 1 < argc) g_script.push_back({L"bring-over", argv[++i]});
+            else if (a == L"--build") g_script.push_back({L"build", L""});
+            else if (a == L"--quit") g_script_quit = true;
+            else if (a == L"--log" && i + 1 < argc) g_log_file = _wfopen(argv[++i], L"wb");
+        }
+        if (argv) LocalFree(argv);
+        g_scripting = !g_script.empty() || g_script_quit;
     }
 
     // For the tools it runs: Python output as it comes, in UTF-8; builds on every core unless BUILD_MP says
@@ -1806,11 +2107,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"kart-recomp", WS_OVERLAPPEDWINDOW, work.left + (work.right - work.left - w) / 2,
                              work.top + (work.bottom - work.top - h) / 2, w, h, nullptr, nullptr, inst, nullptr);
     ShowWindow(g_hwnd, show);
+    if (g_scripting) run_script();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    return 0;
+    return (int)msg.wParam;
 }

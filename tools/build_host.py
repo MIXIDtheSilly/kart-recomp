@@ -2,10 +2,12 @@ r"""Builds host\out\kart.exe (kart-<KART_VER>.exe) with llvm-mingw's clang: what
 host\build.bat runs it when BUILD_CC=mingw (the default; tools\toolchain.py downloads llvm-mingw; see paths.py).
 
 Objects go to host\out\obj-mingw. A file is compiled again only when it, a header it includes (clang's .d files) or the
-flags changed. The exe links the module libraries build_lib.py made (<art>\build\mingw\<module>.a) and everything
+flags changed: <obj>.k records each such file's time, size and hash, so a file unzipped from a release with an older
+time than the object still counts as changed. The exe links the module libraries build_lib.py made (<art>\build\mingw\<module>.a) and everything
 statically (libc++, libunwind, winpthreads): it needs no DLL beyond Windows' own. BUILD_MP=<n>: at most n compilers
 at once (default: one per core).
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -74,19 +76,60 @@ def deps(d):
     return [p.replace("\\ ", " ") for p in re.split(r"(?<!\\)\s+", rhs) if p]
 
 
+def digest(f):
+    with open(f, "rb") as fh:
+        return hashlib.blake2b(fh.read(), digest_size=16).hexdigest()
+
+
+def record(files):
+    """What an object was compiled from (<obj>.k): each file's time, size and contents' hash. 'A file newer than the
+    object' is not enough: files unzipped from a release keep the release's times, which can be older than an object
+    an earlier version compiled."""
+    lines = []
+    for f in files:
+        try:
+            st = os.stat(f)
+            lines.append(f"{f}\t{st.st_mtime_ns}\t{st.st_size}\t{digest(f)}")
+        except OSError:
+            lines.append(f"{f}\t-\t-\t-")
+    return "\n".join(lines)
+
+
+def changed(rec):
+    """A file of the record that is not as it was: its time or size moved and its contents differ."""
+    for line in rec.splitlines():
+        f, t, size, h = line.split("\t")
+        try:
+            st = os.stat(f)
+        except OSError:
+            return True   # a header that is gone
+        if (str(st.st_mtime_ns), str(st.st_size)) != (t, size) and digest(f) != h:
+            return True
+    return False
+
+
 def stale(src, obj):
     if not obj.exists():
         return True
-    t = obj.stat().st_mtime
     files = deps(obj.with_suffix(".d"))
     if files is None:
         return True
+    k = obj.with_suffix(".k")
+    try:
+        rec = k.read_text(encoding="utf-8")
+    except OSError:
+        rec = None
+    if rec is not None:
+        return [l.split("\t")[0] for l in rec.splitlines()] != files or changed(rec)
+    # An object from before the records: by time, and recorded from now on
+    t = obj.stat().st_mtime
     for f in files:
         try:
             if os.stat(f).st_mtime > t:
                 return True
         except OSError:
-            return True   # a header that is gone
+            return True
+    k.write_text(record(files), encoding="utf-8")
     return False
 
 
@@ -132,6 +175,9 @@ def main():
                            env=env, capture_output=True, text=True, errors="replace")
         if r.returncode == 0:
             os.replace(tmp, o)
+            files = deps(o.with_suffix(".d"))
+            if files is not None:
+                o.with_suffix(".k").write_text(record(files), encoding="utf-8")
         else:
             tmp.unlink(missing_ok=True)
         return s, r

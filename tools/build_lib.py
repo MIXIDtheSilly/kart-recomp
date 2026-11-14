@@ -8,6 +8,7 @@ tools/toolchain.py downloads it; see paths.py). Objects are only rebuilt when th
 after lifting a subset is cheap.
 """
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -76,12 +77,31 @@ def main():
         key = arch + (f" @{prof.stat().st_mtime_ns}" if pgo and pgo != "gen" else "")
         if not stamp.exists() or stamp.read_text() != key:
             stale = sources
+    # runtime/*.h: every generated file includes them, so a change compiles everything. <module>_runtime.txt holds
+    # their hash from the last build that finished; an object folder from before it has none and is taken as matching.
+    rt_stamp, rt_key = build / f"{a.module}_runtime.txt", runtime_key()
+    if rt_stamp.exists() and rt_stamp.read_text() != rt_key:
+        print("runtime headers changed: compiling everything")
+        stale = sources
     print(f"{len(sources)} sources, {len(stale)} to compile")
     if clang:
-        return build_clang(a, sources, stale, build, lib, arch, stamp, key)
-    if mingw:
-        return build_mingw(a, sources, stale, build, lib, arch, stamp, key)
+        build_clang(a, sources, stale, build, lib, arch, stamp, key)
+    elif mingw:
+        build_mingw(a, sources, stale, build, lib, arch, stamp, key)
+    else:
+        build_cl(a, sources, stale, build, lib)
+    rt_stamp.write_text(rt_key)
 
+
+def runtime_key():
+    h = hashlib.blake2b(digest_size=16)
+    for f in sorted((ROOT / "runtime").glob("*.h")):
+        h.update(f.name.encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()
+
+
+def build_cl(a, sources, stale, build, lib):
+    """cl (BUILD_CC=cl)."""
     # MSVC skips optimizing functions it finds too big (C4883, silent under /w): the hot ones (lift.py --hot, in
     # <module>_hot_*.cpp) are compiled with /d2OptimizeHugeFunctions, which takes far longer, the rest as they are.
     # BUILD_WARN_HUGE=1 reports the functions it skips (C4883) in <build>/<module>_cl.log. BUILD_MP=<n>: parallel compiles.
