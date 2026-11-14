@@ -195,6 +195,7 @@ Set them in the environment, or as `HOST_*` lines in `local.cfg`.
 | `HOST_USER_DIR=<dir>` | saves and logs in that folder instead of `host\out\user\` |
 | `HOST_NVN_TEXCACHE=<dir>\|0` | decoded texture cache folder, or none; `HOST_NVN_TEXCACHE_MB` caps it (64 GiB) |
 | `HOST_NVN_PIPELINE_CACHE=<file>` | where the pipeline cache lives (its `.keys` and `.primed` lists sit beside it) |
+| `HOST_NVN_OWN_CPU_CACHED=1` | GPU-written CPU-cached pools may move to video memory once the CPU leaves them alone (faster, but a view's lighting can freeze: the game reads some without asking) |
 | `HOST_TRANSCODE_THREADS=<n>` | threads for ASTC decoding / BC encoding (a quarter of the cores by default) |
 | `HOST_RENDER_HIDDEN=1`, `HOST_INPUT_SCRIPT="<s>:<buttons>:<duration>;..."` | hidden test runs with scripted presses, e.g. `30:L+R:0.4;35:A:0.2` (buttons also `LS`, `RS`: stick clicks) |
 | `HOST_INPUT_FILE=<file>` | lines appended to the file while the game runs are pressed from when they are read (`0:A:0.2`): driving a test run step by step |
