@@ -239,8 +239,10 @@ void set_targets(VkCommandBuffer cb, const p_set_rt* rt) {
             t.img = nullptr;
             return;
         }
-        t.view = view_of(t.img, v, true);
-        t.format = view_format(t.img, v);
+        view_t tv;
+        const view_t* own = tex_view(tex, t.img, v, tv);   // (in tex's format, where it shares an image made in another)
+        t.view = view_of(t.img, own, true);
+        t.format = view_format(t.img, own);
         R.samples = t.img->samples;
         t.level = v && v->set_levels ? std::min<u32>(v->base_level, t.img->levels - 1) : 0;
         t.layer = v && v->set_layers ? v->min_layer : 0;
@@ -350,7 +352,8 @@ void clear_tex(VkCommandBuffer cb, const p_clear_tex* c) {
         const u32 d = std::max(img->depth >> level, 1u);
         const u32 nl = v->nlayers ? std::min<u32>(v->nlayers, d - std::min<u32>(v->min_layer, d - 1)) : 1;
         VkRenderingAttachmentInfo at{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        at.imageView = view_of(img, v, true);
+        view_t tv;
+        at.imageView = view_of(img, tex_view(c->tex, img, v, tv), true);
         at.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         at.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;

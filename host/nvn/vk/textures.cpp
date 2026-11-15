@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <mutex>
@@ -148,12 +149,23 @@ u64 alloc_size(VmaAllocation a) {
     return i.size;
 }
 
+// The format part of shape_key. Texture objects over the same storage in formats a view can reinterpret (the same bits per
+// texel and block, colour, read as they are) are the same texels on the console, so they share the image and each views it in
+// its own format (tex_view). The game draws its movies into an RGBA8 target and composites them through an RGBA8_SRGB texture
+// over the same memory (1.8.0's race previews: 2560x1440, NVN formats 0x25 / 0x38); as two images, the composite sampled one
+// nothing was drawn into, and the movie never showed. Other formats (ASTC, depth / stencil, alpha forced to 1, none) as before.
+u64 format_class(u32 nvn_format) {
+    const Format& f = format(nvn_format);
+    if ((f.kind != FmtKind::Exact && f.kind != FmtKind::Substitute) || f.depth || f.stencil || f.noalpha) return nvn_format;
+    return 0x10000ull | f.bytes | static_cast<u64>(f.block_w) << 8 | static_cast<u64>(f.block_h) << 12;
+}
+
 u64 shape_key(const nvn::tex_t* t) {
     static const bool off = getenv("HOST_NVN_NOSHARE") != nullptr;   // one image per texture object (to compare)
     if (!t->mem || off) return 0;
     const nvn_texdesc& d = t->d;
     u64 h = nvn::ga(t->mem) * 0x9E3779B97F4A7C15ull;
-    for (const u64 v : {static_cast<u64>(d.format), static_cast<u64>(d.width), static_cast<u64>(d.height), static_cast<u64>(d.depth),
+    for (const u64 v : {format_class(static_cast<u32>(d.format)), static_cast<u64>(d.width), static_cast<u64>(d.height), static_cast<u64>(d.depth),
                         static_cast<u64>(d.levels), static_cast<u64>(d.target), static_cast<u64>(d.samples),
                         static_cast<u64>(t->L.layers), static_cast<u64>(d.flags)})
         h = (h ^ v) * 0xC2B2AE3D27D4EB4Full + 0x165667B19E3779F9ull;
@@ -212,6 +224,15 @@ VkComponentSwizzle swz(u32 nvn_swizzle) {
 
 VkImageSubresourceRange full_range(const Image* img) {
     return {img->aspect, 0, img->levels, 0, VK_REMAINING_ARRAY_LAYERS};
+}
+
+const nvn::view_t* tex_view(const nvn::tex_t* t, const Image* img, const nvn::view_t* v, nvn::view_t& tmp) {
+    if (!t || !img || (v && v->set_format && v->format) || static_cast<u32>(t->d.format) == img->nvn_format) return v;
+    if (v) tmp = *v;
+    else std::memset(&tmp, 0, sizeof tmp);
+    tmp.set_format = 1;
+    tmp.format = static_cast<uint16_t>(t->d.format);
+    return &tmp;
 }
 
 VkFormat view_format(const Image* img, const nvn::view_t* v) {
@@ -397,7 +418,16 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && img->samples == VK_SAMPLE_COUNT_1_BIT) {
+    // An sRGB image may be shared with a texture in the UNORM format (format_class) that a shader writes: storage use through
+    // that format's views (EXTENDED_USAGE: a usage some view format supports).
+    VkFormatFeatureFlags storage_ff = ff;
+    switch (img->format) {
+    case VK_FORMAT_R8G8B8A8_SRGB: storage_ff |= features(VK_FORMAT_R8G8B8A8_UNORM); break;
+    case VK_FORMAT_B8G8R8A8_SRGB: storage_ff |= features(VK_FORMAT_B8G8R8A8_UNORM); break;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: storage_ff |= features(VK_FORMAT_A8B8G8R8_UNORM_PACK32); break;
+    default: break;
+    }
+    if ((storage_ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && img->samples == VK_SAMPLE_COUNT_1_BIT) {
         usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         img->storage_ok = true;
     }
