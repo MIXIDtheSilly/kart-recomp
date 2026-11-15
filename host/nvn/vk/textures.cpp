@@ -157,6 +157,8 @@ u64 alloc_size(VmaAllocation a) {
 u64 format_class(u32 nvn_format) {
     const Format& f = format(nvn_format);
     if ((f.kind != FmtKind::Exact && f.kind != FmtKind::Substitute) || f.depth || f.stencil || f.noalpha) return nvn_format;
+    // Compressed formats: Vulkan's view classes are per BC family (BC3 and BC7 share a block size, not a class).
+    if (f.block_w > 1 || f.block_h > 1) return nvn_format;
     return 0x10000ull | f.bytes | static_cast<u64>(f.block_w) << 8 | static_cast<u64>(f.block_h) << 12;
 }
 
