@@ -31,6 +31,30 @@ KEYS = ["KART_GAME", "NVN_XLATE", "BUILD_CC", "MINGW", "VCVARS", "CLANG", "VULKA
 NOT_PATHS = ("BUILD_CC", "VCVARS", "CLANG", "KART_VER")
 
 
+def _excepthook(kind, exc, tb):
+    """A program a tool runs that is not there: Windows says only "[WinError 2] The system cannot find the file
+    specified" (issue #22). Names the program, from the subprocess.Popen call in the traceback."""
+    if issubclass(kind, FileNotFoundError) and getattr(exc, "winerror", None) == 2:
+        t, prog = tb, None
+        while t:
+            f = t.tb_frame
+            if f.f_code.co_name == "__init__" and isinstance(f.f_locals.get("self"), subprocess.Popen):
+                args, exe = f.f_locals.get("args"), f.f_locals.get("executable")
+                prog = exe or (args if isinstance(args, (str, bytes, os.PathLike)) else (list(args)[:1] or [None])[0])
+                break
+            t = t.tb_next
+        if prog is not None:
+            import traceback
+            traceback.print_exception(kind, exc, tb)
+            print(f"\ncould not start {os.fsdecode(prog)}: no such program. If it is a tool the build makes or "
+                  "Set up installs, run Set up (Dependencies) again.", file=sys.stderr, flush=True)
+            return
+    sys.__excepthook__(kind, exc, tb)
+
+
+sys.excepthook = _excepthook
+
+
 def _local():
     cfg = {}
     f = ROOT / "local.cfg"
