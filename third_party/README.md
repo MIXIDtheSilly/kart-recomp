@@ -9,6 +9,12 @@ The C++ compiler is not in the repository: `tools\toolchain.py` downloads llvm-m
 its own permissive licenses, listed in its `LICENSE.TXT`) into `tools\llvm-mingw\`. The exes it links
 carry libc++, libunwind (Apache-2.0 with LLVM exceptions) and winpthreads (MIT-style).
 
+On Linux, `./kart.sh setup` downloads LLVM's own release of the same clang (https://github.com/llvm/llvm-project,
+Apache-2.0 with LLVM exceptions) into `tools/llvm/`, and, when the system lacks some of them, the SPIR-V tools of
+LunarG's Vulkan SDK for Linux (the same SDK version as `spirv\bin\`, licenses as below; its `LICENSE.txt` is
+copied along) into `tools/spirv/`. The Linux exe links the system's C and C++ libraries and loads SDL 3, the Vulkan
+loader and libvpx from the system.
+
 | folder | what | version | license |
 |--------|------|---------|---------|
 | `vulkan\` | Vulkan-Headers: the C headers for Windows (`vulkan.h`, `vk_platform.h`, `vulkan_core.h`, `vulkan_win32.h`, `vk_video\`) | 1.4.345 | Apache-2.0 or MIT (`LICENSE.md`, `LICENSES\`) |
@@ -17,6 +23,7 @@ carry libc++, libunwind (Apache-2.0 with LLVM exceptions) and winpthreads (MIT-s
 | `zstd\` | Zstandard, the decoder only (`common\`, `decompress\`): the game's `.zs` files, read by the texture bake | 1.5.8 (33618c8) | BSD-3-Clause (`LICENSE`) |
 | `opus\` | Opus: the float build in plain C, without the SIMD paths, for the `hwopus` service (movie audio) | a3f0ec02b3 | BSD-3-Clause (`COPYING`) |
 | `spirv\bin\` | Khronos SPIR-V tools, prebuilt for Windows x64 (from the Vulkan SDK): `spirv-val`, `spirv-opt`, `spirv-dis` (SPIRV-Tools v2026.4), `spirv-cross`, `glslangValidator` (16.6.0). The shader tools run them. `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` beside them are the Visual C++ runtime they need (14.51.36231, from the Visual Studio redist folder), so PCs without the VC++ redistributable can run them too | SDK 1.4.363.0 | Apache-2.0 (`LICENSE-SPIRV-Tools`, `LICENSE-SPIRV-Cross`); glslang: BSD-3-Clause and others (`LICENSE-glslang.txt`); VC++ runtime: Microsoft Visual Studio redistributable files (`redist.txt`), app-local deployment |
+| `SDL3\include\` | SDL's headers, for the Linux host (window, input, sound), which loads the system's `libSDL3.so.0` (SDL keeps its ABI within version 3: these 3.2 headers work with any SDL 3.2 or later) | 3.2.30 | zlib (`LICENSE.txt`) |
 | `stb\` | stb_dxt by Fabian Giesen: BC1/BC3 block encoding. This is Eden's copy, split into a header and a source file | 1.12 | MIT or public domain |
 
 ## Code adapted into `host\`

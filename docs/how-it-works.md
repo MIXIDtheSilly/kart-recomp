@@ -81,6 +81,60 @@ host\out\kart.exe
 A `.nup` dump unpacks with `python tools\nup.py extract <file> <folder>`. For 1.8.0, set
 `KART_VER=1.8.0` in the environment first (see [Game versions](#game-versions)).
 
+## Linux
+
+The same game and host, built with clang from LLVM 23.1.4 (the clang llvm-mingw has) against the system's C and C++
+libraries. `./kart.sh` (`tools/linux.py`) does what the launcher does, on the command line:
+
+| command | what |
+|---------|------|
+| `./kart.sh setup` | checks SDL 3, the Vulkan loader, libvpx and the C++ headers; puts LLVM's release in `tools/llvm/` (`tools/toolchain.py`; `LLVM=/usr` in `local.linux.cfg` takes the distribution's clang instead), the Python packages in a virtual environment `tools/venv/`, the .NET 10 SDK in `tools/dotnet/` (when the system has none) and the Vulkan SDK's SPIR-V tools in `tools/spirv/` (when some are missing: Fedora has no spirv-cross) |
+| `./kart.sh game <folder>` | the dump, as `KART_GAME` (or `KART_GAME_<version>` with `--version`) in `local.linux.cfg` |
+| `./kart.sh build` | the build steps of [Building by hand](#building-by-hand), each one that is not done yet (`--force`: all) |
+| `./kart.sh play`, `./kart.sh bake` | the game (`host/out/kart`, `kart-<version>`), or the texture bake |
+
+`--version 1.8.0` picks the other game version (else `LAUNCHER_VERSION`). Settings come from `local.linux.cfg`
+first, then `local.cfg`, whose Windows paths (`C:\...`) Linux skips, so one checkout on a drive both systems mount
+serves both: the dump paths go into `local.linux.cfg`, the `HOST_*` settings can stay shared. Saves and the texture
+cache are shared too; the pipeline cache is not (`host/out/nvn_pipelines-linux.bin`, started from Windows' list of
+pipelines to build ahead).
+
+What differs from Windows:
+
+* **Window, input, sound**: SDL 3 (Wayland or X11). Gamepads are every pad SDL knows, Xbox, PlayStation and Switch Pro
+  Controllers included, with vibration; the PlayStation and Pro Controller drivers need read access to
+  `/dev/hidraw*` (most distributions give it to the logged-in user through udev, else SDL falls back to the kernel's
+  driver). Sound goes to PipeWire, PulseAudio or ALSA, whichever SDL finds.
+* **The F3 overlay** is the window title (FPS, frame time, GPU wait, RAM): Wayland draws no window over another
+  program's.
+* **Movies**: libvpx, loaded when the first one starts (no headers needed to build); without it they show black.
+* **Guest memory**: the pool is a memfd and the guest view `MAP_FIXED` mappings of it. Freed memory stays in RAM and
+  is cleared on reuse; `HOST_DISCARD_FREED=1` gives it back with `fallocate(PUNCH_HOLE)` 3 s later. Two traps there: the
+  GPU driver pins the pages an import found, so a hole punched under an import left the GPU reading the old pages
+  (stretched models; `mem::pin`/`unpin` count imports per 64 KiB and hold those back), and the renderer still reads some
+  memory just after the game frees it, so a hole punched at once read zero and hung the GPU in the title demo (Xid 109).
+  It saved next to nothing anyway: the game keeps ~10 GB allocated and reuses what it frees. Imports are lean (at first
+  use, in 64 MB windows), as an import takes ~4 ms on Linux: 6.5-7.5 GB of guest memory instead of 8.5-9+.
+  With many mappings Linux's `vm.max_map_count` (65530 on some distributions) can run out:
+  the error says so.
+* **Timing**: the timer slack is 1 ns (`PR_SET_TIMERSLACK`), so short sleeps spin only their last 100 us
+  (`HOST_SLEEP_SPIN_US`). A thread can lower its priority but not raise it without `CAP_SYS_NICE`: the renderer
+  threads run at normal priority.
+* **LAN Play**: the gateway pings use an unprivileged ICMP socket, which `net.ipv4.ping_group_range` must allow (it
+  does on most distributions); without it LAN play still works.
+* **Crash and stall reports** name functions from kart's own symbol table, and other libraries' exports; each thread
+  reads its own stack when signalled. `HOST_WATCH_STEP` (debug registers) is Windows only.
+* **A GPU hang** freezes the game on Linux instead of losing the device: NVIDIA's driver logs it (`journalctl -k`,
+  `NVRM: Xid ... 109, CTX SWITCH TIMEOUT`) but never fails the wait, so the stall report shows the game in
+  `nvnSyncWait` and the completion thread inside the driver.
+* **One slow file**: 1.0.0's `gen/main_005.cpp` takes ~24 minutes to compile for the Linux target (71 s for Windows with
+  the same clang): one 27,000-line function (`main_30ac60`) where LLVM's SLP vectorizer and register coalescer take
+  that long. Only the first build pays; 1.8.0's files are quick.
+
+`host/build.sh` builds the exe by hand (`tools/build_host.py`; objects in `host/out/obj-linux/`, module libraries in
+`build/linux/`). The tools in [Building by hand](#building-by-hand) run the same with `python3` and `/` paths, and
+`tools/venv/bin/python` has the packages.
+
 ## FPS chart data
 
 | milestone | date | race fps (uncapped) |
