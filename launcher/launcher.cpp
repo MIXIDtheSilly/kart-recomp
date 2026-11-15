@@ -18,6 +18,9 @@
 // tools (kart-<version>.exe, KART_GAME_<version>). The choice is kept as LAUNCHER_VERSION in local.cfg, never as
 // KART_VER, which there would switch every build.
 //
+// A release (launcher\out\release.txt beside the prebuilt launcher) asks GitHub for a newer one at startup and offers
+// to update: tools\update.py puts it over this folder and the launcher starts again (see Updates below).
+//
 // Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the defaults.
 // launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything, in Instrument
 // Sans and DM Mono from launcher\fonts\ (SIL OFL, the licences beside them; Segoe UI and Consolas when they are missing).
@@ -64,6 +67,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -490,14 +494,14 @@ struct Progress {
 static Progress g_prog;
 
 #ifdef _WIN32
-constexpr UINT WM_APP_LOG = WM_APP + 1, WM_APP_DONE = WM_APP + 2;
+constexpr UINT WM_APP_LOG = WM_APP + 1, WM_APP_DONE = WM_APP + 2, WM_APP_UPDATE = WM_APP + 3;
 
 static HWND g_hwnd;
 static void post_log() { PostMessageW(g_hwnd, WM_APP_LOG, 0, 0); }
 #else
 // The window, and the events the job's threads post to it (SDL_PushEvent is safe from any thread)
 static SDL_Window* g_window;
-static Uint32 g_ev_log, g_ev_done;
+static Uint32 g_ev_log, g_ev_done, g_ev_update;
 static void post_event(Uint32 type, int code = 0, bool flag = false) {
     SDL_Event e{};
     e.type = type;
@@ -1749,7 +1753,7 @@ static void frame_end() {
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_VER = 50, B_CC = 60, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_UPDATE, B_VER = 50, B_CC = 60, B_DOT = 100,
 };
 struct Hit {
     int id;
@@ -1766,9 +1770,28 @@ static std::wstring g_nup_dest;    // the folder a .nup is being unpacked into (
 static bool g_unpack_log = false;  // the Game step shows the unpacking's status and output
 static bool g_bringing = false;    // an older version being brought over (bring_over)
 
+// Updates (the section after bring_over)
+static std::wstring g_release;       // this folder's release (launcher/out/release.txt), '' in a checkout
+static std::wstring g_update_ver;    // a newer release on GitHub, '' while none is known
+static std::wstring g_update_notes;  // the start of its notes
+static bool g_update_ask = false;    // found while a job ran or a question was open: asked once that is over
+static bool g_updating = false;      // the newer release being downloaded and unpacked (start_update)
+static int g_asking = 0;             // a message box or file dialog is open
+struct Asking {
+    Asking() { g_asking++; }
+    ~Asking() { g_asking--; }
+};
+static std::vector<std::pair<std::wstring, std::wstring>> g_env0;   // what the launcher changes in its environment, as it was
+static void maybe_offer_update();
+static void update_done(bool ok);
+#ifndef _WIN32
+static bool g_quit_asked = false;   // the window's close button (or --quit, or an update), handled by the main loop
+#endif
+
 // A scripted run, launcher.exe [--bring-over <older folder>] [--setup] [--build] [--quit] [--log <file>]: what the buttons do,
 // one action after the other, each once the one before finished well. --quit closes the launcher at the end, or at
-// the first failure, with exit code 0 or 1 (--log keeps the output).
+// the first failure, with exit code 0 or 1 (--log keeps the output). --update installs the newest release over this
+// folder without asking, and the launcher starts again.
 static std::deque<std::pair<std::wstring, std::wstring>> g_script;
 static bool g_scripting = false, g_script_quit = false;
 static int g_exit_code = 0;
@@ -1803,6 +1826,7 @@ enum { M_INFO, M_ERROR, M_ASK, M_WARN };
 static bool modal_box(const std::wstring& text, const wchar_t* title, int kind);
 #endif
 static bool msg_box(const std::wstring& text, const wchar_t* title, int kind) {
+    Asking asking;
 #ifdef _WIN32
     const UINT f = kind == M_INFO ? MB_ICONINFORMATION : kind == M_ERROR ? MB_ICONERROR : kind == M_ASK ? MB_YESNO | MB_ICONQUESTION
                                                                                                         : MB_YESNO | MB_ICONWARNING;
@@ -2252,6 +2276,20 @@ static void paint() {
         text(STEP_NAMES[i], F_LABEL, {cx[i] - 70, cy + r + 12, cx[i] + 70, cy + r + 32}, sel ? col::text : mix(col::muted, col::text, h), T_CENTER);
     }
 
+    // A newer release: a small button at the top right asks again (it is asked once by itself, offer_update)
+    if (!g_update_ver.empty() && !g_updating) {
+        const std::wstring label = L"Update to " + g_update_ver;
+        const float w = measure(label, F_SMALL, 400).width + 26;
+        const D2D1_RECT_F b{sz.width - m - w, 8, sz.width - m, 33};
+        const bool on = !g_running;
+        if (on) g_hits.push_back({B_UPDATE, b});
+        const float h = on ? ease(anim(B_UPDATE).hov) : 0;
+        fill_round(b, R_CTRL, mix(col::inset, col::btn_hover, h));
+        stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
+        fill_circle(b.left + 11, (b.top + b.bottom) / 2, 3, on ? col::accent : col::dim);
+        text(label, F_SMALL, {b.left + 18, b.top, b.right, b.bottom}, on ? col::text : col::dim, T_CENTER | T_VCENTER);
+    }
+
     paint_panel({m, cy + r + 48, sz.width - m, sz.height - m});
 #ifndef _WIN32
     paint_modal(sz);   // a question over it all
@@ -2361,10 +2399,12 @@ static void job_done(DWORD code, bool cancelled) {
     refresh();
     if (!cancelled && code == 0 && (step == 1 || step == 2) && g_done[step]) g_step = step + 1, g_status.clear();
     redraw();
+    if (std::exchange(g_updating, false)) update_done(!cancelled && code == 0);
     if (g_scripting) {
         if (cancelled || code) g_exit_code = 1;
         run_script();
     }
+    maybe_offer_update();
 }
 
 static void select_version(int v) {
@@ -2399,6 +2439,7 @@ static void browse() {
 // A file or folder dialog; '' when cancelled (Linux: in the window section, through SDL)
 #ifdef _WIN32
 static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start) {
+    Asking asking;
     IFileOpenDialog* d = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
     DWORD o = 0;
@@ -2629,6 +2670,188 @@ static void bring_over() {
     if (!picked.empty()) bring_over_from(picked, true);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Updates: a release carries launcher/out/release.txt (its version; a checkout has none and is never offered one). At
+// startup tools/update.py check asks GitHub for the newest release in the background; a newer one is asked about once
+// (No: UPDATE_SKIP=<version> in the settings, and "Update to <version>" at the top right asks again). Yes: update.py
+// install puts it over this folder (the changed files replaced, the ones it dropped deleted, by launcher/out/files.txt;
+// the build, tools, saves and settings stay, so Build redoes only what changed) and the launcher starts again. A file
+// in use (Windows: this launcher.exe) is renamed to <name>.old; the next start deletes those (clean_leftovers).
+// UPDATE_CHECK=0 in the settings: no check.
+
+#ifdef _WIN32
+#define PYTHON3 L"python"
+#define LAUNCHER_EXE L"launcher.exe"
+#else
+#define PYTHON3 L"python3"   // the system's: Set up's tools/venv need not exist yet
+#define LAUNCHER_EXE L"launcher"
+#endif
+
+static std::wstring g_found_ver, g_found_notes;   // under g_mx: what the check found, for update_found
+
+static void read_release() {
+    for (const auto& l : read_lines(g_root / "launcher" / "out" / "release.txt"))
+        if (!trim(widen(l)).empty()) {
+            g_release = trim(widen(l));
+            break;
+        }
+}
+
+// tools/update.py check: a newer release's version and the start of its notes; no version when this one is the newest,
+// or there was no answer (offline, no Python yet, GitHub's rate limit)
+static std::pair<std::wstring, std::wstring> check_update() {
+    DWORD code;
+    const std::wstring out = widen(capture(PYTHON3 L" \"" + (g_root / "tools" / "update.py").wstring() + L"\" check", &code));
+    if (code != 0) return {};
+    std::wstring ver, notes;
+    bool in_notes = false;
+    for (size_t a = 0, b; a < out.size(); a = b + 1) {
+        b = out.find(L'\n', a);
+        if (b == std::wstring::npos) b = out.size();
+        std::wstring l = out.substr(a, b - a);
+        if (!l.empty() && l.back() == L'\r') l.pop_back();
+        if (in_notes) notes += l + L"\n";
+        else if (l.rfind(L"version ", 0) == 0) ver = trim(l.substr(8));
+        else if (l == L"notes") in_notes = true;
+    }
+    return {ver, trim(notes)};
+}
+
+static void start_update_check() {
+    std::wstring check = env_var(L"UPDATE_CHECK");
+    if (check.empty()) check = local_cfg()[L"UPDATE_CHECK"];
+    if (g_release.empty() || check == L"0") return;
+    std::thread([] {
+        auto [ver, notes] = check_update();
+        if (ver.empty()) return;   // asked again next time
+        {
+            std::lock_guard lk(g_mx);
+            g_found_ver = ver;
+            g_found_notes = notes;
+        }
+#ifdef _WIN32
+        PostMessageW(g_hwnd, WM_APP_UPDATE, 0, 0);
+#else
+        post_event(g_ev_update);
+#endif
+    }).detach();
+}
+
+static void start_update() {
+    if (g_running || g_update_ver.empty()) return;
+    Cmd c{PYTHON3 L" tools" DS L"update.py install " + g_update_ver, g_root.wstring(), L"Downloading"};
+    c.stage_i = c.stage_n = 1;
+    g_unpack_log = true;   // the Game step shows the output too
+    start_job(L"Updating to " + g_update_ver, {c});
+    g_updating = g_running;
+}
+
+static void offer_update() {
+    if (g_running || g_update_ver.empty()) return;
+    std::wstring t = L"Version " + g_update_ver + L" is out (you have " + g_release + L").";
+    if (!g_update_notes.empty()) t += L"\n\n" + g_update_notes;
+    t += L"\n\nUpdate now? Your build, saves and settings stay as they are.";
+    if (msg_box(t, L"Update", M_ASK)) start_update();
+    else save_setting(L"UPDATE_SKIP", g_update_ver);   // not asked by itself again for this one
+    redraw();
+}
+
+static void update_found() {
+    {
+        std::lock_guard lk(g_mx);
+        g_update_ver = g_found_ver;
+        g_update_notes = g_found_notes;
+    }
+    g_update_ask = local_cfg()[L"UPDATE_SKIP"] != g_update_ver;
+    redraw();
+    maybe_offer_update();
+}
+
+// Asked once nothing else is going on: no job, no question open, no script
+static void maybe_offer_update() {
+    if (!g_update_ask || g_running || g_asking || g_scripting) return;
+    g_update_ask = false;
+    offer_update();
+}
+
+// This launcher again (the updated one), on its own: not a child that dies with this one
+static bool restart() {
+    for (const auto& [k, v] : g_env0) SetEnvironmentVariableW(k.c_str(), v.empty() ? nullptr : v.c_str());   // as it started
+    const fs::path exe = g_root / "launcher" / "out" / LAUNCHER_EXE;
+#ifdef _WIN32
+    std::wstring cl = L"\"" + exe.wstring() + L"\"";
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cl.data(), nullptr, nullptr, FALSE, 0, nullptr, g_root.c_str(), &si, &pi)) return false;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+#else
+    const std::string path = exe.string(), dir = g_root.string();
+    int fd[2];
+    if (pipe2(fd, O_CLOEXEC)) return false;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        const int nul = open("/dev/null", O_RDWR);
+        dup2(nul, 0);
+        dup2(nul, 1);
+        dup2(nul, 2);
+        if (chdir(dir.c_str()) == 0) execl(path.c_str(), path.c_str(), (char*)nullptr);
+        const int err = errno;
+        (void)!write(fd[1], &err, sizeof err);   // exec failed: the pipe says so (it closes unread on success)
+        _exit(127);
+    }
+    close(fd[1]);
+    int err = 0;
+    ssize_t n = -1;
+    if (pid > 0)
+        while ((n = read(fd[0], &err, sizeof err)) < 0 && errno == EINTR) {}
+    close(fd[0]);
+    if (pid > 0) waitpid(pid, nullptr, WNOHANG);
+    return pid > 0 && n == 0;
+#endif
+}
+
+static void update_done(bool ok) {
+    if (!ok) return;   // the status and output say why; the button at the top right tries again
+    if (!restart()) {
+        msg_box(L"Updated, but the launcher did not start again: close it and open it again.", L"Update", M_INFO);
+        return;
+    }
+#ifdef _WIN32
+    PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+#else
+    g_quit_asked = true;
+#endif
+}
+
+// The files an update set aside (launcher/out/update-leftovers.txt), deleted in the background: the launcher that
+// updated may take a moment to close and let go of its .exe
+static void clean_leftovers() {
+    const fs::path list = g_root / "launcher" / "out" / "update-leftovers.txt";
+    if (!path_exists(list)) return;
+    std::thread([list] {
+        std::vector<std::string> left = read_lines(list);
+        for (int tries = 0; tries < 20 && !left.empty(); tries++) {
+            if (tries) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::vector<std::string> still;
+            for (const auto& l : left) {
+                if (l.empty() || l.find("..") != std::string::npos) continue;
+                std::error_code ec;
+                const fs::path p = g_root / fs::path(widen(l));
+                fs::remove(p, ec);
+                if (ec && fs::exists(p)) still.push_back(l);
+            }
+            left = std::move(still);
+        }
+        std::error_code ec;
+        if (left.empty()) fs::remove(list, ec);
+        else if (std::ofstream o(list, std::ios::binary | std::ios::trunc); o)
+            for (const auto& l : left) o << l << "\n";
+    }).detach();
+}
+
 static void click(int id);
 static void run_script() {
     while (!g_running) {
@@ -2651,6 +2874,17 @@ static void run_script() {
         log_line(L"script: " + what + (arg.empty() ? L"" : L" " + arg));
         if (what == L"bring-over") {
             if (!bring_over_from(arg, false)) g_exit_code = 1;
+        } else if (what == L"update") {
+            // The newest release, without asking: the launcher starts again once it is in place
+            auto [ver, notes] = g_release.empty() ? std::pair<std::wstring, std::wstring>{} : check_update();
+            if (ver.empty()) {
+                log_line(g_release.empty() ? L"script: no update: this folder is not a release (no launcher" DS L"out" DS L"release.txt)"
+                                           : L"script: no newer release (or no answer from GitHub)");
+            } else {
+                g_update_ver = ver, g_update_notes = notes;
+                start_update();
+                if (!g_running) g_exit_code = 1;
+            }
         } else if (what == L"setup") {
             refresh();
             if (g_done[1]) {
@@ -2695,6 +2929,8 @@ static void click(int id) {
         open_nup();
     } else if (id == B_IMPORT) {
         bring_over();
+    } else if (id == B_UPDATE) {
+        offer_update();
     } else if (id == B_CONTINUE) {
         g_step = std::min(3, g_step + 1);
         g_status.clear();
@@ -2760,6 +2996,7 @@ static void click(int id) {
         stop_job();
     }
     redraw();
+    maybe_offer_update();   // found while a question of this click was open
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2877,6 +3114,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_DONE:
         job_done((DWORD)wp, lp != 0);
         return 0;
+    case WM_APP_UPDATE:
+        update_found();
+        return 0;
     case WM_CLOSE:
         if (g_running && MessageBoxW(hwnd, (g_job_name + L" is still running. Stop it and quit?").c_str(), L"Launcher",
                                      MB_YESNO | MB_ICONQUESTION) != IDYES)
@@ -2937,6 +3177,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
 
+    for (const wchar_t* k : {L"PATH", L"KART_VER", L"BUILD_MP", L"DOTNET_ROOT", L"DOTNET_MULTILEVEL_LOOKUP"}) g_env0.push_back({k, env_var(k)});
+
     // A scripted run (g_script)
     {
         int argc = 0;
@@ -2945,6 +3187,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             const std::wstring a = argv[i];
             if (a == L"--bring-over" && i + 1 < argc) g_script.push_back({L"bring-over", argv[++i]});
             else if (a == L"--setup") g_script.push_back({L"setup", L""});
+            else if (a == L"--update") g_script.push_back({L"update", L""});
             else if (a == L"--build") g_script.push_back({L"build", L""});
             else if (a == L"--quit") g_script_quit = true;
             else if (a == L"--log" && i + 1 < argc) g_log_file = _wfopen(argv[++i], L"wb");
@@ -2973,6 +3216,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         apply_version();
     }
 
+    read_release();
+    clean_leftovers();
     check_tools();
     refresh();
     g_step = 3;
@@ -3004,6 +3249,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                              work.top + (work.bottom - work.top - h) / 2, w, h, nullptr, nullptr, inst, nullptr);
     ShowWindow(g_hwnd, show);
     if (g_scripting) run_script();
+    else start_update_check();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -3023,7 +3269,6 @@ struct Modal {
 };
 static Modal* g_modal;                 // the question being asked
 static bool g_waiting_dialog = false;  // a file dialog is open: the window only draws itself
-static bool g_quit_asked = false;      // the window's close button (or --quit), handled by the main loop
 static float g_wheel = 0;              // wheel steps not yet scrolled (touchpads send fractions)
 static SDL_Cursor *g_cur_arrow, *g_cur_hand;
 enum { B_YES = 40, B_NO = 41 };
@@ -3081,6 +3326,10 @@ static void handle_event(const SDL_Event& e) {
     }
     if (e.type == g_ev_done) {
         job_done((DWORD)e.user.code, e.user.data1 != nullptr);
+        return;
+    }
+    if (e.type == g_ev_update) {
+        update_found();
         return;
     }
     switch (e.type) {
@@ -3193,6 +3442,7 @@ static void SDLCALL picked(void* ud, const char* const* list, int) {
 }
 
 static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start) {
+    Asking asking;
     static const SDL_DialogFileFilter nup[] = {{"NUP game container (*.nup)", "nup"}, {"All files", "*"}};
     const SDL_PropertiesID props = SDL_CreateProperties();
     const std::string t = narrow(title), loc = narrow(start) + "/";
@@ -3237,11 +3487,14 @@ int main(int argc, char** argv) {
     }
     signal(SIGPIPE, SIG_IGN);
 
+    for (const wchar_t* k : {L"PATH", L"KART_VER", L"BUILD_MP", L"DOTNET_ROOT", L"DOTNET_MULTILEVEL_LOOKUP"}) g_env0.push_back({k, env_var(k)});
+
     // A scripted run (g_script)
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--bring-over" && i + 1 < argc) g_script.push_back({L"bring-over", widen(argv[++i])});
         else if (a == "--setup") g_script.push_back({L"setup", L""});
+        else if (a == "--update") g_script.push_back({L"update", L""});
         else if (a == "--build") g_script.push_back({L"build", L""});
         else if (a == "--quit") g_script_quit = true;
         else if (a == "--log" && i + 1 < argc) g_log_file = fopen(argv[++i], "wb");
@@ -3268,6 +3521,8 @@ int main(int argc, char** argv) {
         apply_version();
     }
 
+    read_release();
+    clean_leftovers();
     check_tools();
     refresh();
     g_step = 3;
@@ -3285,8 +3540,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "launcher: no window (%s)\n", SDL_GetError());
         return 1;
     }
-    g_ev_log = SDL_RegisterEvents(2);
+    g_ev_log = SDL_RegisterEvents(3);
     g_ev_done = g_ev_log + 1;
+    g_ev_update = g_ev_log + 2;
     g_window = SDL_CreateWindow("kart-recomp", 900, 780, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
     if (!g_window || !(g_ren = SDL_CreateRenderer(g_window, nullptr))) {
         fprintf(stderr, "launcher: no window (%s)\n", SDL_GetError());
@@ -3312,6 +3568,7 @@ int main(int argc, char** argv) {
     g_cur_hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
     SDL_ShowWindow(g_window);
     if (g_scripting) run_script();
+    else start_update_check();
 
     // Events; a frame once they are handled when something changed, every 15 ms while something moves, and every
     // half second while a job runs (its clock)
