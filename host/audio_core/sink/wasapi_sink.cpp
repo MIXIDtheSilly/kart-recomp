@@ -3,6 +3,7 @@
 // the default output device in shared mode (48 kHz, 16-bit, stereo; Windows converts to the mix
 // format), waits on the buffer event and fills what the device consumed from the sink stream's
 // queue. When the device goes away (headphones unplugged) it opens the new default device.
+#ifdef _WIN32   // (Linux: sdl_sink.cpp)
 #include <windows.h>
 #include <audioclient.h>
 #include <avrt.h>
@@ -240,3 +241,4 @@ std::unique_ptr<Sink> CreateWasapiSink() {
 }
 
 }  // namespace AudioCore::Sink
+#endif  // _WIN32

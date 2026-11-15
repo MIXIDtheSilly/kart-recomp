@@ -5,7 +5,9 @@
 // video decoder). Ported from Eglantine's nx2_gsv.h; command layouts are documented there. With the native renderer
 // (nvn/) the game uses it for its syncpoints, native memory and images, and the video decoder.
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -17,6 +19,7 @@
 #include <thread>
 
 #include "../ipc.h"
+#include "../os.h"
 #include "../memory.h"
 #include "../syncpoints.h"
 #include "vdec_mf.h"
@@ -394,7 +397,7 @@ struct VideoSession : Service {
         if (!ready_event) {
             ready_event = std::make_shared<kern::ServiceEvent>();
             ticker = std::thread([this] {
-                SetThreadDescription(GetCurrentThread(), L"vdec ready");
+                os::set_thread_name("vdec ready");
                 std::unique_lock lk{m};
                 while (!cv.wait_for(lk, std::chrono::milliseconds{4}, [this] { return quit; })) {
                     if (room.load(std::memory_order_relaxed)) ready_event->signal();
@@ -498,7 +501,7 @@ struct VideoSession : Service {
     }
 
     void decode_loop() {
-        SetThreadDescription(GetCurrentThread(), L"vdec");
+        os::set_thread_name("vdec");
         std::unique_ptr<vdec::Decoder> decoder;
         std::vector<vdec::Picture> pictures;
         std::vector<u8> bytes;

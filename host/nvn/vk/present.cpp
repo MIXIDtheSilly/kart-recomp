@@ -3,7 +3,9 @@
 #include "hitch.h"
 #include "dump.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -86,6 +88,15 @@ bool create_swapchain() {
     Device& c = ctx();
     VkSurfaceCapabilitiesKHR caps;
     check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c.phys, g.surface, &caps), "surface capabilities");
+#ifndef _WIN32
+    // Wayland leaves the size to the swapchain (0xFFFFFFFF): the window's, within what the surface takes
+    if (caps.currentExtent.width == 0xFFFFFFFFu) {
+        u32 w = 0, h = 0;
+        video::window_pixel_size(&w, &h);
+        caps.currentExtent.width = w ? std::clamp(w, caps.minImageExtent.width, caps.maxImageExtent.width) : 0;
+        caps.currentExtent.height = h ? std::clamp(h, caps.minImageExtent.height, caps.maxImageExtent.height) : 0;
+    }
+#endif
     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return false;
     u32 n = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(c.phys, g.surface, &n, nullptr);
@@ -307,10 +318,16 @@ void present_init() {
     std::scoped_lock lk{g.lock};
     if (g.surface) return;
     Device& c = ctx();
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR wci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     wci.hinstance = GetModuleHandleW(nullptr);
     wci.hwnd = video::main_window();
     check(vkCreateWin32SurfaceKHR(c.instance, &wci, nullptr, &g.surface), "vkCreateWin32SurfaceKHR");
+#else
+    const char* why = "";
+    g.surface = static_cast<VkSurfaceKHR>(video::create_vk_surface(c.instance, &why));
+    if (!g.surface) fatal("nvk: no Vulkan surface on the window: %s", why);
+#endif
     VkBool32 ok = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(c.phys, c.family, g.surface, &ok);
     if (!ok) fatal("nvk: the queue cannot present to the window");
@@ -338,7 +355,15 @@ void present(VkImage image, VkFormat format, u32 w, u32 h, const int* crop, u64 
     g_presents++;
     std::scoped_lock lk{g.lock};
     if (!g.surface) return;
-    if (is_srgb(format) != g.srgb || !g.swapchain) {
+    bool resized = false;
+#ifndef _WIN32
+    {   // (Wayland reports no swapchain out of date when the window changes size: compared here)
+        u32 w = 0, h = 0;
+        video::window_pixel_size(&w, &h);
+        resized = g.swapchain && (w != g.extent.width || h != g.extent.height);
+    }
+#endif
+    if (is_srgb(format) != g.srgb || !g.swapchain || resized) {
         g.srgb = is_srgb(format);
         destroy_swapchain();
         if (!create_swapchain()) return;

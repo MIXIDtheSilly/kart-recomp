@@ -2,16 +2,23 @@
 // to press a button and the keyboard while the game window has the focus; players 2-4 as Pro Controllers, one more
 // gamepad each (gamepads.cpp: XInput, DualShock 4, DualSense, Switch Pro Controller), which also play the game's
 // vibration. The state goes into the shared memory in nn::hid's layout (hid_shared.h).
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
 
 #include "../ipc.h"
+#include "../os.h"
 #include "gamepads.h"
+#ifndef _WIN32
+#include "../video.h"
+#endif
 #include "hid_shared.h"
 
 namespace ipc {
@@ -43,22 +50,31 @@ using PadInput = gamepads::State;
 
 constexpr s32 StickMax = 0x7fff;
 
+#ifdef _WIN32
 bool window_focused() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     return pid == GetCurrentProcessId();
 }
+const auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+#define KEY(windows_vk, sdl_scancode) windows_vk
+#else
+// Linux: the SDL window's keyboard (video_sdl.cpp), by scancode: the keys' positions, as Windows' virtual keys are on a
+// US layout. (Values from SDL_scancode.h.)
+bool window_focused() { return video::focused(); }
+const auto down = [](int scancode) { return video::key_down(scancode); };
+#define KEY(windows_vk, sdl_scancode) sdl_scancode
+#endif
 
 // Eden's default keyboard layout.
 void read_keyboard(PadInput& in) {
-    const auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     const struct { int vk; u64 b; } keys[] = {
-        {'C', A},       {'X', B},      {'V', X},
-        {'Z', Y},       {'Q', L},      {'E', R},
-        {'R', ZL},      {'T', ZR},     {'M', Plus},
-        {'N', Minus},   {'F', StickL}, {'G', StickR},
-        {VK_LEFT, Left}, {VK_UP, Up},  {VK_RIGHT, Right},
-        {VK_DOWN, Down}, {VK_RETURN, Plus},
+        {KEY('C', 6), A},          {KEY('X', 27), B},       {KEY('V', 25), X},
+        {KEY('Z', 29), Y},         {KEY('Q', 20), L},       {KEY('E', 8), R},
+        {KEY('R', 21), ZL},        {KEY('T', 23), ZR},      {KEY('M', 16), Plus},
+        {KEY('N', 17), Minus},     {KEY('F', 9), StickL},   {KEY('G', 10), StickR},
+        {KEY(VK_LEFT, 80), Left},  {KEY(VK_UP, 82), Up},    {KEY(VK_RIGHT, 79), Right},
+        {KEY(VK_DOWN, 81), Down},  {KEY(VK_RETURN, 40), Plus},
     };
     for (const auto& k : keys)
         if (down(k.vk)) in.buttons |= k.b;
@@ -67,8 +83,8 @@ void read_keyboard(PadInput& in) {
         const s32 y = (down(up) ? StickMax : 0) - (down(dn) ? StickMax : 0);
         if (x || y) s = {x, y};
     };
-    stick('A', 'W', 'D', 'S', in.l);
-    stick('J', 'I', 'L', 'K', in.r);
+    stick(KEY('A', 4), KEY('W', 26), KEY('D', 7), KEY('S', 22), in.l);
+    stick(KEY('J', 13), KEY('I', 12), KEY('L', 15), KEY('K', 14), in.r);
 }
 
 // HOST_INPUT_SCRIPT="<seconds>:<buttons>:<duration>;..." presses buttons at given times since
@@ -227,7 +243,7 @@ void push_state(NpadInternalState& np, const PadInput& in, bool handheld) {
 // are connected while a pad (or the keyboard, with HOST_KEYBOARD_JOINS=1) holds them (gamepads.h: a pad joins on its
 // first button press), as Pro Controllers.
 void input_thread() {
-    SetThreadDescription(GetCurrentThread(), L"hid");
+    os::set_thread_name("hid");
     auto script = load_script();
     LiveScript live;
     const u64 start = host_ns();
@@ -284,7 +300,11 @@ void input_thread() {
             }
         }
         if (changed) style_event().signal();
+#ifdef _WIN32
         Sleep(4);
+#else
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+#endif
     }
 }
 

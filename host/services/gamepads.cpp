@@ -4,6 +4,7 @@
 // Switch Pro Controller: subcommands switch it to its full report and read its stick calibration (see below).
 // Buttons by position as on the Switch: the bottom face button (Cross, Xbox A) is B, the right one A.
 // Vibration: one thread sends each player's latest motors to its pad.
+#ifdef _WIN32   // (Linux: gamepads_sdl.cpp)
 #include <windows.h>
 
 #include <Xinput.h>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "../common.h"
+#include "../os.h"
 #include "gamepads.h"
 
 #ifdef _MSC_VER   // (mingw: tools/build_host.py links xinput1_4; its libxinput.a is XINPUT1_3.dll, not in Windows)
@@ -203,7 +205,7 @@ std::mutex g_pads_lock;
 std::vector<std::shared_ptr<PsPad>> g_pads;
 
 void read_reports(std::shared_ptr<PsPad> pad) {
-    SetThreadDescription(GetCurrentThread(), L"gamepad");
+    os::set_thread_name("gamepad");
     std::vector<u8> buf(std::max<u32>(pad->report_size, 64));
     bool logged = false;
     for (;;) {
@@ -379,7 +381,7 @@ State switch_state(const u8* p, const PsPad& pad) {
 }
 
 void read_switch(std::shared_ptr<PsPad> pad) {
-    SetThreadDescription(GetCurrentThread(), L"gamepad");
+    os::set_thread_name("gamepad");
     PsPad& p = *pad;
     if (p.usb) {
         const bool ok = send_usb(p, 0x02, true) && send_usb(p, 0x03, true) && send_usb(p, 0x02, true) && send_usb(p, 0x04, false);
@@ -552,7 +554,7 @@ void start() {
     scan_hid();
     std::thread(send_vibration).detach();
     std::thread([] {
-        SetThreadDescription(GetCurrentThread(), L"gamepad scan");
+        os::set_thread_name("gamepad scan");
         for (;;) {
             Sleep(2000);
             scan_xinput();
@@ -709,7 +711,7 @@ void send_xinput(int slot, const Motors& m) {
 // Sends what changed, at most every 15 ms. A Pro Controller's vibration is sent again every 50 ms while it lasts, as
 // SDL does.
 void send_vibration() {
-    SetThreadDescription(GetCurrentThread(), L"vibration");
+    os::set_thread_name("vibration");
     std::array<Motors, XUSER_MAX_COUNT> xinput_sent{};
     for (;;) {
         std::vector<std::pair<Slot, Motors>> targets;
@@ -890,3 +892,4 @@ void stop_vibration() {
 }
 
 }  // namespace gamepads
+#endif  // _WIN32

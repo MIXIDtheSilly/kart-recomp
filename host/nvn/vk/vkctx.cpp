@@ -5,8 +5,11 @@
 #include "vkq.h"
 
 #include "../../memory.h"
+#include "../../video.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -16,15 +19,22 @@
 
 namespace vkfn {
 
+#ifdef _WIN32
 namespace {
 HMODULE g_lib = nullptr;
 }
+#endif
 
 bool load_global() {
     if (vkGetInstanceProcAddr) return true;
+#ifdef _WIN32
     g_lib = LoadLibraryW(L"vulkan-1.dll");
     if (!g_lib) return false;
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(g_lib, "vkGetInstanceProcAddr"));
+#else
+    // The loader SDL opened for the window (video_sdl.cpp): the surface it makes belongs to the same one
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(video::vk_get_instance_proc_addr());
+#endif
     if (!vkGetInstanceProcAddr) return false;
 #define X(name) name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(nullptr, #name));
     VKFN_GLOBAL(X)
@@ -121,12 +131,21 @@ bool has_ext(const std::vector<VkExtensionProperties>& exts, const char* name) {
 }
 
 void create_instance(Device& c) {
+#ifdef _WIN32
     if (!load_global()) fatal("vulkan: vulkan-1.dll not found");
+#else
+    if (!load_global()) fatal("vulkan: no Vulkan loader (libvulkan.so.1): install your distribution's vulkan-loader package");
+#endif
     u32 n = 0;
     vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> exts(n);
     vkEnumerateInstanceExtensionProperties(nullptr, &n, exts.data());
+#ifdef _WIN32
     std::vector<const char*> want{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::vector<const char*> want = video::vk_instance_extensions();   // VK_KHR_surface and Wayland's or X11's
+    if (want.empty()) fatal("vulkan: SDL names no instance extensions for a surface on the window");
+#endif
     const bool debug_utils = has_ext(exts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (debug_utils) want.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     // HOST_VK_VALIDATION=1: the Khronos validation layer, its messages in the log.
@@ -367,6 +386,12 @@ void create_device(Device& c) {
         if (!(c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) host_heap = std::max(host_heap, c.mem_props.memoryHeaps[h].size);
     if (const u64 cap = test_heap_bytes(false); cap && host_heap) host_heap = std::min(host_heap, cap);
     c.feat.lean_imports = c.feat.uma || (host_heap && host_heap < (12ull << 30));
+#ifndef _WIN32
+    // Linux: an import makes every page it covers resident and pins it (mem::pin), also pages the game never touches,
+    // and the whole-pool windows held ~2 GB more in a race (8.5 GB of guest memory, 6.5 with small windows). An import
+    // takes ~4 ms here (75 on Windows), so the small windows cost little.
+    c.feat.lean_imports = true;
+#endif
     if (const char* e = std::getenv("HOST_NVN_LEAN_IMPORTS"); e && *e) c.feat.lean_imports = std::strcmp(e, "0") != 0;
     if (c.feat.lean_imports && !c.feat.uma)
         LOG("nvk: host heap %llu MB: memory pools imported at first use, in small windows (HOST_NVN_LEAN_IMPORTS=0: off)",
@@ -491,7 +516,9 @@ bool import_host(void* host, u64 size, Imported& out, const char** why) {
             return false;
         }
     }
+    im.pins = mem::pin(host, im.size);   // (before the driver pins the pages: a free meanwhile keeps them)
     if (const VkResult r = vkAllocateMemory(c.dev, &mai, nullptr, &im.memory); r != VK_SUCCESS) {
+        mem::unpin(im.pins);
         *why = r == VK_ERROR_INVALID_EXTERNAL_HANDLE ? "vkAllocateMemory: invalid external handle (pages not mapped?)"
                : r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? "vkAllocateMemory: out of device memory"
                                                      : "vkAllocateMemory failed";
@@ -510,7 +537,8 @@ bool import_host(void* host, u64 size, Imported& out, const char** why) {
                 VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
     if (vkCreateBuffer(c.dev, &bci, nullptr, &im.buffer) != VK_SUCCESS) {
         *why = "vkCreateBuffer failed";
-        vkFreeMemory(c.dev, im.memory, nullptr);
+        vkFreeMemory(c.dev, im.memory, nullptr), g_import_bytes -= im.size;
+        mem::unpin(im.pins);
         return false;
     }
     if (vkBindBufferMemory(c.dev, im.buffer, im.memory, 0) != VK_SUCCESS) {
@@ -528,6 +556,7 @@ void release_import(Imported& im) {
     Device& c = ctx();
     if (im.buffer) vkDestroyBuffer(c.dev, im.buffer, nullptr);
     if (im.memory) vkFreeMemory(c.dev, im.memory, nullptr), g_import_bytes -= im.size;
+    if (!im.pins.empty()) mem::unpin(im.pins);   // (after vkFreeMemory: the driver has let go of the pages)
     im = {};
 }
 

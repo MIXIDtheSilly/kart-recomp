@@ -1,7 +1,10 @@
 #include "shaders.h"
 #include "hitch.h"
+#include "../../os.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -38,14 +41,12 @@ u64 key_u64(const u8 k[8]) {
 
 std::string shader_dir() {
     if (const char* e = getenv("HOST_NVN_SHADERS")) return e;
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string p(exe, n);
+    std::string p = os::exe_path().string();
     p = p.substr(0, p.find_last_of("\\/"));    // ...\host\out
     p = p.substr(0, p.find_last_of("\\/"));    // ...\host
     p = p.substr(0, p.find_last_of("\\/"));    // ...\recomp
     const std::string variant = host_exe_variant();  // kart-<version>.exe: that version's shader tables
-    return p + "\\work\\nvn_shaders" + (variant.empty() ? "" : "-" + variant);
+    return p + OS_SEP "work" OS_SEP "nvn_shaders" + (variant.empty() ? "" : "-" + variant);
 }
 
 ShStage stage_of(const std::string& s) {
@@ -71,9 +72,9 @@ void load_table() {
     if (done) return;
     done = true;
     g_dir = shader_dir();
-    std::ifstream f(g_dir + "\\refl.tsv");
+    std::ifstream f(g_dir + OS_SEP "refl.tsv");
     if (!f) {
-        LOG("[RED] nvk: no shader reflection table at %s\\refl.tsv (run tools/nvn_shaders.py and tools/nvn_refl.py): nothing is drawn",
+        LOG("[RED] nvk: no shader reflection table at %s" OS_SEP "refl.tsv (run tools/nvn_shaders.py and tools/nvn_refl.py): nothing is drawn",
             g_dir.c_str());
         return;
     }
@@ -613,7 +614,7 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     // Task and mesh shaders: the translator made compute kernels of them; tools/nvn_mesh.py turns those into
     // TaskEXT / MeshEXT modules (<key>.mesh.spv), and per-primitive outputs into flat per-vertex ones where they fit
     // (<key>.meshflat.spv), which the translated fragment shaders read without PerPrimitiveEXT.
-    std::string file = g_dir + "\\" + sh->name + ".spv";
+    std::string file = g_dir + OS_SEP + sh->name + ".spv";
     // On Intel, compute / task / mesh shaders with workgroup barriers load <file>.bar.spv (tools/nvn_barfix.py): threads past the
     // early "return" stay for the barriers with their writes skipped, as Intel needs (NVIDIA lets them leave).
     // HOST_NVN_BARSPV=0: never, 1: on any GPU (to test on the desktop).
@@ -627,12 +628,12 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
         if (want_bar && std::ifstream(b).good()) file = b, bar = true;
     };
     if (row.stage == SH_TS || row.stage == SH_MS) {
-        const std::string flat = g_dir + "\\" + sh->name + ".meshflat.spv", mesh = g_dir + "\\" + sh->name + ".mesh.spv";
+        const std::string flat = g_dir + OS_SEP + sh->name + ".meshflat.spv", mesh = g_dir + OS_SEP + sh->name + ".mesh.spv";
         file = std::ifstream(flat).good() ? flat : mesh;
         bar_of(file);
     } else {
         if (row.stage == SH_CS) bar_of(file);
-        const std::string fix = g_dir + "\\" + sh->name + ".fix.spv";
+        const std::string fix = g_dir + OS_SEP + sh->name + ".fix.spv";
         if (!bar && !getenv("HOST_NVN_NO_SPVFIX") && std::ifstream(fix).good())
             file = fix;   // one the driver miscompiles, restructured by tools/nvn_spvfix.py (HOST_NVN_NO_SPVFIX=1: the translation as it is)
     }
@@ -694,7 +695,7 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     }
     // HOST_NVN_DUMP_PATCHED=<folder>: the modules as given to the driver written there (to check with spirv-val)
     if (const char* d = getenv("HOST_NVN_DUMP_PATCHED"))
-        std::ofstream(std::string(d) + "\\" + sh->name + ".spv", std::ios::binary).write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
+        std::ofstream(std::string(d) + OS_SEP + sh->name + ".spv", std::ios::binary).write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = words.size() * 4;
     mi.pCode = words.data();

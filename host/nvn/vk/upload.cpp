@@ -1,4 +1,5 @@
 #include "upload.h"
+#include "../../os.h"
 
 #include <algorithm>
 #include <map>
@@ -19,8 +20,15 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
+#include "../../os.h"
 #include "../abi.h"
 #include "../nvn_int.h"
 #include "../replay.h"
@@ -483,10 +491,7 @@ const std::string& disk_dir() {
         if (const char* e = getenv("HOST_NVN_TEXCACHE")) {
             if (std::strcmp(e, "0") != 0) d = e;
         } else {
-            char exe[MAX_PATH];
-            const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-            std::filesystem::path p(std::string(exe, n));
-            d = (p.parent_path().parent_path().parent_path() / "work" / "nvn_texcache").string();   // ...\recomp\work
+            d = (os::exe_dir().parent_path().parent_path() / "work" / "nvn_texcache").string();   // ...\recomp\work
         }
         if (d.empty()) return d;
         std::error_code ec;
@@ -511,7 +516,7 @@ u64 disk_max() {
 
 std::string disk_file(u64 key) {
     char b[32];
-    std::snprintf(b, sizeof b, "\\%016llx.bc", static_cast<unsigned long long>(key));
+    std::snprintf(b, sizeof b, OS_SEP "%016llx.bc", static_cast<unsigned long long>(key));
     return disk_dir() + b;
 }
 
@@ -519,12 +524,13 @@ std::string disk_file(u64 key) {
 // pieces unpacked on the shared thread pool (not for prefetches: they would hold up the renderer's own parallel work).
 bool disk_get(u64 key, Prepared& out, bool* old, bool parallel = true) {
     if (disk_dir().empty()) return false;
-    // The whole file in one read, by the Win32 calls (not the C runtime's streams)
+    // The whole file in one read, by the system's calls (not the C runtime's streams)
     const u64 t0 = host_ns();
+    Bytes file;
+#ifdef _WIN32
     const HANDLE fh = CreateFileA(disk_file(key).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (fh == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER fsize{};
-    Bytes file;
     bool ok = GetFileSizeEx(fh, &fsize) && fsize.QuadPart >= static_cast<LONGLONG>(sizeof(DiskHead)) && fsize.QuadPart < (1ll << 31);
     const u64 t1 = host_ns();
     if (ok) {
@@ -533,6 +539,24 @@ bool disk_get(u64 key, Prepared& out, bool* old, bool parallel = true) {
         ok = ReadFile(fh, file.data(), static_cast<DWORD>(file.size()), &got, nullptr) && got == file.size();
     }
     CloseHandle(fh);
+#else
+    const int fd = open(disk_file(key).c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st{};
+    bool ok = fstat(fd, &st) == 0 && st.st_size >= static_cast<off_t>(sizeof(DiskHead)) && st.st_size < (1ll << 31);
+    const u64 t1 = host_ns();
+    if (ok) {
+        file.resize(static_cast<size_t>(st.st_size));
+        size_t got = 0;
+        while (got < file.size()) {
+            const ssize_t r = read(fd, file.data() + got, file.size() - got);
+            if (r <= 0) break;
+            got += static_cast<size_t>(r);
+        }
+        ok = got == file.size();
+    }
+    close(fd);
+#endif
     const u64 t2 = host_ns();
     DiskHead h{};
     if (ok) std::memcpy(&h, file.data(), sizeof h);
@@ -636,7 +660,7 @@ u64 disk_write(u64 key, const Prepared& p) {
 }
 
 void disk_writer() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    os::set_thread_priority(os::Priority::Lowest);
     for (;;) {
         std::pair<u64, std::shared_ptr<const Prepared>> w;
         {
@@ -812,10 +836,14 @@ void start_workers() {
     // while the game's threads ran, and the renderer often waits for the upload a worker has
     // (HOST_NVN_UPLOAD_PRIORITY=<Windows thread priority>, e.g. -1 for below normal).
     const char* pe = getenv("HOST_NVN_UPLOAD_PRIORITY");
-    const int prio = pe ? std::atoi(pe) : THREAD_PRIORITY_NORMAL;
+    const int prio = pe ? std::atoi(pe) : 0;
     for (int i = 0; i < n; i++)
         std::thread([prio] {
+#ifdef _WIN32
             SetThreadPriority(GetCurrentThread(), prio);
+#else
+            if (prio) os::set_thread_priority(prio <= -2 ? os::Priority::Lowest : prio < 0 ? os::Priority::BelowNormal : os::Priority::AboveNormal);
+#endif
             worker();
         }).detach();
 }
@@ -1011,7 +1039,7 @@ std::vector<u8> zstd_decompress(const std::vector<u8>& packed) {
 // The ASTC textures of one .bntx.zs, each as the game would hand it to upload_async_start. write false: only counted.
 void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
     std::vector<u8> packed;
-    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+    if (FILE* f = os::open_file(path, "rb")) {
         std::error_code ec;
         packed.resize(std::filesystem::file_size(path, ec));
         const bool ok = std::fread(packed.data(), 1, packed.size(), f) == packed.size();
@@ -1102,10 +1130,14 @@ void repack_disk(u32 threads) {
 }  // namespace
 
 int bake_textures(const std::filesystem::path& game, size_t check) {
+#ifdef _WIN32
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+#else
+    os::set_thread_priority(os::Priority::BelowNormal);   // (the threads started from here on inherit it)
+#endif
     nvn_gob_switch2 = 1;
     const u32 half = std::max(std::thread::hardware_concurrency() / 2, 2u);
-    if (!getenv("HOST_TRANSCODE_THREADS")) _putenv_s("HOST_TRANSCODE_THREADS", std::to_string(half).c_str());
+    if (!getenv("HOST_TRANSCODE_THREADS")) os::set_env("HOST_TRANSCODE_THREADS", std::to_string(half).c_str());
     if (disk_dir().empty()) {
         LOG("[RED] bake: the decoded texture cache is turned off (HOST_NVN_TEXCACHE=0)");
         return 1;
@@ -1114,7 +1146,7 @@ int bake_textures(const std::filesystem::path& game, size_t check) {
     std::vector<std::filesystem::path> files;
     std::error_code ec;
     for (const auto& f : std::filesystem::recursive_directory_iterator(game / "romfs", ec))
-        if (f.path().native().ends_with(L".bntx.zs")) files.push_back(f.path());
+        if (f.path().filename().string().ends_with(".bntx.zs")) files.push_back(f.path());
     std::shuffle(files.begin(), files.end(), std::mt19937{1});   // even progress: the big textures are not all at the end
     if (check) files.resize(std::min(check, files.size()));
     LOG("bake: %zu texture files, %s", files.size(), check ? "counting only" : "decoding what the cache does not have");
@@ -1136,7 +1168,7 @@ int bake_textures(const std::filesystem::path& game, size_t check) {
             static_cast<unsigned long long>(st.failed.load()));
     };
     while (st.files.load() < files.size()) {
-        Sleep(200);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const u64 secs = (host_ns() - t0) / 1'000'000'000;
         if (secs >= said + 10) said = secs, report("at", secs);
     }

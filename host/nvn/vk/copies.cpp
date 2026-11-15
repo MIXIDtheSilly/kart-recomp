@@ -2,6 +2,7 @@
 // texture -> texture (OP_COPY_T2T, also multisample resolves), with the copy strides (OP_COPY_STRIDE).
 #include "copies.h"
 
+#include <algorithm>
 #include <span>
 #include <vector>
 

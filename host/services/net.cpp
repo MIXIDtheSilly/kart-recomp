@@ -4,15 +4,18 @@
 //   nifm   - accepts LAN Play's requests (connection confirmation "prohibited": no internet check) when the PC has a
 //            LAN adapter, and reports its address; requests that need the internet stay rejected (Online Play asks
 //            with the same request and preset, confirmation "required"), so online play stays off.
-//   bsd:u  - nn::socket on Winsock. Guest layouts are FreeBSD's (sockaddr with sin_len, socket option and message
+//   bsd:u  - nn::socket on Winsock (Linux: its own sockets). Guest layouts are FreeBSD's (sockaddr with sin_len, socket option and message
 //            flag values) but errno values are Linux's (EAGAIN is 11: Pia's recvfrom took BSD's 35 as a fatal error,
 //            0xe487, shown as 2318-6635), and O_NONBLOCK is 0x800. Host sockets stay non-blocking; a blocking guest call
 //            waits in slices with its core given to other guest threads. Raw ICMP sockets (Pia opens one to ping the
 //            gateway; Windows gives raw sockets to admins only) are loopback UDP sockets: echo requests sent on them
 //            become IcmpSendEcho pings whose replies come back as IP + ICMP packets, as a BSD raw socket receives them.
+//            (Linux: the pings go out on an unprivileged ICMP socket instead, which needs net.ipv4.ping_group_range to
+//            take the user's group, as most distributions set it; socket options are translated from BSD's numbers.)
 // HOST_LAN=0 hides the network. HOST_LAN_IP=<address> picks the adapter (default: the one the default route uses).
 // HOST_NET_TRACE=1 logs nifm requests and socket calls; 2 also every bsd command, every IPC request from LAN Play's
 // start and the results behind error messages (overrides.cpp); 3 also every packet sent.
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
@@ -22,6 +25,44 @@
 
 #include <iphlpapi.h>
 #include <icmpapi.h>
+#else
+#include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <fstream>
+#include <sstream>
+
+// The Winsock names the code below uses, on POSIX sockets.
+using SOCKET = int;
+using SHORT = short;
+using DWORD = uint32_t;
+using BOOL = int;
+using u_short = unsigned short;
+using u_long = unsigned long;
+using ULONG = unsigned long;
+using WSAPOLLFD = pollfd;
+constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+constexpr int WSAEWOULDBLOCK = EWOULDBLOCK;
+constexpr int WSAEMSGSIZE = EMSGSIZE;
+static int closesocket(SOCKET s) { return close(s); }
+static int WSAGetLastError() { return errno; }
+static int WSAPoll(pollfd* p, unsigned long n, int ms) { return ::poll(p, static_cast<nfds_t>(n), ms); }
+static int ioctlsocket(SOCKET s, unsigned long cmd, u_long* v) {
+    int i = static_cast<int>(*v);
+    const int r = ::ioctl(s, cmd, &i);
+    *v = static_cast<u_long>(i);
+    return r;
+}
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -53,8 +94,10 @@ struct Lan {
     u32 ip = 0, mask = 0, gateway = 0;  // network byte order, as nn::socket::InAddr
 
     Lan() {
+#ifdef _WIN32
         WSADATA wd;
         WSAStartup(MAKEWORD(2, 2), &wd);
+#endif
         if (const char* v = std::getenv("HOST_LAN"); v && std::strcmp(v, "0") == 0) {
             LOG("net: HOST_LAN=0, no network");
             return;
@@ -70,13 +113,14 @@ struct Lan {
             to.sin_port = htons(9);
             inet_pton(AF_INET, "198.51.100.1", &to.sin_addr);
             sockaddr_in me{};
-            int len = sizeof me;
+            socklen_t len = sizeof me;
             if (s != INVALID_SOCKET && connect(s, reinterpret_cast<sockaddr*>(&to), sizeof to) == 0 &&
                 getsockname(s, reinterpret_cast<sockaddr*>(&me), &len) == 0) {
                 want = me.sin_addr.s_addr;
             }
             if (s != INVALID_SOCKET) closesocket(s);
         }
+#ifdef _WIN32
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         INTERFACE_INFO ifs[64];
         DWORD got = 0;
@@ -95,11 +139,30 @@ struct Lan {
             }
         }
         if (s != INVALID_SOCKET) closesocket(s);
+#else
+        std::string ifname;
+        if (ifaddrs* list = nullptr; getifaddrs(&list) == 0) {
+            for (int pass = 0; pass < 2 && !up; pass++) {
+                for (ifaddrs* f = list; f && !up; f = f->ifa_next) {
+                    if (!f->ifa_addr || f->ifa_addr->sa_family != AF_INET || !f->ifa_netmask) continue;
+                    if (!(f->ifa_flags & IFF_UP) || (f->ifa_flags & IFF_LOOPBACK)) continue;
+                    const u32 a = reinterpret_cast<const sockaddr_in*>(f->ifa_addr)->sin_addr.s_addr;
+                    if (pass == 0 && a != want) continue;  // pass 1: the first adapter that is up
+                    ip = a;
+                    mask = reinterpret_cast<const sockaddr_in*>(f->ifa_netmask)->sin_addr.s_addr;
+                    ifname = f->ifa_name;
+                    up = true;
+                }
+            }
+            freeifaddrs(list);
+        }
+#endif
         if (!up) {
             LOG("net: no LAN adapter, no network");
             return;
         }
         // The default gateway (Pia pings it): the next hop of the route to a public address from this adapter.
+#ifdef _WIN32
         MIB_IPFORWARDROW route{};
         in_addr pub{};
         inet_pton(AF_INET, "198.51.100.1", &pub);
@@ -108,6 +171,21 @@ struct Lan {
         } else {
             gateway = (ip & mask) | htonl(1);
         }
+#else
+        // /proc/net/route: the adapter's default route (destination 0); addresses as the bytes in memory, in hex.
+        std::ifstream routes("/proc/net/route");
+        std::string line;
+        std::getline(routes, line);   // (the header)
+        while (std::getline(routes, line)) {
+            std::istringstream fields(line);
+            std::string name, dst, via;
+            if (fields >> name >> dst >> via && name == ifname && std::stoul(dst, nullptr, 16) == 0 && std::stoul(via, nullptr, 16) != 0) {
+                gateway = static_cast<u32>(std::stoul(via, nullptr, 16));
+                break;
+            }
+        }
+        if (!gateway) gateway = (ip & mask) | htonl(1);
+#endif
         char a[16], m[16], g[16];
         inet_ntop(AF_INET, &ip, a, sizeof a);
         inet_ntop(AF_INET, &mask, m, sizeof m);
@@ -222,6 +300,9 @@ constexpr s32 BADF = 9, INVAL = 22, MFILE = 24, AGAIN = 11, INPROGRESS = 115, NO
               NOPROTOOPT = 92, AFNOSUPPORT = 97, TIMEDOUT = 110;
 }
 
+#ifndef _WIN32
+s32 bsd_errno(int e) { return e; }   // (Linux's own values)
+#else
 s32 bsd_errno(int wsa) {
     switch (wsa) {
     case 0: return 0;
@@ -263,6 +344,46 @@ s32 bsd_errno(int wsa) {
     default: return E::INVAL;
     }
 }
+#endif
+
+#ifndef _WIN32
+// A FreeBSD socket option (level 0xFFFF: SOL_SOCKET; 0: IPPROTO_IP) as Linux numbers it; false when Linux has none.
+// Winsock numbers them as BSD does, so on Windows they pass unchanged.
+bool host_sockopt(s32 level, s32 opt, int& hl, int& ho) {
+    hl = level;
+    ho = opt;
+    if (level == 0xFFFF) {
+        hl = SOL_SOCKET;
+        switch (opt) {
+        case 0x4: case 0x200: ho = SO_REUSEADDR; return true;   // SO_REUSEADDR; SO_REUSEPORT as on Windows
+        case 0x8: ho = SO_KEEPALIVE; return true;
+        case 0x10: ho = SO_DONTROUTE; return true;
+        case 0x20: ho = SO_BROADCAST; return true;
+        case 0x80: ho = SO_LINGER; return true;
+        case 0x100: ho = SO_OOBINLINE; return true;
+        case 0x1001: ho = SO_SNDBUF; return true;
+        case 0x1002: ho = SO_RCVBUF; return true;
+        case 0x1007: ho = SO_ERROR; return true;
+        case 0x1008: ho = SO_TYPE; return true;
+        default: return false;
+        }
+    }
+    if (level == IPPROTO_IP) {
+        switch (opt) {
+        case 2: ho = IP_HDRINCL; return true;
+        case 3: ho = IP_TOS; return true;
+        case 4: ho = IP_TTL; return true;
+        case 9: ho = IP_MULTICAST_IF; return true;
+        case 10: ho = IP_MULTICAST_TTL; return true;
+        case 11: ho = IP_MULTICAST_LOOP; return true;
+        case 12: ho = IP_ADD_MEMBERSHIP; return true;
+        case 13: ho = IP_DROP_MEMBERSHIP; return true;
+        default: return false;
+        }
+    }
+    return true;   // IPPROTO_TCP (TCP_NODELAY 1 and TCP_MAXSEG 2 alike) and the rest
+}
+#endif
 
 struct Sock {
     SOCKET s = INVALID_SOCKET;
@@ -353,6 +474,73 @@ u16 inet_checksum(const u8* p, size_t n) {
 
 // Pings `dst` for an ICMP echo request sent on an emulated raw socket and delivers the reply to it (127.0.0.1:port) as
 // [u32 source address][IP header][ICMP echo reply]. Runs on a thread of its own: IcmpSendEcho blocks.
+#ifndef _WIN32
+// Linux: an unprivileged ICMP socket (SOCK_DGRAM, IPPROTO_ICMP) sends the echo request; the kernel sets its identifier
+// and checksum and hands back the reply's ICMP part, from which the packet a BSD raw socket gets is put together.
+void icmp_echo(u32 dst, u16 port, std::vector<u8> request) {
+    std::thread([=] {
+        const int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (s < 0) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                LOG("net: no ICMP socket (%s): the gateway pings go unanswered (sysctl net.ipv4.ping_group_range)", std::strerror(errno));
+            return;
+        }
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_addr.s_addr = dst;
+        std::vector<u8> reply(request.size() + 64);
+        ssize_t got = -1;
+        const auto t0 = Clock::now();
+        if (sendto(s, request.data(), request.size(), 0, reinterpret_cast<sockaddr*>(&to), sizeof to) >= 0) {
+            for (;;) {
+                const auto left = 1000 - std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+                pollfd p{s, POLLIN, 0};
+                if (left <= 0 || ::poll(&p, 1, static_cast<int>(left)) <= 0) break;
+                got = ::recv(s, reply.data(), reply.size(), 0);
+                if (got >= 8 && reply[0] == 0) break;   // an echo reply (the socket only gets replies to its own requests)
+                got = -1;
+            }
+        }
+        close(s);
+        if (net_trace()) {
+            char t[16];
+            inet_ntop(AF_INET, &dst, t, sizeof t);
+            LOG("net: icmp echo to %s: %s, %lld ms", t, got >= 8 ? "reply" : "no reply",
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()));
+        }
+        if (got < 8) return;
+        const size_t data = static_cast<size_t>(got) - 8;
+        std::vector<u8> pkt(4 + 20 + 8 + data);
+        std::memcpy(pkt.data(), &dst, 4);
+        u8* ip = pkt.data() + 4;
+        const u16 total = static_cast<u16>(20 + 8 + data);
+        ip[0] = 0x45;
+        ip[2] = static_cast<u8>(total >> 8);
+        ip[3] = static_cast<u8>(total);
+        ip[8] = 64;
+        ip[9] = 1;  // ICMP
+        std::memcpy(ip + 12, &dst, 4);
+        std::memcpy(ip + 16, &lan().ip, 4);
+        const u16 ipsum = inet_checksum(ip, 20);
+        ip[10] = static_cast<u8>(ipsum >> 8);
+        ip[11] = static_cast<u8>(ipsum);
+        u8* icmp = ip + 20;
+        std::memcpy(icmp + 4, request.data() + 4, 4);  // the guest's identifier and sequence (the kernel used its own)
+        if (data) std::memcpy(icmp + 8, reply.data() + 8, data);
+        const u16 sum = inet_checksum(icmp, 8 + data);
+        icmp[2] = static_cast<u8>(sum >> 8);
+        icmp[3] = static_cast<u8>(sum);
+        const int u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in back{};
+        back.sin_family = AF_INET;
+        back.sin_port = port;
+        back.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sendto(u, pkt.data(), pkt.size(), 0, reinterpret_cast<sockaddr*>(&back), sizeof back);
+        close(u);
+    }).detach();
+}
+#else
 void icmp_echo(u32 dst, u16 port, std::vector<u8> request) {
     std::thread([=] {
         const u8* payload = request.data() + 8;
@@ -403,6 +591,7 @@ void icmp_echo(u32 dst, u16 port, std::vector<u8> request) {
         closesocket(s);
     }).detach();
 }
+#endif
 
 // Waits until the socket is readable or writable or the deadline passes (or forever). The caller holds a HostWait.
 // Returns false on timeout or when the socket was closed meanwhile.
@@ -475,7 +664,7 @@ struct Bsd : Service {
                 sockaddr_in a{};
                 a.sin_family = AF_INET;
                 a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                int len = sizeof a;
+                socklen_t len = sizeof a;
                 if (::bind(k->s, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 ||
                     getsockname(k->s, reinterpret_cast<sockaddr*>(&a), &len) != 0) {
                     return reply(r, -1, bsd_errno(WSAGetLastError()));
@@ -484,11 +673,13 @@ struct Bsd : Service {
             }
             u_long nb = 1;
             ioctlsocket(k->s, FIONBIO, &nb);
+#ifdef _WIN32
             if (type == SOCK_DGRAM || icmp) {  // no WSAECONNRESET from recvfrom after an ICMP port unreachable
                 BOOL off = FALSE;
                 DWORD got = 0;
                 WSAIoctl(k->s, SIO_UDP_CONNRESET, &off, sizeof off, nullptr, 0, &got, nullptr, nullptr);
             }
+#endif
             k->nonblock = (type_raw & 0x20000000) != 0;  // SOCK_NONBLOCK
             const s32 fd = add_fd(k);
             if (net_trace()) LOG("net: socket(%d, %#x, %d) = %d", domain, type_raw, proto, fd);
@@ -521,7 +712,7 @@ struct Bsd : Service {
             auto k = get_fd(r.arg<s32>(0));
             if (!k) return bad_fd(r), r.push<u32>(0);
             sockaddr_in a{};
-            int len = sizeof a;
+            socklen_t len = sizeof a;
             const int ok = peer ? getpeername(k->s, reinterpret_cast<sockaddr*>(&a), &len)
                                 : getsockname(k->s, reinterpret_cast<sockaddr*>(&a), &len);
             if (ok != 0) return reply(r, -1, bsd_errno(WSAGetLastError())), r.push<u32>(0);
@@ -585,7 +776,7 @@ struct Bsd : Service {
         std::vector<char> buf(out.size);
         const int wflags = (flags & 1 ? MSG_OOB : 0) | (flags & 2 ? MSG_PEEK : 0);
         sockaddr_in a{};
-        int alen = sizeof a;
+        socklen_t alen = sizeof a;
         auto [n, err] = run_io(*k, false, (flags & 0x80) != 0, [&] {
             alen = sizeof a;
             return from ? recvfrom(k->s, buf.data(), static_cast<int>(buf.size()), wflags, reinterpret_cast<sockaddr*>(&a), &alen)
@@ -686,7 +877,8 @@ struct Bsd : Service {
                 return reply(r, -1, E::TIMEDOUT);
             }
         }
-        int so = 0, len = sizeof so;
+        int so = 0;
+        socklen_t len = sizeof so;
         ::getsockopt(k->s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so), &len);
         reply(r, so ? -1 : 0, bsd_errno(so));
     }
@@ -695,7 +887,7 @@ struct Bsd : Service {
         auto k = get_fd(r.arg<s32>(0));
         if (!k) return bad_fd(r), r.push<u32>(0);
         sockaddr_in a{};
-        int alen = sizeof a;
+        socklen_t alen = sizeof a;
         SOCKET got = INVALID_SOCKET;
         auto [n, err] = run_io(*k, false, false, [&] {
             alen = sizeof a;
@@ -741,7 +933,7 @@ struct Bsd : Service {
         }
         auto run = [&](int ms) {
             if (w.empty()) {
-                if (ms > 0) Sleep(ms);
+                if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 return 0;
             }
             for (auto& p : w) p.revents = 0;
@@ -805,7 +997,7 @@ struct Bsd : Service {
         const s64 timeout_ms = forever ? -1 : sec * 1000 + usec / 1000;
         auto run = [&](int ms) {
             if (w.empty()) {
-                if (ms > 0) Sleep(ms);
+                if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 return 0;
             }
             for (auto& p : w) p.revents = 0;
@@ -882,8 +1074,15 @@ struct Bsd : Service {
             wv.assign(reinterpret_cast<const char*>(&d), reinterpret_cast<const char*>(&d) + 4);
             wlen = 4;
         }
+#ifdef _WIN32
         const int ok = ::setsockopt(k->s, wlevel, wopt, wv.data(), wlen);
         const s32 err = ok == 0 ? 0 : bsd_errno(WSAGetLastError());
+#else
+        int hl, ho;
+        const bool known = host_sockopt(wlevel, opt == 0x200 && level == 0xFFFF ? 0x4 : opt, hl, ho);
+        const int ok = known ? ::setsockopt(k->s, hl, ho, wv.data(), static_cast<socklen_t>(wlen)) : -1;
+        const s32 err = ok == 0 ? 0 : known ? bsd_errno(errno) : E::NOPROTOOPT;
+#endif
         if (net_trace() || err) LOG("net: setsockopt(%d, %#x, %#x, %d) = %d", r.arg<s32>(0), level, opt, iv, err);
         // Options Winsock lacks (ENOPROTOOPT) are accepted: the game only tunes with them.
         const s32 reported = err == E::NOPROTOOPT ? 0 : err;
@@ -902,12 +1101,19 @@ struct Bsd : Service {
         }
         int wopt = level == 0xFFFF && opt == 0x200 ? SO_REUSEADDR : opt;
         char buf[16]{};
-        int len = sizeof buf;
+        socklen_t len = sizeof buf;
+#ifdef _WIN32
         if (::getsockopt(k->s, level, wopt, buf, &len) != 0) {
             return reply(r, -1, bsd_errno(WSAGetLastError())), r.push<u32>(0);
         }
+#else
+        int hl, ho;
+        if (!host_sockopt(level, opt, hl, ho)) return reply(r, -1, E::NOPROTOOPT), r.push<u32>(0);
+        if (::getsockopt(k->s, hl, ho, buf, &len) != 0) return reply(r, -1, bsd_errno(errno)), r.push<u32>(0);
+        (void)wopt;
+#endif
         s32 iv = 0;
-        std::memcpy(&iv, buf, std::min(len, 4));
+        std::memcpy(&iv, buf, std::min<size_t>(len, 4));
         if (level == 0xFFFF && opt == 0x1007) iv = bsd_errno(iv);  // SO_ERROR
         if (len <= 4) {
             r.write_out(0, &iv, 4);

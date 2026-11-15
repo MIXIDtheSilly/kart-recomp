@@ -1,4 +1,5 @@
 #include "textures.h"
+#include "../../os.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -6,7 +7,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "sparse.h"
 #include "upload.h"
@@ -63,8 +66,8 @@ u64 storage_hash(u64 addr, u64 size) {
 }
 
 void hash_thread() {
-    SetThreadDescription(GetCurrentThread(), L"nvk cpu writes");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    os::set_thread_name("nvk cpu writes");
+    os::set_thread_priority(os::Priority::BelowNormal);
     for (;;) {
         std::shared_ptr<CpuWatch> w;
         {
@@ -330,9 +333,11 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
                     types += b;
                 }
                 u64 wc = 0, wc_n = 0;
+#ifdef _WIN32
                 MEMORY_BASIC_INFORMATION mi;
                 for (u8* a = nullptr; VirtualQuery(a, &mi, sizeof mi); a = static_cast<u8*>(mi.BaseAddress) + mi.RegionSize)
                     if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & PAGE_WRITECOMBINE)) wc += mi.RegionSize, wc_n++;
+#endif
                 LOG("nvk: memory: %s; write-combined %llu MB in %llu regions; arenas %u, submissions %u, set generations %u",
                     types.c_str(), static_cast<unsigned long long>(wc >> 20), static_cast<unsigned long long>(wc_n),
                     g_dbg_arenas.load(), g_dbg_subs.load(), g_dbg_gens.load());

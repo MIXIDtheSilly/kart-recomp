@@ -9,9 +9,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "nvn_int.h"
+#include "../os.h"
 #include "../video.h"
 
 namespace nvn {
@@ -48,13 +51,8 @@ uint64_t pace(uint64_t* target, uint64_t now, uint64_t period) {
 void sleep_until_ns(uint64_t dl) {
     const uint64_t now = now_ns();
     if (dl <= now) return;
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     HostWait hw;
-    if (timer) {
-        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((dl - now) / 100);
-        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) { WaitForSingleObject(timer, INFINITE); return; }
-    }
-    Sleep((DWORD)((dl - now) / 1000000));
+    os::timer_sleep_ns(static_cast<int64_t>(dl - now));
 }
 
 // Frame times (from present to present) and the game's waits in AcquireTexture, logged every 10 s: whether frames

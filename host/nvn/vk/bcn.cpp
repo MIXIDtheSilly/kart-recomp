@@ -3,7 +3,9 @@
 
 // BC1/BC3 encoding of RGBA8 for formats the host GPU lacks (from Eden's video_core/textures/bcn.cpp; the blocks are
 // stb_dxt's), and the transcode threads both codecs run on.
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +18,7 @@
 #include <thread>
 
 #include "codecs.h"
+#include "../../os.h"
 #include "stb_dxt.h"
 
 namespace codec {
@@ -40,7 +43,7 @@ struct Pool {
         if (const char* v = std::getenv("HOST_TRANSCODE_THREADS")) n = std::max<u32>(std::strtoul(v, nullptr, 10), 1);
         for (u32 i = 0; i < n; i++) {
             std::thread([this, i] {
-                SetThreadDescription(GetCurrentThread(), (L"transcode " + std::to_wstring(i)).c_str());
+                os::set_thread_name(("transcode " + std::to_string(i)).c_str());
                 run();
             }).detach();
         }

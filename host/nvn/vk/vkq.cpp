@@ -4,8 +4,16 @@
 // full; the consumer spins a little when it is empty, then sleeps on `head` (WaitOnAddress). Each side makes the wake
 // syscall only when the other has said it sleeps.
 #include "vkq.h"
+#include "../../os.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 #include <immintrin.h>
 
 #include <atomic>
@@ -16,10 +24,31 @@
 
 #include "../../common.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "Synchronization.lib")
+#endif
 
 namespace nvk::vkq {
 namespace {
+
+// Sleeps while *a == seen (at most ms milliseconds, -1: no limit), and wakes the sleepers on a. On Linux a futex on the
+// counter's low 32 bits: the counters only grow, so those change whenever the counter does.
+void wait_u64(std::atomic<u64>* a, u64 seen, int ms) {
+#ifdef _WIN32
+    WaitOnAddress(a, &seen, sizeof seen, ms < 0 ? INFINITE : static_cast<DWORD>(ms));
+#else
+    timespec ts{ms / 1000, (ms % 1000) * 1'000'000L};
+    syscall(SYS_futex, reinterpret_cast<u32*>(a), FUTEX_WAIT_PRIVATE, static_cast<u32>(seen), ms < 0 ? nullptr : &ts, nullptr, 0);
+#endif
+}
+void wake_u64(std::atomic<u64>* a, bool all = true) {
+#ifdef _WIN32
+    if (all) WakeByAddressAll(a);
+    else WakeByAddressSingle(a);
+#else
+    syscall(SYS_futex, reinterpret_cast<u32*>(a), FUTEX_WAKE_PRIVATE, all ? INT32_MAX : 1, nullptr, nullptr, 0);
+#endif
+}
 
 constexpr size_t RingBytes = 32u << 20;   // (stage 1 appends a few entries a frame: never full in practice)
 constexpr u64 SpinNs = 80'000;            // the consumer spins this long on an empty ring before it sleeps
@@ -42,8 +71,8 @@ alignas(64) std::atomic<u32> g_prod_sleeps{0};  // the producer waits on g_tail
 u64 g_head_local = 0, g_pending = 0, g_tail_seen = 0;   // producer only: published, reserved, last tail read
 
 void consumer_loop() {
-    SetThreadDescription(GetCurrentThread(), L"NVN driver");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    os::set_thread_name("NVN driver");
+    os::set_thread_priority(os::Priority::AboveNormal);
     u64 t = 0;
     // How this thread spends its time (logged every 10 s): running entries, spinning on an empty ring, asleep.
     u64 st_at = host_ns(), st_run = 0, st_spin = 0, st_sleep = 0, st_sleeps = 0, st_entries = 0, st_batches = 0;
@@ -61,7 +90,7 @@ void consumer_loop() {
             if (h == t) {
                 g_cons_sleeps.store(1, std::memory_order_seq_cst);
                 h = g_head.load(std::memory_order_seq_cst);
-                if (h == t) WaitOnAddress(&g_head, &t, sizeof t, INFINITE);
+                if (h == t) wait_u64(&g_head, t, -1);
                 g_cons_sleeps.store(0, std::memory_order_relaxed);
                 st_sleep += host_ns() - t1, st_sleeps++;
                 continue;
@@ -75,7 +104,7 @@ void consumer_loop() {
             st_entries++;
             if (n % 32 == 0 || t == h) {
                 g_tail.store(t, std::memory_order_seq_cst);
-                if (g_prod_sleeps.load(std::memory_order_seq_cst)) WakeByAddressAll(&g_tail);
+                if (g_prod_sleeps.load(std::memory_order_seq_cst)) wake_u64(&g_tail);
             }
         }
         const u64 r1 = host_ns();
@@ -103,7 +132,7 @@ void wait_tail(u64 target) {
     while ((t = g_tail.load(std::memory_order_seq_cst)) < target) {
         g_prod_sleeps.store(1, std::memory_order_seq_cst);
         t = g_tail.load(std::memory_order_seq_cst);
-        if (t < target) WaitOnAddress(&g_tail, &t, sizeof t, 10);
+        if (t < target) wait_u64(&g_tail, t, 10);
         g_prod_sleeps.store(0, std::memory_order_relaxed);
     }
 }
@@ -123,7 +152,7 @@ void attach() {
     if (!on()) return;
     static std::once_flag once;
     std::call_once(once, [] {
-        g_ring = static_cast<u8*>(VirtualAlloc(nullptr, RingBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        g_ring = static_cast<u8*>(os::alloc_pages(RingBytes));
         if (!g_ring) {
             LOG("[RED] nvk: driver thread: no memory for its ring; queue work stays on the renderer thread");
             return;
@@ -138,7 +167,7 @@ void flush() {
     if (!detail::t_producer || g_pending == g_head_local) return;
     g_head_local = g_pending;
     g_head.store(g_pending, std::memory_order_seq_cst);
-    if (g_cons_sleeps.load(std::memory_order_seq_cst)) WakeByAddressSingle(&g_head);
+    if (g_cons_sleeps.load(std::memory_order_seq_cst)) wake_u64(&g_head, false);
 }
 
 void sync() {

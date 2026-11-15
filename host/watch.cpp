@@ -1,7 +1,11 @@
 // Guest write watch (watch.h).
 #include "watch.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <ucontext.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +17,7 @@
 
 #include "kernel.h"
 #include "memory.h"
+#include "os.h"
 
 namespace nvn { extern std::atomic<uint64_t> g_frame; }
 
@@ -242,7 +247,30 @@ bool protected_page(u64 page) {
     return g_pages.count(page) != 0;
 }
 
+// The faulting thread's registers: Windows' CONTEXT, Linux's signal context. gpr() takes x86 register numbers.
+#ifdef _WIN32
+using Context = CONTEXT;
+u64 ctx_rip(const Context* c) { return c->Rip; }
+u64& ctx_gpr(Context* c, int reg) { return (&c->Rax)[reg]; }
+void ctx_trap_flag(Context* c, bool on) { c->EFlags = on ? c->EFlags | 0x100u : c->EFlags & ~0x100u; }
+#else
+using Context = ucontext_t;
+u64 ctx_rip(const Context* c) { return static_cast<u64>(c->uc_mcontext.gregs[REG_RIP]); }
+u64& ctx_gpr(Context* c, int reg) {
+    static constexpr int order[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                      REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+    return reinterpret_cast<u64&>(c->uc_mcontext.gregs[order[reg]]);
+}
+void ctx_trap_flag(Context* c, bool on) {
+    auto& f = c->uc_mcontext.gregs[REG_EFL];
+    f = on ? f | 0x100 : f & ~0x100ll;
+}
+#endif
+
 // The host call stack of the faulting store (recompiled guest functions are ordinary host functions calling each other).
+#ifndef _WIN32
+int unwind(const Context* ctx, u64* out, int max) { return os::backtrace_from(ctx_rip(ctx), out, max); }   // (in the signal handler)
+#else
 int unwind(const CONTEXT* ctx, u64* out, int max) {
     CONTEXT c = *ctx;
     int n = 0;
@@ -257,6 +285,7 @@ int unwind(const CONTEXT* ctx, u64* out, int max) {
     }
     return n;
 }
+#endif
 
 void flush_frame_locked() {
     for (const auto& [key, a] : g_rec) {
@@ -297,7 +326,7 @@ void record(u64 addr, u32 width, bool unknown) {
     for (u64 u = off / 16; u <= (off + width - 1) / 16 && u < stored.size(); u++) stored[u] = 1;
     a.lo = std::min(a.lo, off);
     a.hi = std::max(a.hi, std::min<u64>(off + width, r->hi - r->lo));
-    a.tid = GetCurrentThreadId();
+    a.tid = static_cast<u32>(os::thread_id());
     if (kern::KThread* t = kern::current_thread()) a.fpcr = t->ctx.fpcr;
     const u8* p = mem::backing_ptr(addr & ~(mem::PageSize - 1));
     if (!p) return;
@@ -422,8 +451,8 @@ void gpu_access(const char* what, const char* shader, u32 slot, u64 addr, u64 si
 bool on_write_fault(u64 guest, void* context) {
     const u64 page = guest / mem::PageSize;
     if (!protected_page(page) || t_reg >= 0 || t_unprotected) return false;
-    auto* ctx = static_cast<CONTEXT*>(context);
-    const u8* code = reinterpret_cast<const u8*>(ctx->Rip);
+    auto* ctx = static_cast<Context*>(context);
+    const u8* code = reinterpret_cast<const u8*>(ctx_rip(ctx));
     const u32 width = store_bytes(code);
     const u64 off = guest & (mem::PageSize - 1);
     u8* const backing = mem::backing_ptr(page * mem::PageSize);
@@ -437,26 +466,26 @@ bool on_write_fault(u64 guest, void* context) {
     if (reg >= 0) {
         t_reg = reg;
         t_delta = reinterpret_cast<u64>(backing + off) - reinterpret_cast<u64>(hp(guest));
-        (&ctx->Rax)[reg] += t_delta;
+        ctx_gpr(ctx, reg) += t_delta;
     } else {
         // Unknown form or host code (memcpy): this one instruction runs with the page writable.
         static std::atomic<int> said{0};
-        if (said++ < 16) line("store at %s not redirected, page unprotected for one instruction", host_symbol(ctx->Rip).c_str());
+        if (said++ < 16) line("store at %s not redirected, page unprotected for one instruction", host_symbol(ctx_rip(ctx)).c_str());
         t_unprotected = true;
         t_page = page;
         mem::protect_view(page * mem::PageSize, protected_page(page + 1) ? 2 * mem::PageSize : mem::PageSize, true, true);
     }
-    ctx->EFlags |= 0x100u;
+    ctx_trap_flag(ctx, true);
     return true;
 }
 
 bool on_single_step(void* context) {
     if (t_reg < 0 && !t_unprotected) return false;
-    auto* ctx = static_cast<CONTEXT*>(context);
-    ctx->EFlags &= ~0x100u;
+    auto* ctx = static_cast<Context*>(context);
+    ctx_trap_flag(ctx, false);
     const bool unknown = t_unprotected;
     if (t_reg >= 0) {
-        (&ctx->Rax)[t_reg] -= t_delta;
+        ctx_gpr(ctx, t_reg) -= t_delta;
         t_reg = -1;
     } else {
         t_unprotected = false;

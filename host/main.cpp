@@ -1,14 +1,41 @@
 // Standalone host: loads the game's modules into a native address space and runs the
 // recompiled code on host threads, with a native kernel and native services.
+#ifdef _WIN32
 #include <windows.h>
 
-#include <chrono>
-#include <thread>
 #include <dbghelp.h>
 #include <timeapi.h>
 #include <tlhelp32.h>
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "winmm.lib")
+#else
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <vector>
+
+// The performance counter the timing below reads, on Linux the monotonic clock in nanoseconds.
+union LARGE_INTEGER {
+    long long QuadPart;
+};
+static void QueryPerformanceCounter(LARGE_INTEGER* t) {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    t->QuadPart = static_cast<long long>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+}
+static void QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1'000'000'000; }
+#endif
+
+#include <chrono>
+#include <thread>
 
 #include <cstdio>
 #include <cstring>
@@ -19,6 +46,7 @@
 #include <unordered_map>
 
 #include "aot_modules.h"
+#include "os.h"
 #include "host.h"
 #include "ipc.h"
 #include "kernel.h"
@@ -103,9 +131,18 @@ void fatal(const char* fmt, ...) {
         va_start(ap, fmt);
         vsnprintf(text, sizeof text, fmt, ap);
         va_end(ap);
+#ifdef _WIN32
         MessageBoxA(nullptr, text, "Kart: fatal error", MB_OK | MB_ICONERROR);
+#else
+        video::error_box("Kart: fatal error", text);
+#endif
     }
+#ifdef _WIN32
     ExitProcess(1);
+#else
+    if (g_log_file) fflush(g_log_file);
+    _exit(1);
+#endif
 }
 
 // ------------------------------------------------------------------ time
@@ -226,6 +263,16 @@ GuestFn find_guest_fn(u64 target) {
 
 int walk_frames(u64 fp, u64* out, int max) {
     int n = 0;
+#ifndef _WIN32
+    // (no fault handling around the reads here: each frame record is checked to be mapped first)
+    while (fp && !(fp & 7) && n < max && mem::backing_ptr(fp) && mem::backing_ptr(fp + 8)) {
+        const u64* frame = static_cast<const u64*>(hp(fp));
+        out[n++] = frame[1];
+        if (frame[0] <= fp) break;
+        fp = frame[0];
+    }
+    return n;
+#else
     __try {
         while (fp && !(fp & 7) && n < max) {
             const u64* frame = static_cast<const u64*>(hp(fp));
@@ -236,9 +283,213 @@ int walk_frames(u64 fp, u64* out, int max) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     return n;
+#endif
 }
 
 }  // namespace
+
+#ifndef _WIN32
+// ------------------------------------------------------------------ Linux: symbols, stacks, crashes
+
+namespace {
+
+// kart's own functions, from the symbol table of its file (linked without PIE: the addresses are where they run).
+struct ElfSymbols {
+    std::vector<std::pair<u64, u64>> funcs;   // address, offset of the name in `names`; sorted
+    std::vector<u64> sizes;
+    std::string names;
+    u64 text_lo = ~0ull, text_hi = 0;
+
+    ElfSymbols() {
+        std::ifstream f("/proc/self/exe", std::ios::binary);
+        std::string file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (file.size() < sizeof(Elf64_Ehdr) || std::memcmp(file.data(), ELFMAG, SELFMAG) != 0) return;
+        Elf64_Ehdr eh;
+        std::memcpy(&eh, file.data(), sizeof eh);
+        if (eh.e_shoff + u64(eh.e_shnum) * sizeof(Elf64_Shdr) > file.size()) return;
+        std::vector<Elf64_Shdr> sh(eh.e_shnum);
+        std::memcpy(sh.data(), file.data() + eh.e_shoff, sh.size() * sizeof(Elf64_Shdr));
+        for (const Elf64_Shdr& s : sh) {
+            if (s.sh_type != SHT_SYMTAB || s.sh_link >= sh.size()) continue;
+            const Elf64_Shdr& str = sh[s.sh_link];
+            if (s.sh_offset + s.sh_size > file.size() || str.sh_offset + str.sh_size > file.size()) return;
+            names.assign(file.data() + str.sh_offset, str.sh_size);
+            std::vector<std::pair<u64, std::pair<u64, u64>>> all;   // address, (name, size)
+            for (u64 o = 0; o + sizeof(Elf64_Sym) <= s.sh_size; o += sizeof(Elf64_Sym)) {
+                Elf64_Sym sym;
+                std::memcpy(&sym, file.data() + s.sh_offset + o, sizeof sym);
+                if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC || !sym.st_value || sym.st_name >= names.size()) continue;
+                all.push_back({sym.st_value, {sym.st_name, sym.st_size}});
+                text_lo = std::min<u64>(text_lo, sym.st_value);
+                text_hi = std::max<u64>(text_hi, sym.st_value + sym.st_size);
+            }
+            std::sort(all.begin(), all.end());
+            funcs.reserve(all.size());
+            sizes.reserve(all.size());
+            for (const auto& [a, ns] : all) funcs.push_back({a, ns.first}), sizes.push_back(ns.second);
+        }
+    }
+
+    // "name+0x12" of the function holding `a`, or "" outside them.
+    std::string find(u64 a) const {
+        // (outside kart's code: a size-0 symbol, as the last one, would otherwise take every library address above it)
+        if (a < text_lo || a >= text_hi) return {};
+        auto it = std::upper_bound(funcs.begin(), funcs.end(), std::pair<u64, u64>{a, ~0ull});
+        if (it == funcs.begin()) return {};
+        --it;
+        const u64 size = sizes[it - funcs.begin()];
+        if (size && a >= it->first + size) return {};
+        const char* mangled = names.c_str() + it->second;
+        int status = 0;
+        char* plain = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+        char off[24];
+        std::snprintf(off, sizeof off, "+%#llx", static_cast<unsigned long long>(a - it->first));
+        std::string r = std::string(status == 0 && plain ? plain : mangled) + off;
+        std::free(plain);
+        return r;
+    }
+};
+
+const ElfSymbols& elf_symbols() {
+    static const ElfSymbols s;
+    return s;
+}
+
+}  // namespace
+
+std::string host_symbol(u64 rip) {
+    static std::mutex m;
+    std::scoped_lock lk{m};
+    std::string own = elf_symbols().find(rip);
+    if (!own.empty()) return own;
+    // Outside kart (the Vulkan driver, system libraries): the library and offset, and its nearest exported symbol
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(rip), &info) || !info.dli_fname) return "?";
+    const char* name = std::strrchr(info.dli_fname, '/');
+    char b[400];
+    std::snprintf(b, sizeof b, "%s+%#llx", name ? name + 1 : info.dli_fname,
+                  static_cast<unsigned long long>(rip - reinterpret_cast<u64>(info.dli_fbase)));
+    std::string r = b;
+    if (info.dli_sname) {
+        std::snprintf(b, sizeof b, " (%s+%#llx)", info.dli_sname, static_cast<unsigned long long>(rip - reinterpret_cast<u64>(info.dli_saddr)));
+        r += b;
+    }
+    return r;
+}
+
+// Every thread of the process with its host call stack, for a stall: where each one runs or waits. A recompiled
+// function carries its guest address in its name, so a guest thread's stack is also its guest call chain. Each thread
+// reads its own stack when signalled (os::sample_thread); names are looked up afterwards.
+static void dump_host_stacks() {
+    const int self = static_cast<int>(os::thread_id());
+    for (const os::ThreadInfo& t : os::list_threads()) {
+        if (t.tid == self) continue;
+        u64 pcs[28];
+        const int n = os::sample_thread(t.tid, pcs, 28);
+        std::string line;
+        for (int i = 0; i < n; i++) {
+            std::string sym = host_symbol(pcs[i]);
+            if (sym.size() > 90) sym.resize(90);
+            line += i ? " < " : " ";
+            line += sym;
+        }
+        if (!n) line = " (no answer: signals blocked)";
+        LOG("stack of host thread %d (%s):%s", t.tid, t.name.c_str(), line.c_str());
+    }
+}
+
+namespace stepwatch {
+void start() {
+    if (std::getenv("HOST_WATCH_STEP")) LOG("stepwatch: HOST_WATCH_STEP needs the Windows debug registers; not on Linux");
+}
+}  // namespace stepwatch
+
+namespace {
+
+struct sigaction g_prev[NSIG];   // the handlers installed before ours (a fault outside kart's code goes on to them)
+
+const char* signal_name(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS: return "SIGBUS";
+    case SIGILL: return "SIGILL";
+    case SIGFPE: return "SIGFPE";
+    case SIGTRAP: return "SIGTRAP";
+    case SIGABRT: return "SIGABRT";
+    default: return "signal";
+    }
+}
+
+// A fault: the debug write watch's (watch.cpp), else a crash. Faults in other code (the Vulkan driver, a library) that
+// another handler was installed for go on to it. Logs what Windows' crash_handler logs, then ends the process.
+void crash_signal(int sig, siginfo_t* si, void* context) {
+    auto* uc = static_cast<ucontext_t*>(context);
+    const u64 rip = static_cast<u64>(uc->uc_mcontext.gregs[REG_RIP]);
+    if (sig == SIGTRAP && watch::on_single_step(uc)) return;
+    const bool memory = sig == SIGSEGV || sig == SIGBUS;
+    const u64 fault = memory ? reinterpret_cast<u64>(si->si_addr) : 0;
+    const u64 guest = fault - g_membase;
+    const bool write = memory && (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;   // page fault error code: a write
+    if (sig == SIGSEGV && write && guest < mem::AddressSpaceSize && watch::on_write_fault(guest, uc)) return;
+    const ElfSymbols& own = elf_symbols();
+    const bool ours = rip >= own.text_lo && rip < own.text_hi;
+    if (!ours && guest >= mem::AddressSpaceSize) {
+        const struct sigaction& prev = g_prev[sig];
+        if (prev.sa_flags & SA_SIGINFO ? prev.sa_sigaction != nullptr : prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
+            if (prev.sa_flags & SA_SIGINFO) prev.sa_sigaction(sig, si, context);
+            else prev.sa_handler(sig);
+            return;
+        }
+    }
+    static std::atomic<bool> crashing{false};
+    if (crashing.exchange(true)) {   // a second thread, or a fault in the report: the first one finishes it
+        for (;;) pause();
+    }
+    log_line("[RED] crash: %s (code %d) at %s (rip %#llx), %s %#llx%s, thread %llu", signal_name(sig), si->si_code,
+             host_symbol(rip).c_str(), rip, memory ? (write ? "writing" : "reading") : "addr",
+             guest < mem::AddressSpaceSize ? guest : fault, guest < mem::AddressSpaceSize ? " (guest)" : "",
+             static_cast<unsigned long long>(os::thread_id()));
+    if (guest < mem::AddressSpaceSize) {
+        // The guest memory blocks around the address.
+        const mem::Info at = mem::query(guest);
+        const mem::Info before = at.addr ? mem::query(at.addr - 1) : at;
+        for (const mem::Info& b : {before, at})
+            log_line("  block %#llx+%#llx state %#x perm %#x attr %#x", b.addr, b.size, b.state, b.perm, b.attr);
+        log_line("  backing %p", static_cast<void*>(mem::backing_ptr(guest)));
+    }
+    u64 pcs[32];
+    const int n = os::backtrace_from(rip, pcs, 32);
+    for (int i = 1; i < n; i++) log_line("  #%-2d %s", i, host_symbol(pcs[i]).c_str());
+    if (auto* t = kern::current_thread()) dump_guest_stack(&t->ctx);
+    kern::dump_threads();
+    gamepads::stop_vibration();
+    if (g_log_file) fflush(g_log_file);
+    _exit(3);   // (not exit(): the Vulkan driver's threads would run destructors under it)
+}
+
+}  // namespace
+
+// The signal stack of the calling thread (a stack overflow is reported too): main, and each guest thread (kernel.cpp).
+void host_signal_stack() {
+    constexpr size_t Size = 256 << 10;
+    stack_t ss{};
+    ss.ss_sp = os::alloc_pages(Size);
+    ss.ss_size = Size;
+    if (ss.ss_sp) sigaltstack(&ss, nullptr);
+}
+
+static void install_crash_handler() {
+    host_signal_stack();
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) {
+        struct sigaction sa{};
+        sa.sa_sigaction = crash_signal;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sig, &sa, &g_prev[sig]);
+    }
+}
+
+#else  // Windows
 
 std::string host_symbol(u64 rip) {
     static std::mutex m;
@@ -531,6 +782,7 @@ LONG WINAPI last_chance(EXCEPTION_POINTERS* ep) {
 }
 
 }  // namespace
+#endif  // _WIN32
 
 std::string describe_guest(u64 addr) {
     char buf[96];
@@ -620,12 +872,17 @@ namespace nvk { int bake_textures(const std::filesystem::path& game, size_t chec
 
 // Clang PGO (tools/build_lib.py BUILD_PGO=gen): instrumented modules link clang's profile runtime
 // (clang_rt.profile); in every other build this resolves to the no-op below.
+#ifdef _WIN32
 extern "C" int __llvm_profile_write_file(void);
 extern "C" int kart_pgo_nop(void) { return 0; }
 #pragma comment(linker, "/alternatename:__llvm_profile_write_file=kart_pgo_nop")
+#else
+extern "C" __attribute__((weak)) int __llvm_profile_write_file(void);
+#endif
 
 std::string host_exe_variant();  // localcfg.cpp
 
+#ifdef _WIN32
 extern "C" {
 NTSYSAPI LONG NTAPI NtQueryTimerResolution(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
 NTSYSAPI LONG NTAPI NtSetTimerResolution(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
@@ -647,12 +904,19 @@ static ULONG finest_timer_resolution() {
     NtSetTimerResolution(finest, TRUE, &current);
     return current;
 }
+#endif
 
 int main(int argc, char** argv) {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc_start);
+#ifdef _WIN32
     timeBeginPeriod(1);
     SetConsoleOutputCP(CP_UTF8);
+#else
+    // Timers fire within 1 ns of when they are due instead of the default 50 us (the game's job loops sleep 20 us
+    // between polls); threads started from here on inherit it.
+    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+#endif
 
     // The game dump (the folder holding exefs\ and romfs\): the first argument, else KART_GAME from the environment
     // or local.cfg (localcfg.cpp)
@@ -663,8 +927,9 @@ int main(int argc, char** argv) {
         game = e;
     }
     if (game.empty()) {
-        fprintf(stderr, "usage: kart.exe <game dump folder, holding exefs\\ and romfs\\> [--bake-textures [n]]\n"
-                        "       (or set KART_GAME to that folder, in the environment or in local.cfg)\n");
+        fprintf(stderr, "usage: %s <game dump folder, holding exefs\\ and romfs\\> [--bake-textures [n]]\n"
+                        "       (or set KART_GAME to that folder, in the environment or in local.cfg)\n",
+                argv[0]);
         return 2;
     }
     g_config.game_dir = game;
@@ -674,15 +939,19 @@ int main(int argc, char** argv) {
     // HOST_USER_DIR: another folder for saves and logs (a second instance on this PC, for LAN play).
     if (const char* e = getenv("HOST_USER_DIR"); e && *e) g_config.user_dir = fs::path(e);
     fs::create_directories(g_config.user_dir);
-    g_log_file = _wfopen((g_config.user_dir / "host.log").c_str(), L"w");
+    g_log_file = os::open_file(g_config.user_dir / "host.log", "w");
     LOG("game %s", game.string().c_str());
 
     if (argc > 2 && std::strcmp(argv[2], "--bake-textures") == 0) return nvk::bake_textures(game, argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0);
 
+#ifdef _WIN32
     AddVectoredExceptionHandler(0, crash_handler);
     SetUnhandledExceptionFilter(last_chance);
     // The finest host timer resolution (0.5 ms), for the renderer's acquire polling and the game's short timed waits.
     LOG("host timer resolution %lu us", finest_timer_resolution() / 10);
+#else
+    install_crash_handler();
+#endif
     mem::init();
     video::init();
 
@@ -731,7 +1000,7 @@ int main(int argc, char** argv) {
         const int secs = v ? std::atoi(v) : 10;
         if (secs > 0) {
             std::thread([secs] {
-                SetThreadDescription(GetCurrentThread(), L"stall watch");
+                os::set_thread_name("stall watch");
                 u64 dumped_for = 0;
                 for (int dumps = 0; dumps < 3;) {
                     std::this_thread::sleep_for(std::chrono::seconds{1});
@@ -751,7 +1020,11 @@ int main(int argc, char** argv) {
         const int secs = std::atoi(v);
         std::thread([secs] {
             std::this_thread::sleep_for(std::chrono::seconds{secs});
+#ifdef _WIN32
             LOG("PGO profile written (%d)", __llvm_profile_write_file());
+#else
+            LOG("PGO profile written (%d)", __llvm_profile_write_file ? __llvm_profile_write_file() : -1);
+#endif
         }).detach();
     }
     video::run_window_loop();

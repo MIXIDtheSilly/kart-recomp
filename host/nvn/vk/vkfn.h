@@ -2,7 +2,12 @@
 #pragma once
 // Headers from third_party/vulkan; no prototypes: every entry point is a pointer loaded below.
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#define VKFN_WIN32_SURFACE(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VKFN_WIN32_SURFACE(X)   // (Linux: SDL makes the window's surface, video_sdl.cpp)
+#endif
 #include <vulkan/vulkan.h>
 // windows.h macros that would rename Vulkan's and the renderer's names
 #undef CreateEvent
@@ -18,7 +23,7 @@
     X(vkGetPhysicalDeviceMemoryProperties2) X(vkGetPhysicalDeviceQueueFamilyProperties)            \
     X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFormatProperties2)                 \
     X(vkGetPhysicalDeviceImageFormatProperties) X(vkEnumerateDeviceExtensionProperties)           \
-    X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR) X(vkCreateWin32SurfaceKHR)    \
+    X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR) VKFN_WIN32_SURFACE(X)    \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)          \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)          \
     X(vkCreateDebugUtilsMessengerEXT) X(vkDestroyDebugUtilsMessengerEXT)                           \

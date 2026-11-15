@@ -11,8 +11,11 @@
 //
 // HOST_NVN_SYNC_REPLAY=1: everything on the calling thread, as before.
 #include "replay_async.h"
+#include "../../os.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -86,8 +89,8 @@ void log_hitch(u64 ns, const u64* before) {
 }
 
 void renderer_loop() {
-    SetThreadDescription(GetCurrentThread(), L"NVN renderer");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    os::set_thread_name("NVN renderer");
+    os::set_thread_priority(os::Priority::AboveNormal);
     nvk::t_hitch = true;
     nvk::vkq::attach();   // queue work from here on goes to the driver thread (vkq.h)
     for (;;) {

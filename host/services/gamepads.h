@@ -1,5 +1,5 @@
 // Gamepads: Xbox pads through XInput; DualShock 4, DualSense and the Switch Pro Controller (USB and Bluetooth)
-// through their HID input reports.
+// through their HID input reports (gamepads.cpp). On Linux every pad SDL 3 knows (gamepads_sdl.cpp).
 #pragma once
 #include <array>
 
@@ -45,5 +45,10 @@ int connected_players();
 void vibrate(int player, int motor, const Vibration& v);
 // Stops every pad's vibration now, for good: the game is closing (or crashing: it never waits long).
 void stop_vibration();
+
+#ifndef _WIN32
+// Linux: an SDL event from the window's loop (video_sdl.cpp, main thread): pads come and go with it.
+void on_sdl_event(const void* sdl_event);
+#endif
 
 }  // namespace gamepads

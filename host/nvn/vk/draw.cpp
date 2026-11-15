@@ -1,4 +1,5 @@
 #include "draw.h"
+#include "../../os.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -6,7 +7,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1015,7 +1018,7 @@ std::vector<PipeDesc> predicted_descs(const std::vector<PipeDesc>& seen, const s
     };
     const std::string dir = shader_folder();
     std::unordered_set<u64> pairs_done;
-    for (const char* name : {"\\split\\shader_pairs.tsv", "\\split\\pso_pairs.tsv"}) {
+    for (const char* name : {OS_SEP "split" OS_SEP "shader_pairs.tsv", OS_SEP "split" OS_SEP "pso_pairs.tsv"}) {
         std::ifstream f(dir + name);
         for (std::string line; std::getline(f, line);) {
             if (line.empty() || line[0] == '#') continue;
@@ -1047,7 +1050,7 @@ std::vector<PipeDesc> predicted_descs(const std::vector<PipeDesc>& seen, const s
             }
         }
     }
-    std::ifstream f(dir + "\\refl.tsv");
+    std::ifstream f(dir + OS_SEP "refl.tsv");
     for (std::string line; std::getline(f, line);) {
         if (line.empty() || line[0] == '#') continue;
         char* end = nullptr;
@@ -1092,8 +1095,8 @@ void prime(const std::vector<PipeDesc>& seen) {
     std::vector<std::thread> threads;
     for (u32 i = 0; i < n; i++)
         threads.emplace_back([&] {
-            SetThreadDescription(GetCurrentThread(), L"NVN pipelines ahead of time");
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            os::set_thread_name("NVN pipelines ahead of time");
+            os::set_thread_priority(os::Priority::Lowest);
             for (size_t k; (k = next++) < list.size();) {
                 made += prime_one(list[k]);
                 std::scoped_lock lk{mu};
@@ -1121,8 +1124,8 @@ void warm_up(std::vector<PipeDesc> list) {
         std::vector<std::thread> threads;
         for (u32 i = 0; i < n; i++)
             threads.emplace_back([&] {
-                SetThreadDescription(GetCurrentThread(), L"NVN pipeline warm-up");
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                os::set_thread_name("NVN pipeline warm-up");
+                os::set_thread_priority(os::Priority::BelowNormal);
                 for (size_t k; (k = next++) < list.size();) warm_one(list[k]);
             });
         for (std::thread& t : threads) t.join();
@@ -3213,6 +3216,19 @@ void draw_init() {
     if (const char* e = getenv("HOST_NVN_PIPELINE_CACHE")) g_pcache_path = e;
     else if (const std::string v = host_exe_variant(); !v.empty()) g_pcache_path = "nvn_pipelines-" + v + ".bin";  // another game version's shaders
     else g_pcache_path = "nvn_pipelines.bin";
+#ifndef _WIN32
+    // Linux keeps its own (a checkout both systems use would otherwise build it again on each switch); the list of the
+    // pipelines to make ahead of time is the same on both, so a new one starts from Windows' list
+    if (!getenv("HOST_NVN_PIPELINE_CACHE")) {
+        const std::string windows_keys = g_pcache_path + ".keys";
+        g_pcache_path.insert(g_pcache_path.size() - 4, "-linux");
+        std::error_code ec;
+        if (!std::filesystem::exists(g_pcache_path + ".keys", ec) && std::filesystem::exists(windows_keys, ec)) {
+            std::filesystem::copy_file(windows_keys, g_pcache_path + ".keys", ec);
+            if (!ec) LOG("nvk: pipeline list for ahead-of-time builds taken from %s", windows_keys.c_str());
+        }
+    }
+#endif
     {
         std::ifstream f(g_pcache_path, std::ios::binary);
         if (f) data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());

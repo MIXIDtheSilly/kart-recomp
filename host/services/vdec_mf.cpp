@@ -1,18 +1,22 @@
 #include "vdec_mf.h"
 
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+
+#ifdef _WIN32   // (Linux: vdec_vpx.cpp; Decoder::Render below is shared)
 #include <windows.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
 
-#include <algorithm>
-#include <mutex>
-
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
+#endif
 
 namespace vdec {
+#ifdef _WIN32
 namespace {
 
 template <class T> struct Com {
@@ -253,6 +257,8 @@ void Decoder::Reset() {
     if (impl->missing) return;
     impl->mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
 }
+
+#endif  // _WIN32
 
 void Decoder::Render(const Picture& pic, Format format, u32 width, u32 height, u64 pitch, u64 chroma_offset,
                      std::span<u8> out) {

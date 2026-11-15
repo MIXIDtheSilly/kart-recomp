@@ -112,7 +112,11 @@ struct TimeZone : Service {
         auto to_calendar = [](Request& r) {
             const time_t t = static_cast<time_t>(r.arg<s64>(0));
             std::tm tm{};
+#ifdef _WIN32
             gmtime_s(&tm, &t);
+#else
+            gmtime_r(&t, &tm);
+#endif
             struct {
                 s16 year; s8 month, day, hour, minute, second; s8 pad;
             } cal{static_cast<s16>(tm.tm_year + 1900), static_cast<s8>(tm.tm_mon + 1), static_cast<s8>(tm.tm_mday),
@@ -134,7 +138,11 @@ struct TimeZone : Service {
             std::tm tm{};
             tm.tm_year = cal.year - 1900; tm.tm_mon = cal.month - 1; tm.tm_mday = cal.day;
             tm.tm_hour = cal.hour; tm.tm_min = cal.minute; tm.tm_sec = cal.second;
+#ifdef _WIN32
             const s64 t = _mkgmtime(&tm);
+#else
+            const s64 t = timegm(&tm);
+#endif
             r.push<u32>(1);
             r.write_out(0, &t, 8);
         });

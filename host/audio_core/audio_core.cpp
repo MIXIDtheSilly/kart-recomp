@@ -6,12 +6,20 @@
 
 #include "audio_core/audio_core.h"
 #include "audio_core/sink/null_sink.h"
+#ifdef _WIN32
 #include "audio_core/sink/wasapi_sink.h"
+#else
+#include "audio_core/sink/sdl_sink.h"
+#endif
 
 namespace AudioCore {
 
 AudioCore::AudioCore(HostSystem& system) {
+#ifdef _WIN32
     output_sink = Sink::CreateWasapiSink();
+#else
+    output_sink = Sink::CreateSdlSink();
+#endif
     if (!output_sink) {
         LOG_ERROR(Audio, "audio: no output device, rendering without sound");
         output_sink = std::make_unique<Sink::NullSink>("null");

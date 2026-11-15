@@ -1,6 +1,8 @@
 // The graphics boundary: nv::, nn::vi:: and NVN are native. NVN functions the game looks up by
 // name get guest-callable addresses in a reserved range; each address dispatches to a native function.
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -12,6 +14,7 @@
 #include "graphics.h"
 #include "host.h"
 #include "kernel.h"
+#include "os.h"
 
 namespace gfx {
 namespace {
@@ -91,6 +94,7 @@ kern::ServiceEvent& vsync_event() {
     static kern::ServiceEvent ev;
     static std::thread ticker([] {
         // Until presentation drives it, vsync is a 60 Hz timer.
+#ifdef _WIN32
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         LARGE_INTEGER due;
         due.QuadPart = -166667;
@@ -99,6 +103,14 @@ kern::ServiceEvent& vsync_event() {
             WaitForSingleObject(timer, INFINITE);
             ev.signal();
         }
+#else
+        for (u64 next = host_ns();;) {
+            next += 16'666'667;
+            const u64 now = host_ns();
+            if (next > now) os::timer_sleep_ns(static_cast<int64_t>(next - now));
+            ev.signal();
+        }
+#endif
     });
     return ev;
 }

@@ -1,17 +1,29 @@
 #include "kernel.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <intrin.h>
 #include <thread>
 #include <random>
 
 #include "ipc.h"
+#include "os.h"
 #include "memory.h"
 #include "services/gamepads.h"
+
+#ifndef _WIN32
+void host_signal_stack();   // main.cpp: the calling thread's stack for the crash handler
+#endif
 
 namespace kern {
 
@@ -414,9 +426,18 @@ std::shared_ptr<KThread> thread_from_handle(u32 h) {
 
 // ------------------------------------------------------------------ threads
 
+#ifdef _WIN32
 DWORD WINAPI host_thread_main(void* param) {
+#else
+void* host_thread_main(void* param) {
+#endif
     auto* t = static_cast<KThread*>(param);
     t_current = t;
+#ifndef _WIN32
+    // Linux: the thread's id, which dump_threads samples it by (os::sample_thread), and a stack for the crash handler
+    t->host_thread = reinterpret_cast<void*>(static_cast<uintptr_t>(syscall(SYS_gettid)));
+    host_signal_stack();
+#endif
     Ctx* c = &t->ctx;
     c->rt = t;
     // Experiment: HOST_FTZ=1 runs every guest thread with denormals flushed to zero (MXCSR FTZ + DAZ), as the game's
@@ -433,6 +454,28 @@ DWORD WINAPI host_thread_main(void* param) {
 }
 
 void launch(KThread* t) {
+#ifndef _WIN32
+    // 64 MiB stacks as on Windows (reserved: pages are only used as the stack grows)
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64ull << 20);
+    pthread_t h;
+    if (const int e = pthread_create(&h, &attr, host_thread_main, t); e != 0) fatal("pthread_create failed (%s)", std::strerror(e));
+    pthread_attr_destroy(&attr);
+    pthread_detach(h);
+    char name[16];
+    std::snprintf(name, sizeof name, "guest %llu", static_cast<unsigned long long>(t->id));
+    pthread_setname_np(h, name);
+    // Experiment: HOST_ONE_CPU=1 runs every guest thread on host CPU 0.
+    static const bool one_cpu = std::getenv("HOST_ONE_CPU") != nullptr;
+    if (one_cpu) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(0, &set);
+        pthread_setaffinity_np(h, sizeof set, &set);
+    }
+    return;
+#else
     HANDLE h = CreateThread(nullptr, 64ull << 20, host_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, nullptr);
     if (!h) fatal("CreateThread failed (%lu)", GetLastError());
     t->host_thread = h;  // kept open for dump_threads
@@ -442,6 +485,7 @@ void launch(KThread* t) {
     static const bool one_cpu = std::getenv("HOST_ONE_CPU") != nullptr;
     if (one_cpu) SetThreadAffinityMask(h, 1);
     ResumeThread(h);
+#endif
 }
 
 u64 g_tls_page = 0;
@@ -751,23 +795,34 @@ static u32 svc_signal_to_address(Ctx* c) {
 // HOST_SLEEP_SPIN_US (default 700 us; whole sleeps below that) after a timer for the rest; longer
 // ones (frame pacing threads, 15-16 ms) keep the timer alone. HOST_SLEEP_SPIN_US=0: timer only
 // (old). The caller has released the guest core.
+// Linux timers are precise to a few microseconds (main.cpp sets the timer slack to 1 ns), so there the clock only takes
+// the last 100 us by default.
 static void sleep_ns(s64 ns) {
     if (ns <= 0) {
-        SwitchToThread();
+        os::yield();
         return;
     }
+#ifdef _WIN32
+    constexpr s64 DefaultSpin = 700'000;
+#else
+    constexpr s64 DefaultSpin = 100'000;
+#endif
     static const s64 spin = [] {
         const char* v = std::getenv("HOST_SLEEP_SPIN_US");
-        return v ? std::strtoll(v, nullptr, 10) * 1000 : 700'000LL;
+        return v ? std::strtoll(v, nullptr, 10) * 1000 : DefaultSpin;
     }();
     const u64 deadline = host_ns() + static_cast<u64>(ns);
     const bool tail = ns < 4'000'000;
     if (!tail || ns > spin) {
+#ifdef _WIN32
         thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         LARGE_INTEGER due;
         due.QuadPart = -std::max<s64>(1, (tail ? ns - spin : ns) / 100);
         SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
         WaitForSingleObject(timer, INFINITE);
+#else
+        os::timer_sleep_ns(tail ? ns - spin : ns);
+#endif
     }
     while (tail && host_ns() < deadline) {
         for (int i = 0; i < 32; i++) _mm_pause();
@@ -840,6 +895,10 @@ void dump_threads() {
         const int k = t->wait_kind;
         std::string where;
         if (k == 0 && t->host_thread) {
+#ifndef _WIN32
+            u64 pc = 0;
+            if (os::sample_thread(static_cast<int>(reinterpret_cast<uintptr_t>(t->host_thread)), &pc, 1, 200)) where = host_symbol(pc);
+#else
             HANDLE h = static_cast<HANDLE>(t->host_thread);
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL;
@@ -849,6 +908,7 @@ void dump_threads() {
                 // (named after it runs again: the lookup takes the heap and loader locks, which it may hold)
                 if (got) where = host_symbol(ctx.Rip);
             }
+#endif
         }
         // What a waiter waits on: the arbiter word, or the mutex word (its owner's thread handle, bit 30 = has waiters;
         // for a condition variable wait, the mutex it takes back).
@@ -913,7 +973,12 @@ void svc(Ctx* c, u32 imm) {
     case 0x07:  // ExitProcess
         LOG("svcExitProcess");
         gamepads::stop_vibration();
+#ifdef _WIN32
         ExitProcess(0);
+#else
+        std::fflush(nullptr);
+        _exit(0);
+#endif
     case 0x08: {  // CreateThread
         auto t = std::make_shared<KThread>();
         t->id = g_next_thread_id++;
@@ -958,7 +1023,11 @@ void svc(Ctx* c, u32 imm) {
                 }
             }
         }
+#ifdef _WIN32
         ExitThread(0);
+#else
+        pthread_exit(nullptr);
+#endif
     }
     case 0x0B: {  // SleepThread (0, -1, -2: yield)
         const s64 ns = static_cast<s64>(c->x[0]);

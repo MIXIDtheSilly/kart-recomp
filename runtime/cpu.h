@@ -5,13 +5,42 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <intrin.h>
 #include <limits>
 #include <type_traits>
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#include <x86intrin.h>
+#endif
+
+#ifndef _WIN32
+// Linux (clang): the MSVC intrinsics this file and the generated code use, from GCC-style builtins.
+static inline uint64_t _byteswap_uint64(uint64_t v) { return __builtin_bswap64(v); }
+static inline unsigned long _byteswap_ulong(unsigned long v) { return __builtin_bswap32(static_cast<uint32_t>(v)); }
+static inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t* hi) {
+    const unsigned __int128 r = static_cast<unsigned __int128>(a) * b;
+    *hi = static_cast<uint64_t>(r >> 64);
+    return static_cast<uint64_t>(r);
+}
+static inline uint64_t __umulh(uint64_t a, uint64_t b) { return static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) >> 64); }
+static inline int64_t __mulh(int64_t a, int64_t b) { return static_cast<int64_t>((static_cast<__int128>(a) * b) >> 64); }
+static inline unsigned short __popcnt16(unsigned short v) { return static_cast<unsigned short>(__builtin_popcount(v)); }
+static inline void rt_cpuid(int r[4], int leaf) {
+    unsigned a, b, c, d;
+    __cpuid_count(leaf, 0, a, b, c, d);
+    r[0] = static_cast<int>(a), r[1] = static_cast<int>(b), r[2] = static_cast<int>(c), r[3] = static_cast<int>(d);
+}
+#ifndef __forceinline
+#define __forceinline inline __attribute__((always_inline))
+#endif
+#else
+static inline void rt_cpuid(int r[4], int leaf) { __cpuid(r, leaf); }
+#endif
 
 #ifndef _MSC_VER
 // clang for MinGW (the llvm-mingw toolchain, BUILD_CC=mingw) has these MSVC intrinsics only as builtins with
-// -fms-extensions (and -mcx16 for the 128-bit one); _udiv128 not at all.
+// -fms-extensions (and -mcx16 for the 128-bit one); _udiv128 not at all. On Linux none of them.
 #if !__has_builtin(_InterlockedCompareExchange128)
 static inline unsigned char _InterlockedCompareExchange128(volatile int64_t* dst, int64_t hi, int64_t lo, int64_t* cmp) {
     unsigned char ok;
@@ -22,7 +51,7 @@ static inline unsigned char _InterlockedCompareExchange128(volatile int64_t* dst
     return ok;
 }
 #endif
-#if !__has_builtin(__lzcnt)
+#if !__has_builtin(__lzcnt) && defined(_WIN32)
 static inline unsigned __lzcnt(unsigned v) { return v ? static_cast<unsigned>(__builtin_clz(v)) : 32u; }
 #endif
 #if !__has_builtin(_udiv128)
@@ -189,7 +218,7 @@ template <class C> RT_INLINE void set_nzcv(C* c, unsigned v) { c->n = (v >> 3) &
 template <class C> RT_INLINE uint64_t get_nzcv(C* c) { return static_cast<uint64_t>(c->n << 3 | c->z << 2 | c->cf << 1 | c->vf) << 28; }
 
 template <class C> RT_INLINE uint64_t adds64(C* c, uint64_t a, uint64_t b, unsigned ci) {
-    uint64_t r;
+    unsigned long long r;   // (uint64_t is unsigned long on Linux)
     c->cf = _addcarry_u64(static_cast<unsigned char>(ci), a, b, &r);
     c->n = r >> 63; c->z = r == 0;
     c->vf = ((~(a ^ b) & (a ^ r)) >> 63) & 1;
@@ -207,8 +236,13 @@ template <class C> RT_INLINE uint32_t logic_flags32(C* c, uint32_t r) { c->n = r
 
 // ------------------------------------------------------------------ integer helpers
 
+#ifdef _WIN32
 RT_INLINE uint64_t rotr64(uint64_t v, unsigned s) { return _rotr64(v, static_cast<int>(s)); }
 RT_INLINE uint32_t rotr32(uint32_t v, unsigned s) { return _rotr(v, static_cast<int>(s)); }
+#else
+RT_INLINE uint64_t rotr64(uint64_t v, unsigned s) { return __builtin_rotateright64(v, s); }
+RT_INLINE uint32_t rotr32(uint32_t v, unsigned s) { return __builtin_rotateright32(v, s); }
+#endif
 RT_INLINE uint64_t udiv64(uint64_t a, uint64_t b) { return b ? a / b : 0; }
 RT_INLINE uint32_t udiv32(uint32_t a, uint32_t b) { return b ? a / b : 0; }
 RT_INLINE uint64_t sdiv64(uint64_t a, uint64_t b) {
@@ -233,8 +267,13 @@ RT_INLINE uint64_t rbit64(uint64_t v) {
     return bswap64(v);
 }
 RT_INLINE uint32_t rbit32(uint32_t v) { return static_cast<uint32_t>(rbit64(v) >> 32); }
+#ifdef _WIN32
 RT_INLINE uint64_t clz64(uint64_t v) { return v ? __lzcnt64(v) : 64; }
 RT_INLINE uint32_t clz32(uint32_t v) { return v ? __lzcnt(v) : 32; }
+#else   // (clang's __lzcnt needs an LZCNT target; any x86-64 has BSR)
+RT_INLINE uint64_t clz64(uint64_t v) { return v ? static_cast<uint64_t>(__builtin_clzll(v)) : 64; }
+RT_INLINE uint32_t clz32(uint32_t v) { return v ? static_cast<uint32_t>(__builtin_clz(v)) : 32; }
+#endif
 // CLS counts bits after the sign bit that equal it: clz of (x ^ x<<1) over the top N-1 bits.
 RT_INLINE uint64_t cls64(uint64_t v) { return clz64((v ^ (v << 1)) | 1); }
 RT_INLINE uint32_t cls32(uint32_t v) { return clz32((v ^ (v << 1)) | 1); }
@@ -309,7 +348,7 @@ static inline unsigned long long rt_xgetbv0() { return _xgetbv(0); }
 #endif
 inline const bool g_host_fma3 = [] {
     int r[4];
-    __cpuid(r, 1);
+    rt_cpuid(r, 1);
     const bool cpu = (r[2] >> 12 & 1) && (r[2] >> 27 & 1) && (r[2] >> 28 & 1);  // FMA, OSXSAVE, AVX
     return cpu && (rt_xgetbv0() & 6) == 6;                                      // the OS saves the ymm state
 }();

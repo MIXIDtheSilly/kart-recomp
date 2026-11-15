@@ -69,6 +69,10 @@ std::vector<PhysRun> phys_alloc(u64 size);
 void phys_free(const std::vector<PhysRun>& runs);
 u64 phys_free_bytes();  // what is left of the pool
 u8* phys_ptr(u64 phys);
+// Memory the GPU imports (VK_EXT_external_memory_host; host: a guest address or a pointer into the pool, phys_ptr). On Linux
+// the driver pins the pages it found, so freed memory under an import is not given back to the system until unpin.
+std::vector<PhysRun> pin(const void* host, u64 size);
+void unpin(const std::vector<PhysRun>& runs);
 u64 phys_pool_bytes();  // size of the whole pool
 
 void set_perm(u64 addr, u64 size, u32 perm);

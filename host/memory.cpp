@@ -1,12 +1,25 @@
 #include "memory.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include <fstream>
+#include <string>
+#endif
+
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 
+#ifdef _WIN32
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -18,6 +31,7 @@
 #endif
 #ifndef MEM_PRESERVE_PLACEHOLDER
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
 #endif
 
 uintptr_t g_membase = 0;
@@ -34,7 +48,21 @@ namespace {
 // space around it and replaces it with a view of the section; unmapping puts the placeholder back
 // and merges it with the free space on both sides. Every entry of g_mappings is one such view, so
 // the free space between two views is always one placeholder.
+// Linux: the pool is a memfd, the backing view one shared mapping of it, and the guest view a PROT_NONE reservation
+// in which each mapping is a MAP_FIXED shared mapping of the memfd (replacing that part of the reservation, which an
+// unmap puts back). Linux unmaps and remaps parts of a mapping in place, so there are no placeholders to split or merge.
 
+constexpr u64 ViewAlign = 2ull << 20;  // guest address 0 starts a 2 MiB block of the host's
+u64 g_phys_size = 0;
+u8* g_backing = nullptr;
+u8* g_reserve = nullptr;  // the guest view's reservation: the address space plus ViewAlign
+u8* g_reserve_end = nullptr;
+// One bit per pool page that has held guest data (freed without being discarded): cleared on reuse.
+std::unique_ptr<std::atomic<u64>[]> g_freed;
+
+u8* view_ptr(u64 addr) { return reinterpret_cast<u8*>(g_membase) + addr; }
+
+#ifdef _WIN32
 using VirtualAlloc2Fn = void*(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, ULONG, void*, ULONG);
 using MapViewOfFile3Fn = void*(WINAPI*)(HANDLE, HANDLE, void*, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
 using UnmapViewOfFile2Fn = BOOL(WINAPI*)(HANDLE, void*, ULONG);
@@ -42,14 +70,7 @@ VirtualAlloc2Fn g_VirtualAlloc2 = nullptr;
 MapViewOfFile3Fn g_MapViewOfFile3 = nullptr;
 UnmapViewOfFile2Fn g_UnmapViewOfFile2 = nullptr;
 
-constexpr u64 ViewAlign = 2ull << 20;  // guest address 0 starts a 2 MiB block of the host's
-u64 g_phys_size = 0;
 HANDLE g_section = nullptr;
-u8* g_backing = nullptr;
-u8* g_reserve = nullptr;  // the guest view's reservation: the address space plus ViewAlign
-u8* g_reserve_end = nullptr;
-// One bit per pool page that has held guest data (freed without being discarded): cleared on reuse.
-std::unique_ptr<std::atomic<u64>[]> g_freed;
 
 void load_memory_api() {
     const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
@@ -83,8 +104,6 @@ void reserve_view() {
     g_membase = (reinterpret_cast<uintptr_t>(g_reserve) + ViewAlign - 1) & ~(ViewAlign - 1);
 }
 
-u8* view_ptr(u64 addr) { return reinterpret_cast<u8*>(g_membase) + addr; }
-
 void place_view(u64 addr, u64 phys, u64 size) {
     if (!g_MapViewOfFile3(g_section, GetCurrentProcess(), view_ptr(addr), phys, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                           nullptr, 0))
@@ -102,9 +121,61 @@ void unplace_view(u64 addr) {
         fatal("mem: unmapping guest %#llx failed (error %lu)", addr, GetLastError());
 }
 
+#else  // Linux
+
+int g_pool_fd = -1;
+
+bool create_pool(u64 size) {
+    g_pool_fd = memfd_create("kart guest memory", MFD_CLOEXEC);
+    if (g_pool_fd < 0) fatal("cannot create the guest memory pool (memfd_create: %s)", std::strerror(errno));
+    if (ftruncate(g_pool_fd, static_cast<off_t>(size)) == 0) {
+        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, g_pool_fd, 0);
+        if (p != MAP_FAILED) {
+            g_backing = static_cast<u8*>(p);
+            return true;
+        }
+    }
+    close(g_pool_fd);
+    g_pool_fd = -1;
+    return false;
+}
+
+void reserve_view() {
+    const u64 size = AddressSpaceSize + ViewAlign;
+    void* p = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) fatal("cannot reserve %llu GiB of address space for guest memory (%s)", size >> 30, std::strerror(errno));
+    g_reserve = static_cast<u8*>(p);
+    g_reserve_end = g_reserve + size;
+    g_membase = (reinterpret_cast<uintptr_t>(g_reserve) + ViewAlign - 1) & ~(ViewAlign - 1);
+}
+
+void place_view(u64 addr, u64 phys, u64 size) {
+    if (mmap(view_ptr(addr), size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_pool_fd, static_cast<off_t>(phys)) == MAP_FAILED)
+        fatal("mem: mapping guest %#llx (+%#llx) failed (%s%s)", addr, size, std::strerror(errno),
+              errno == ENOMEM ? "; raise vm.max_map_count" : "");
+}
+
+// [addr, addr + size) back to the reservation.
+void unplace_range(u64 addr, u64 size) {
+    if (mmap(view_ptr(addr), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED)
+        fatal("mem: unmapping guest %#llx (+%#llx) failed (%s)", addr, size, std::strerror(errno));
+}
+#endif
+
+// Imports of guest memory by the GPU (VK_EXT_external_memory_host), counted per 64 KiB of the pool (under g_lock). On
+// Linux the driver pins the pages an import found: a hole punched under it drops them from the memfd, the CPU then faults
+// in new zero pages while the GPU goes on reading the old ones, so reused memory (vertices, indices, constants) read
+// stale on the GPU: stretched and broken models. Freed memory there is kept until the last import over it goes.
+constexpr u64 PinShift = 16;
+std::unique_ptr<u16[]> g_pins;
+
 void mark_freed(u64 phys, u64 size) {
     for (u64 page = phys / PageSize, last = (phys + size) / PageSize; page < last; ++page)
         g_freed[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_relaxed);
+}
+void unmark_freed(u64 phys, u64 size) {
+    for (u64 page = phys / PageSize, last = (phys + size) / PageSize; page < last; ++page)
+        g_freed[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
 }
 
 // Zeroes the pages of a run that held guest data; the others were never written or were discarded
@@ -142,7 +213,23 @@ struct Mapping {
 std::recursive_mutex g_lock;
 std::map<u64, Block> g_blocks;      // covers [0, AddressSpaceSize) without gaps
 std::map<u64, Mapping> g_mappings;  // guest address -> physical run (only mapped ranges)
+u64 g_discarded = 0;
 std::map<u64, u64> g_phys_free;     // free physical runs: offset -> size
+u64 g_phys_used = 0, g_phys_top = 0;  // bytes handed out now; the highest offset ever handed out (statistics)
+// Every 30 s at most, from the allocator: how much of the pool the guest holds (HOST_MEM_STATS=1).
+void phys_stats() {
+    static const bool on = [] {
+        const char* v = std::getenv("HOST_MEM_STATS");
+        return v && v[0] == '1';
+    }();
+    if (!on) return;
+    static auto at = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - at < std::chrono::seconds(30)) return;
+    at = now;
+    LOG("mem: guest physical memory in use %llu MB, highest offset %llu MB, %llu MB discarded so far", g_phys_used >> 20,
+        g_phys_top >> 20, g_discarded >> 20);
+}
 u64 g_heap_size = 0;
 
 // Make `addr` the start of a block.
@@ -190,10 +277,12 @@ void split_mapping(u64 addr) {
     if (it->first == addr || addr >= it->first + it->second.size) return;
     const u64 head = addr - it->first;
     Mapping tail{it->second.size - head, it->second.phys + head, it->second.owned};
+#ifdef _WIN32
     unplace_view(it->first);
     split_placeholder(view_ptr(it->first), head);
     place_view(it->first, it->second.phys, head);
     place_view(addr, tail.phys, tail.size);
+#endif
     it->second.size = head;
     g_mappings.emplace(addr, tail);
 }
@@ -212,19 +301,25 @@ std::pair<u8*, u8*> free_space(std::map<u64, Mapping>::iterator next, std::map<u
 
 // Maps a view of [phys, phys + size) at guest `addr` (nothing mapped there).
 void map_one(u64 addr, u64 phys, u64 size) {
+#ifdef _WIN32
     const auto next = g_mappings.lower_bound(addr);
     const auto [lo, hi] = free_space(next, next);
     if (lo != view_ptr(addr) || hi != view_ptr(addr + size)) split_placeholder(view_ptr(addr), size);
+#endif
     place_view(addr, phys, size);
 }
 
 // Unmaps one view and merges its placeholder with the free space around it.
 void unmap_one(std::map<u64, Mapping>::iterator it) {
+#ifdef _WIN32
     unplace_view(it->first);
     const auto [lo, hi] = free_space(std::next(it), it);
     if (lo == view_ptr(it->first) && hi == view_ptr(it->first + it->second.size)) return;
     if (!VirtualFree(lo, hi - lo, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
         fatal("mem: merging placeholders at %p (+%#llx) failed (error %lu)", lo, static_cast<u64>(hi - lo), GetLastError());
+#else
+    unplace_range(it->first, it->second.size);
+#endif
 }
 
 // Freed physical pages leave RAM: until the pool hands them out again only the backing view maps
@@ -233,7 +328,15 @@ void unmap_one(std::map<u64, Mapping>::iterator it) {
 // reused either: clearing a reused 4 MiB sparse block made all of it resident for a 256 KiB write.
 // Returns false when they were kept (HOST_KEEP_FREED=1, or the discard failed): then they are
 // marked freed and cleared on reuse. HOST_KEEP_FREED=1 restores that.
-u64 g_discarded = 0;
+// Linux: the pool's pages go with a hole punched in the memfd, and read zero again. Not under the GPU's imports (pinned,
+// see pin): free_run keeps those until unpin.
+bool discard_pages(u64 phys, u64 size) {
+#ifdef _WIN32
+    return DiscardVirtualMemory(g_backing + phys, size) == 0;
+#else
+    return fallocate(g_pool_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(phys), static_cast<off_t>(size)) == 0;
+#endif
+}
 bool discard_run(u64 phys, u64 size) {
     // Checked once on the pool's last page (the allocator hands it out last): written, discarded,
     // then it must read zero.
@@ -241,20 +344,83 @@ bool discard_run(u64 phys, u64 size) {
         if (const char* v = std::getenv("HOST_KEEP_FREED"); v && v[0] == '1') return true;
         u8* const page = g_backing + g_phys_size - PageSize;
         std::memset(page, 0xAB, PageSize);
-        bool zero = DiscardVirtualMemory(page, PageSize) == 0;
+        bool zero = discard_pages(g_phys_size - PageSize, PageSize);
         for (u64 i = 0; zero && i < PageSize; ++i) zero = page[i] == 0;
+        if (!zero) std::memset(page, 0, PageSize);   // (the allocator expects never-used pages to read zero)
         if (!zero) LOG("mem: discarded pages do not read zero; freed guest memory stays resident");
         return !zero;
     }();
-    if (keep || DiscardVirtualMemory(g_backing + phys, size) != 0) return false;
+    if (keep || !discard_pages(phys, size)) return false;
     const u64 before = g_discarded;
     g_discarded += size;
     if ((before >> 30) != (g_discarded >> 30)) LOG("mem: %llu MiB of freed guest memory returned to the system so far", g_discarded >> 20);
     return true;
 }
 
+#ifndef _WIN32
+// Linux: freed memory stays in RAM, cleared on reuse, unless HOST_DISCARD_FREED=1. Then it leaves RAM a while after the
+// guest frees it (HOST_DISCARD_DELAY_MS, 3000), not at once: the renderer runs behind the game and still reads some
+// memory the game has just freed (which, not found yet). Windows' DiscardVirtualMemory leaves the old content until RAM
+// runs short, but a hole punched at once read zero there, and the GPU hung within minutes in the title screen's demo
+// (NVRM Xid 109, CTX SWITCH TIMEOUT). Pages under the GPU's imports wait for the last import over them to go (unpin),
+// as the GPU would go on reading the pinned old pages. It saved next to nothing (the title demo: 7.4 GB of guest memory
+// after 10 minutes either way): the game keeps ~10 GB allocated and reuses what it frees.
+bool discard_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("HOST_DISCARD_FREED");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+struct DueDiscard {
+    u64 lo, hi;
+    std::chrono::steady_clock::time_point at;
+};
+std::deque<DueDiscard> g_due;   // (under g_lock)
+
+// The free, unpinned parts of [lo, hi) out of RAM: they read zero afterwards, so need no clearing on reuse.
+void discard_free_in(u64 lo, u64 hi) {
+    auto it = g_phys_free.upper_bound(lo);
+    if (it != g_phys_free.begin()) --it;
+    for (; it != g_phys_free.end() && it->first < hi; ++it) {
+        for (u64 a = std::max(lo, it->first), b = std::min(hi, it->first + it->second); a < b;) {
+            const bool pinned = g_pins[a >> PinShift] != 0;
+            u64 n = std::min(b, ((a >> PinShift) + 1) << PinShift);
+            while (n < b && (g_pins[n >> PinShift] != 0) == pinned) n = std::min(b, n + (u64{1} << PinShift));
+            if (!pinned && discard_run(a, n - a)) unmark_freed(a, n - a);
+            a = n;
+        }
+    }
+}
+
+void discard_later(u64 lo, u64 hi) {
+    if (discard_on()) g_due.push_back({lo, hi, std::chrono::steady_clock::now()});
+}
+
+// The discards that are due (from the allocator, which the game calls often).
+void discard_due() {
+    static const auto delay = std::chrono::milliseconds([] {
+        const char* v = std::getenv("HOST_DISCARD_DELAY_MS");
+        return v && *v ? std::strtoll(v, nullptr, 0) : 3000;
+    }());
+    const auto now = std::chrono::steady_clock::now();
+    while (!g_due.empty() && now - g_due.front().at >= delay) {
+        const DueDiscard d = g_due.front();
+        g_due.pop_front();
+        discard_free_in(d.lo, d.hi);
+    }
+}
+#endif
+
 void free_run(u64 phys, u64 size) {
+    g_phys_used -= size;
+#ifdef _WIN32
     if (!discard_run(phys, size)) mark_freed(phys, size);
+#else
+    mark_freed(phys, size);   // (cleared on reuse, unless discarded first)
+    discard_due();
+    discard_later(phys, phys + size);   // (discard_free_in checks it is still free then)
+#endif
     auto next = g_phys_free.lower_bound(phys);
     if (next != g_phys_free.begin()) {
         auto prev = std::prev(next);
@@ -310,8 +476,31 @@ void init() {
     // Intel handheld took 24 GiB and then every image of the first frame failed, out of host memory, and the
     // device was lost). HOST_PHYS_HEADROOM_GIB sets that reserve (8).
     std::vector<u64> sizes{24, 20, 16, 14, 12};
+#ifdef _WIN32
     MEMORYSTATUSEX ms{sizeof ms};
     GlobalMemoryStatusEx(&ms);
+#else
+    // Linux commits nothing up front (the pool's pages are taken as they are touched): what bounds it is RAM + swap.
+    struct {
+        u64 ullTotalPhys = 0, ullTotalPageFile = 0, ullAvailPageFile = 0;
+    } ms;
+    {
+        std::ifstream mi("/proc/meminfo");
+        u64 swap = 0, avail = 0, swap_free = 0;
+        for (std::string key; mi >> key;) {
+            u64 kb = 0;
+            mi >> kb;
+            if (key == "MemTotal:") ms.ullTotalPhys = kb << 10;
+            else if (key == "SwapTotal:") swap = kb << 10;
+            else if (key == "MemAvailable:") avail = kb << 10;
+            else if (key == "SwapFree:") swap_free = kb << 10;
+            mi.ignore(64, '\n');
+        }
+        ms.ullTotalPageFile = ms.ullTotalPhys + swap;
+        ms.ullAvailPageFile = ms.ullTotalPageFile;   // (not what is free now: the pool is only used as it is touched)
+        (void)avail, (void)swap_free;
+    }
+#endif
     u64 headroom = 8;
     if (const char* v = std::getenv("HOST_PHYS_HEADROOM_GIB")) headroom = std::strtoull(v, nullptr, 0);
     LOG("memory: %llu MB RAM, %llu MB of %llu MB commit (RAM + page file) free; %llu GiB kept for the rest", ms.ullTotalPhys >> 20,
@@ -322,20 +511,30 @@ void init() {
             LOG("guest memory pool: %llu GiB would leave less than %llu GiB of commit", sizes.front(), headroom);
             sizes.erase(sizes.begin());
         }
+#ifdef _WIN32
     load_memory_api();
+#endif
     for (const u64 gib : sizes) {
         g_phys_size = gib << 30;
         if (create_pool(g_phys_size)) break;
         g_phys_size = 0;
         LOG("guest memory pool: %llu GiB doesn't fit in RAM + page file", gib);
     }
+#ifdef _WIN32
     if (!g_phys_size)
         fatal("cannot reserve guest memory: even %llu GiB doesn't fit in RAM + page file. Free memory or "
               "enlarge the page file (System > About > Advanced system settings > Performance > Virtual memory).",
               sizes.back());
+#else
+    if (!g_phys_size) fatal("cannot create guest memory: even %llu GiB failed (%s)", sizes.back(), std::strerror(errno));
+#endif
     LOG("guest memory pool: %llu GiB", g_phys_size >> 30);
+#ifndef _WIN32
+    LOG("mem: freed guest memory %s", discard_on() ? "leaves RAM 3 s after it is freed (HOST_DISCARD_FREED=1)" : "stays in RAM, cleared on reuse");
+#endif
     reserve_view();
     g_freed = std::make_unique<std::atomic<u64>[]>(g_phys_size / PageSize / 64);
+    g_pins = std::make_unique<u16[]>((g_phys_size >> PinShift) + 1);
     g_phys_free.emplace(0, g_phys_size);
     g_blocks.emplace(0, Block{AddressSpaceSize, Free, None, 0});
 }
@@ -343,6 +542,9 @@ void init() {
 std::vector<PhysRun> phys_alloc(u64 size) {
     std::scoped_lock lk{g_lock};
     std::vector<PhysRun> runs;
+#ifndef _WIN32
+    discard_due();
+#endif
     // First fit in one piece if possible, otherwise from the front in several.
     auto it = g_phys_free.begin();
     for (; it != g_phys_free.end() && it->second < size; ++it) {}
@@ -357,13 +559,18 @@ std::vector<PhysRun> phys_alloc(u64 size) {
         left -= take;
     }
     if (left) fatal("out of guest physical memory allocating %#llx bytes (raise HOST_PHYS_GIB)", size);
-    for (const PhysRun& r : runs) clear_freed(r.phys, r.size);
+    for (const PhysRun& r : runs) {
+        clear_freed(r.phys, r.size);
+        g_phys_used += r.size, g_phys_top = std::max(g_phys_top, r.phys + r.size);
+    }
+    phys_stats();
     return runs;
 }
 
 void phys_free(const std::vector<PhysRun>& runs) {
     std::scoped_lock lk{g_lock};
     for (const PhysRun& r : runs) free_run(r.phys, r.size);
+    phys_stats();
 }
 
 u64 phys_free_bytes() {
@@ -371,6 +578,32 @@ u64 phys_free_bytes() {
     u64 total = 0;
     for (const auto& [off, size] : g_phys_free) total += size;
     return total;
+}
+
+std::vector<PhysRun> pin(const void* host, u64 size) {
+    std::scoped_lock lk{g_lock};
+    const u8* const p = static_cast<const u8*>(host);
+    std::vector<PhysRun> runs;
+    if (p >= g_backing && p < g_backing + g_phys_size) runs.push_back({static_cast<u64>(p - g_backing), std::min<u64>(size, g_backing + g_phys_size - p)});
+    else runs = phys_runs(static_cast<u64>(p - reinterpret_cast<const u8*>(g_membase)), size);
+    for (const PhysRun& r : runs)
+        for (u64 g = r.phys >> PinShift, last = (r.phys + r.size - 1) >> PinShift; g <= last; ++g) ++g_pins[g];
+    return runs;
+}
+
+void unpin(const std::vector<PhysRun>& runs) {
+    std::scoped_lock lk{g_lock};
+    std::vector<std::pair<u64, u64>> open;   // granule spans no import holds now
+    for (const PhysRun& r : runs)
+        for (u64 g = r.phys >> PinShift, last = (r.phys + r.size - 1) >> PinShift; g <= last; ++g) {
+            if (!g_pins[g] || --g_pins[g]) continue;
+            if (!open.empty() && open.back().second == g) open.back().second = g + 1;
+            else open.emplace_back(g, g + 1);
+        }
+#ifndef _WIN32
+    // The free memory there can leave RAM now (also the never-used pages the import made resident), after the delay.
+    for (const auto& [g0, g1] : open) discard_later(g0 << PinShift, std::min(g1 << PinShift, g_phys_size));
+#endif
 }
 
 u8* phys_ptr(u64 phys) { return g_backing + phys; }
@@ -472,6 +705,17 @@ bool wait_mapped(u64 addr) {
 
 void protect_view(u64 addr, u64 size, bool read, bool write) {
     std::scoped_lock lk{g_lock};
+#ifndef _WIN32
+    const int prot = write ? PROT_READ | PROT_WRITE : read ? PROT_READ : PROT_NONE;
+    auto m = g_mappings.upper_bound(addr);
+    if (m != g_mappings.begin()) --m;
+    for (; m != g_mappings.end() && m->first < addr + size; ++m) {
+        const u64 lo = std::max(addr, m->first), hi = std::min(addr + size, m->first + m->second.size);
+        if (lo < hi && mprotect(view_ptr(lo), hi - lo, prot) != 0)
+            LOG("mem: protecting guest %#llx (+%#llx) failed (%s)", lo, hi - lo, std::strerror(errno));
+    }
+    return;
+#else
     const DWORD protection = write ? PAGE_READWRITE : read ? PAGE_READONLY : PAGE_NOACCESS;
     // One call per view: VirtualProtect doesn't cross views.
     auto it = g_mappings.upper_bound(addr);
@@ -482,6 +726,7 @@ void protect_view(u64 addr, u64 size, bool read, bool write) {
         if (lo < hi && !VirtualProtect(view_ptr(lo), hi - lo, protection, &old))
             LOG("mem: protecting guest %#llx (+%#llx) failed (error %lu)", lo, hi - lo, GetLastError());
     }
+#endif
 }
 
 // Permissions are bookkeeping only: host code reads guest memory through the view whatever the

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../../common.h"
+#include "../../memory.h"
 #include "vkfn.h"
 #include "vma.h"
 
@@ -87,6 +88,7 @@ struct Imported {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceAddress gpu = 0;
+    std::vector<mem::PhysRun> pins;   // the pool memory it holds (mem::pin)
 };
 bool import_guest(u64 addr, u64 size, Imported& out, const char** why = nullptr);
 // Host memory [host, host + size) (aligned to the import alignment) as one buffer; out.addr is left 0.

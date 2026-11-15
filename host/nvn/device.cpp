@@ -1,5 +1,4 @@
 // Native NVN: device objects and queries (nvnDevice*, nvnDeviceGetInteger).
-#include <intrin.h>
 
 #include "nvn_int.h"
 

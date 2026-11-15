@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The Windows parts of audio_core/host.h.
+// The system parts of audio_core/host.h.
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "audio_core/host.h"
+#include "os.h"
 
 namespace AudioCore {
 
-void SetThreadName(const char* name) {
-    const std::wstring wide(name, name + std::strlen(name));
-    SetThreadDescription(GetCurrentThread(), wide.c_str());
-}
+void SetThreadName(const char* name) { os::set_thread_name(name); }
 
 void SetThreadPriority(ThreadPriority priority) {
+#ifndef _WIN32
+    os::set_thread_priority(priority == ThreadPriority::Low ? os::Priority::BelowNormal
+                            : priority == ThreadPriority::Normal ? os::Priority::Normal : os::Priority::AboveNormal);
+#else
     int value = THREAD_PRIORITY_NORMAL;
     switch (priority) {
     case ThreadPriority::Low: value = THREAD_PRIORITY_BELOW_NORMAL; break;
@@ -25,6 +29,7 @@ void SetThreadPriority(ThreadPriority priority) {
     case ThreadPriority::Critical: value = THREAD_PRIORITY_TIME_CRITICAL; break;
     }
     ::SetThreadPriority(GetCurrentThread(), value);
+#endif
 }
 
 f32 OutputVolume() { return 1.0f; }

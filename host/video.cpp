@@ -1,6 +1,9 @@
 ﻿// The game window: created by init, its message loop run by run_window_loop on the main thread. The
 // renderer (nvn/vk) puts its swapchain on it. Also the performance overlay in its corner.
+#ifdef _WIN32   // (Linux: video_sdl.cpp)
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <psapi.h>
 
 #include <algorithm>
@@ -12,6 +15,7 @@
 #include <vector>
 
 #include "memory.h"
+#include "os.h"
 #include "services/gamepads.h"
 #include "video.h"
 
@@ -40,8 +44,8 @@ constexpr int OverlayW = 230, OverlayH = 76, OverlayMargin = 8;
 std::atomic<u64> g_double_counted_bytes{0};
 void start_double_count() {
     std::thread([] {
-        SetThreadDescription(GetCurrentThread(), L"overlay RAM count");
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        os::set_thread_name("overlay RAM count");
+        os::set_thread_priority(os::Priority::Lowest);
         std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(65536);
         for (;; Sleep(10000)) {
             if (!g_overlay_on) continue;
@@ -233,3 +237,4 @@ void run_window_loop() {
 }
 
 }  // namespace video
+#endif  // _WIN32

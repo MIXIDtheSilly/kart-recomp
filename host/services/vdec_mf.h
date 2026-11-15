@@ -1,6 +1,7 @@
 // The video decoder behind nn::codec::video (host/services/gsv.cpp, VideoSession): Windows' Media Foundation
 // decodes the elementary stream the game demuxed (its movies are VP9, which needs the VP9 Video Extensions;
-// without a decoder the frames come out black and the movies still run their course).
+// without a decoder the frames come out black and the movies still run their course). On Linux libvpx does
+// (vdec_vpx.cpp), loaded when the first movie starts.
 #pragma once
 #include <memory>
 #include <span>

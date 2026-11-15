@@ -1,7 +1,9 @@
 // audren: the audio renderer (audio_core/, adapted from Eden) runs the game's voices, mixes and
 // effects and plays the result through WASAPI, paced by the output stream. This file is its host
 // side: guest memory, the clock, logging, and the rendered event.
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
