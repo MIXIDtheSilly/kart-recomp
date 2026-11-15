@@ -77,6 +77,12 @@ struct Syncpt : Service {
         u32 syncpoint = 0;
         std::atomic<bool> pending{false};
         sync::Handle handle = 0;
+        // Which request of the slot an action belongs to (under Shared::m). sync::increment runs the actions due after
+        // letting go of its lock, and the client may meanwhile see the value reached (TryWait), take the frame and arm the
+        // slot for the next one: cancel misses the action already taken out, and it signalled the new request's event
+        // early. The movie module then found the next image's value not reached and aborted (subsdk0+0x4540 / 0x4690,
+        // svcBreak after IApplicationFunctions::22, mid-movie). A stale action now leaves the event alone.
+        u64 gen = 0;
     };
     struct Shared {
         std::mutex m;
@@ -105,22 +111,37 @@ struct Syncpt : Service {
             }
             auto& req = requests[slot];
             cancel(req);
-            ev->clear();
+            u64 gen;
+            {
+                std::scoped_lock lk{shared->m};
+                gen = ++req.gen;
+                ev->clear();
+            }
             req.syncpoint = id;
             req.pending = true;
             TIMELINE("syncwait slot=%u fence=%u:%u now=%u", slot, id, value, sync_value(id));
-            req.handle = on_sync(id, value, [sh = shared, &req, ev, slot, id, value] {
+            req.handle = on_sync(id, value, [sh = shared, &req, ev, slot, id, value, gen] {
                 TIMELINE("syncdone slot=%u fence=%u:%u", slot, id, value);
                 std::scoped_lock lk{sh->m};
-                if (!sh->alive) return;
+                if (!sh->alive || req.gen != gen) return;
                 req.pending = false;
                 ev->signal();
             });
         });
-        on(202, [this](Request& r) {  // cancel: always signals (the SDK waits on it next)
+        // Cancel: the request goes and the event is cleared, not signalled (as nvhost's ClearEventWait on the Switch).
+        // Its only user is the movie module's waiter (subsdk0+0x102e0: 202 then 201 to move a slot to the next image, from
+        // its thread at subsdk0+0x4734 or from the decoder feed's when an image goes into an empty ring; also when the movie
+        // stops). Its thread (subsdk0+0x101c0) takes any signal of the slot's event for "the image is ready" and checks
+        // with nn::gs::TryWaitNativeSync, aborting when the value is not reached (svcBreak after IApplicationFunctions::22,
+        // subsdk0+0x4540 / 0x4690): a signal at the cancel did that whenever the image was not decoded yet, mostly when a
+        // button skipped a movie or left a menu playing one. Nothing waits on the cancel; that thread stops on its own event.
+        on(202, [this](Request& r) {
             const u32 slot = W(r, 2);
+            auto ev = events.get(slot);
             if (auto it = requests.find(slot); it != requests.end()) cancel(it->second);
-            events.get(slot)->signal();
+            std::scoped_lock lk{shared->m};
+            if (auto it = requests.find(slot); it != requests.end()) ++it->second.gen;   // (an action on its way: a no-op)
+            ev->clear();
         });
     }
     ~Syncpt() override {
