@@ -142,14 +142,23 @@ const Imported* window(u64 phys, u64 size) {
 //    submission uses are copied once for it. The game wrote what a submission reads before submitting it (submissions are replayed
 //    after that), and the copy runs on the GPU before the draws of the part that first uses it.
 //  - Written by the GPU (storage a shader writes, buffer copies): back to system memory at first, the import being what the CPU
-//    sees. A pool the CPU cannot access, or a CPU-cached one the CPU has neither published nor asked for (InvalidateMappedRange,
-//    which the game calls before it reads what the GPU wrote) in QuietFrames frames of such writes, then becomes the GPU's own:
-//    reads and writes go to the copy and system memory is left as it was. The first publish or ask takes it back for good
-//    (the copy is written out first, and waited for).
+//    sees. A pool the CPU cannot access then becomes the GPU's own: reads and writes go to the copy and system memory is left as
+//    it was. A CPU-cached one stays in system memory: the game reads some of them without asking (InvalidateMappedRange) first,
+//    as the per-view sky and ambient light it reads back from the GPU each frame, which froze in whichever view's pools became
+//    the GPU's own. HOST_NVN_OWN_CPU_CACHED=1: as before, the GPU's own after QuietFrames frames of GPU writes in which the CPU
+//    neither published nor asked for any of it. The first publish or ask takes such a pool back for good (the copy is written
+//    out first, and waited for).
 //  - Written by the renderer on the CPU (counter reports, copies it could not do on the GPU): system memory for good.
 constexpr u64 MirrorMaxPool = 64ull << 20, MirrorMaxAll = 1500ull << 20, RefreshMaxPool = 256ull << 10;
 constexpr u32 MirrorMaxFlushFrames = 32;
 constexpr u64 QuietFrames = 180;
+bool own_cpu_cached() {
+    static const bool on = [] {
+        const char* e = getenv("HOST_NVN_OWN_CPU_CACHED");
+        return e && *e == '1';
+    }();
+    return on;
+}
 u64 g_mirror_bytes = 0, g_mirrors = 0;
 std::vector<std::pair<u64, u64>> g_flushed;   // (renderer thread, as everything below but g_owned)
 u64 g_sub_id = 1;                             // the submission being recorded
@@ -349,7 +358,7 @@ void pool_gpu_write(u64 addr, u64 n, bool on_cpu) {
         if (!p.gpu_written) p.gpu_written = true, p.quiet_from = frame;
         if (p.pinned || p.shared) return;
         p.where = "system memory (the GPU writes it)";
-        if (!p.promote_queued && (p.flags == 0x21 || (p.flags == 0x24 && frame - p.quiet_from >= QuietFrames))) {
+        if (!p.promote_queued && (p.flags == 0x21 || (own_cpu_cached() && p.flags == 0x24 && frame - p.quiet_from >= QuietFrames))) {
             p.promote_queued = true;
             g_promote.push_back(start);
         }
