@@ -1,12 +1,13 @@
 // hid: input. Player 1 as a Pro Controller (Handheld when the game doesn't take Fullkey), fed by the first gamepad
 // to press a button and the keyboard while the game window has the focus; players 2-4 as Pro Controllers, one more
-// gamepad each (gamepads.cpp: XInput, DualShock 4, DualSense, Switch Pro Controller). The state goes into the shared
-// memory in nn::hid's layout (hid_shared.h).
+// gamepad each (gamepads.cpp: XInput, DualShock 4, DualSense, Switch Pro Controller), which also play the game's
+// vibration. The state goes into the shared memory in nn::hid's layout (hid_shared.h).
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 #include "../ipc.h"
@@ -323,7 +324,16 @@ struct Hid : Service {
         on(120, [](Request&) {});  // SetNpadJoyHoldType
         on(128, [](Request& r) { r.push<u64>(0); });  // GetNpadHandheldActivationMode
         on(203, [](Request& r) { r.push_object(std::make_shared<VibrationDeviceList>()); });
-        on(214, [](Request&) {});  // Switch 2 vibration values
+        on(214, [](Request& r) {  // SendVibrationValues: device handles (type, npad id, motor, 0), a value for each
+            const auto handles = r.read_in(0), values = r.read_in(1);
+            const size_t n = std::min(handles.size() / 4, values.size() / sizeof(gamepads::Vibration));
+            for (size_t i = 0; i < n; i++) {
+                gamepads::Vibration v;
+                std::memcpy(&v, values.data() + i * sizeof v, sizeof v);
+                const u8 npad = handles[i * 4 + 1];
+                gamepads::vibrate(npad == 0x20 ? 0 : npad, handles[i * 4 + 2], v);  // 0x20: handheld, player 1
+            }
+        });
         on(11, [](Request&) {});    // ActivateTouchScreen
         on(1004, [](Request&) {});  // SetTouchScreenResolution
     }

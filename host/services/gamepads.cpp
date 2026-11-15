@@ -3,6 +3,7 @@
 // pad; over Bluetooth, reading the calibration feature report switches them from the short report to the full one.
 // Switch Pro Controller: subcommands switch it to its full report and read its stick calibration (see below).
 // Buttons by position as on the Switch: the bottom face button (Cross, Xbox A) is B, the right one A.
+// Vibration: one thread sends each player's latest motors to its pad.
 #include <windows.h>
 
 #include <Xinput.h>
@@ -13,7 +14,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,7 +56,8 @@ struct Source {
     std::wstring key;
     std::string name;
     State state;
-    std::shared_ptr<PsPad> pad;  // HID pads (player lights)
+    std::shared_ptr<PsPad> pad;  // HID pads (player lights, vibration)
+    int xinput = -1;             // XInput slot
 };
 
 // ------------------------------------------------------------------ XInput
@@ -93,7 +97,7 @@ void read_xinput(std::vector<Source>& out) {
         if (g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) s.buttons |= ZR;
         s.l = radial(g.sThumbLX / 32767.0f, g.sThumbLY / 32767.0f);
         s.r = radial(g.sThumbRX / 32767.0f, g.sThumbRY / 32767.0f);
-        out.push_back({L"xinput:" + std::to_wstring(i), "Xbox pad " + std::to_string(i + 1), s, nullptr});
+        out.push_back({L"xinput:" + std::to_wstring(i), "Xbox pad " + std::to_string(i + 1), s, nullptr, int(i)});
     }
 }
 
@@ -172,18 +176,27 @@ struct PsPad {
     std::wstring path;
     std::string name;
     HANDLE handle = INVALID_HANDLE_VALUE;
+    HANDLE out = INVALID_HANDLE_VALUE;  // overlapped, for output reports: `handle` itself on the Pro Controller
     bool dualsense = false;
-    u32 report_size = 0;
+    u32 report_size = 0, out_size = 0;
     // Switch Pro Controller: the handle is overlapped (replies are waited for with a timeout)
     bool nintendo = false, usb = false;
-    u32 out_size = 0;
     std::atomic<u8> counter{0};
+    std::atomic<bool> ready{false};      // set up (full reports, vibration on): rumble reports can be sent
     std::atomic<int> player{-1};         // the player it joined as (-1: not joined)
     std::atomic<bool> lights_due{true};  // its reader thread sends `player`'s light (show_player sets it)
     StickCal cal[2];
     std::atomic<bool> alive{true};
     std::mutex lock;
     State state;
+    std::array<Vibration, 2> rumble{};  // last sent (the vibration thread's)
+    ULONGLONG rumble_at = 0;
+
+    // Closed only once nothing holds the pad: the vibration thread may still be writing to it.
+    ~PsPad() {
+        if (out != handle && out != INVALID_HANDLE_VALUE) CloseHandle(out);
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    }
 };
 
 std::mutex g_pads_lock;
@@ -211,7 +224,6 @@ void read_reports(std::shared_ptr<PsPad> pad) {
         std::lock_guard lk{pad->lock};
         pad->state = {};
     }
-    CloseHandle(pad->handle);
     pad->alive = false;
 }
 
@@ -222,8 +234,9 @@ void read_reports(std::shared_ptr<PsPad> pad) {
 // with 0x30 switches it to the full report, 0x10 reads its SPI flash (the stick calibration), 0x30 sets the player
 // lights. Over USB the pad first needs the 0x80 commands (handshake, baud rate, handshake, USB only).
 
-// Overlapped read or write that gives up after `ms`: false on error or timeout. Only the pad's reader thread does
-// I/O on its handle; one event a thread (ReadFile and WriteFile reset it when they start).
+// Overlapped read or write that gives up after `ms`: false on error or timeout. The pad's reader thread does its I/O
+// on the handle, and the vibration thread writes a Pro Controller's rumble reports to it too; each thread has its own
+// event (ReadFile and WriteFile reset it when they start).
 bool hid_io(HANDLE h, bool write, u8* buf, DWORD size, DWORD& n, DWORD ms) {
     struct Event {
         HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -374,6 +387,8 @@ void read_switch(std::shared_ptr<PsPad> pad) {
     }
     read_calibration(p);
     if (!subcommand(p, 0x03, {0x30})) LOG("hid: %s: full report mode not acknowledged", p.name.c_str());
+    if (!subcommand(p, 0x48, {0x01})) LOG("hid: %s: vibration not enabled", p.name.c_str());
+    p.ready = true;
     LOG("hid: gamepad ready: %s", p.name.c_str());
 
     std::vector<u8> buf(std::max<u32>(p.report_size, 64));
@@ -391,6 +406,7 @@ void read_switch(std::shared_ptr<PsPad> pad) {
             if (GetTickCount64() - last_reset >= 1000) {
                 last_reset = GetTickCount64();
                 const bool ok = subcommand(p, 0x03, {0x30});
+                subcommand(p, 0x48, {0x01});
                 p.lights_due = true;
                 LOG("hid: %s: back in simple mode, full reports %s", p.name.c_str(), ok ? "again" : "not acknowledged");
             }
@@ -410,7 +426,6 @@ void read_switch(std::shared_ptr<PsPad> pad) {
         std::lock_guard lk{p.lock};
         p.state = {};
     }
-    CloseHandle(p.handle);
     p.alive = false;
 }
 
@@ -445,6 +460,7 @@ void open_switch(const std::wstring& path) {
     auto pad = std::make_shared<PsPad>();
     pad->path = path;
     pad->handle = h;
+    pad->out = h;
     pad->nintendo = true;
     pad->report_size = caps.InputReportByteLength;
     pad->out_size = caps.OutputReportByteLength;
@@ -480,6 +496,9 @@ void open_pad(const std::wstring& path) {
     pad->handle = h;
     pad->dualsense = dualsense;
     pad->report_size = caps.InputReportByteLength;
+    pad->out_size = caps.OutputReportByteLength;
+    pad->out = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED, nullptr);
     const bool bluetooth = caps.InputReportByteLength > 64;
     pad->name = std::string(pid == 0x0df2 ? "DualSense Edge" : dualsense ? "DualSense" : "DualShock 4") +
                 (bluetooth ? " (Bluetooth)" : " (USB)");
@@ -522,6 +541,8 @@ void scan_hid() {
     SetupDiDestroyDeviceInfoList(set);
 }
 
+void send_vibration();
+
 }  // namespace
 
 void start() {
@@ -529,12 +550,16 @@ void start() {
     if (started.exchange(true)) return;
     scan_xinput();
     scan_hid();
+    std::thread(send_vibration).detach();
     std::thread([] {
         SetThreadDescription(GetCurrentThread(), L"gamepad scan");
         for (;;) {
             Sleep(2000);
             scan_xinput();
             scan_hid();
+            // Disconnected pads go (their handles close once the vibration thread and the slots let go of them too)
+            std::lock_guard lk{g_pads_lock};
+            std::erase_if(g_pads, [](const auto& p) { return !p->alive; });
         }
     }).detach();
 }
@@ -588,6 +613,7 @@ struct Slot {
     std::wstring key;  // empty: free
     std::string name;
     std::shared_ptr<PsPad> pad;
+    int xinput = -1;
     bool holding = false;  // the joining press: nothing reaches the game until every button is up
 };
 
@@ -595,6 +621,145 @@ std::mutex g_slots_lock;
 std::array<Slot, MaxPlayers> g_slots;
 std::vector<std::wstring> g_left;  // pads sent away by leave(): they join again on a new press, not the one held now
 std::unordered_map<std::wstring, Press> g_presses;
+
+// ------------------------------------------------------------------ Vibration
+
+using Motors = std::array<Vibration, 2>;
+
+// Guarded by g_slots_lock: each player's motors as the game last set them, the pads that left a player (they stop),
+// and whether anything changed since the vibration thread last looked.
+std::array<Motors, MaxPlayers> g_motors{};
+std::vector<Slot> g_released;
+bool g_motors_changed = false;
+std::condition_variable g_motors_cv;
+
+std::timed_mutex g_send_lock;  // one sender at a time; stop_vibration() ends the sending for good
+std::atomic<bool> g_stopped{false};
+
+// HD rumble amplitude, 0 (none) to 100 (1.0, the safe maximum), as in dekuNukem's rumble_data_table.md: its formulas
+// above 0.12, and below that its table's quarter-octave steps from 0.011823 (step 2).
+int rumble_amp(float a) {
+    if (a <= 0) return 0;
+    const float e = a > 0.23f ? std::log2(a * 8.7f) * 32 : a > 0.12f ? std::log2(a * 17) * 16 : std::log2(a / 0.011823f) * 4 + 2;
+    return static_cast<int>(std::clamp(std::lround(e), 0L, 100L));
+}
+
+int rumble_freq(float hz, int lo, int hi) {
+    return static_cast<int>(std::clamp(std::lround(std::log2(std::max(hz, 1.0f) / 10) * 32), long(lo), long(hi)));
+}
+
+// One motor's 4 bytes: 9-bit high-band frequency, high-band amplitude, 7-bit low-band frequency, 9-bit low-band
+// amplitude (its low bit is byte 2's top bit). Neutral: 00 01 40 40.
+void encode_rumble(const Vibration& v, u8* d) {
+    const int hf = (rumble_freq(v.freq_high, 0x61, 0xdf) - 0x60) * 4, lf = rumble_freq(v.freq_low, 0x41, 0xbf) - 0x40;
+    const int lf_amp = rumble_amp(v.amp_low) + 0x80;
+    d[0] = static_cast<u8>(hf);
+    d[1] = static_cast<u8>(rumble_amp(v.amp_high) * 2 | hf >> 8);
+    d[2] = static_cast<u8>(lf | (lf_amp & 1) << 7);
+    d[3] = static_cast<u8>(lf_amp >> 1);
+}
+
+// Bluetooth output reports of the PlayStation pads end in a CRC-32 of 0xa2 (the HID header) and the report.
+u32 bt_crc(const u8* p, size_t n) {
+    u32 c = ~0u;
+    const auto add = [&](u8 b) {
+        c ^= b;
+        for (int k = 0; k < 8; k++) c = c >> 1 ^ (0xedb88320u & (0u - (c & 1)));
+    };
+    add(0xa2);
+    for (size_t i = 0; i < n; i++) add(p[i]);
+    return ~c;
+}
+
+// The Pro Controller plays both bands of each motor (report 0x10). The PlayStation pads have a big motor (the low
+// band) and a small one (the high band); report layouts as in Linux's hid-playstation.
+bool send_rumble(PsPad& p, const Motors& m) {
+    if (!p.alive || p.out == INVALID_HANDLE_VALUE) return false;
+    std::vector<u8> r(p.out_size);
+    if (p.nintendo) {
+        if (!p.ready || r.size() < 10) return false;
+        r[0] = 0x10;
+        r[1] = p.counter++ & 0xf;
+        encode_rumble(m[0], &r[2]);
+        encode_rumble(m[1], &r[6]);
+    } else {
+        const auto level = [](float a) { return static_cast<u8>(std::clamp(a, 0.0f, 1.0f) * 255 + 0.5f); };
+        const u8 big = level(std::max(m[0].amp_low, m[1].amp_low)), small = level(std::max(m[0].amp_high, m[1].amp_high));
+        const bool bluetooth = p.report_size > 64;
+        if (r.size() < (bluetooth ? 78u : 8u)) return false;
+        if (p.dualsense && bluetooth) r[0] = 0x31, r[1] = static_cast<u8>(p.counter++ << 4), r[2] = 0x10, r[3] = 0x03, r[5] = small, r[6] = big;
+        else if (p.dualsense) r[0] = 0x02, r[1] = 0x03, r[3] = small, r[4] = big;
+        else if (bluetooth) r[0] = 0x11, r[1] = 0xc4, r[3] = 0x01, r[6] = small, r[7] = big;
+        else r[0] = 0x05, r[1] = 0x01, r[4] = small, r[5] = big;
+        if (bluetooth) {
+            const u32 crc = bt_crc(r.data(), 74);
+            std::memcpy(&r[74], &crc, 4);
+        }
+    }
+    DWORD n = 0;
+    return hid_io(p.out, true, r.data(), static_cast<DWORD>(r.size()), n, 100);
+}
+
+void send_xinput(int slot, const Motors& m) {
+    const auto level = [](float a) { return static_cast<WORD>(std::clamp(a, 0.0f, 1.0f) * 65535 + 0.5f); };
+    XINPUT_VIBRATION v{level(std::max(m[0].amp_low, m[1].amp_low)), level(std::max(m[0].amp_high, m[1].amp_high))};
+    XInputSetState(slot, &v);
+}
+
+// Sends what changed, at most every 15 ms. A Pro Controller's vibration is sent again every 50 ms while it lasts, as
+// SDL does.
+void send_vibration() {
+    SetThreadDescription(GetCurrentThread(), L"vibration");
+    std::array<Motors, XUSER_MAX_COUNT> xinput_sent{};
+    for (;;) {
+        std::vector<std::pair<Slot, Motors>> targets;
+        {
+            std::unique_lock lk{g_slots_lock};
+            g_motors_cv.wait_for(lk, std::chrono::milliseconds(50), [] { return g_motors_changed; });
+            g_motors_changed = false;
+            for (int i = 0; i < MaxPlayers; i++)
+                if (!g_slots[i].key.empty()) targets.push_back({g_slots[i], g_motors[i]});
+            for (Slot& s : g_released) targets.push_back({std::move(s), Motors{}});
+            g_released.clear();
+        }
+        if (max_players() == 1) {  // nobody joins and every pad drives player 1: they all play its vibration
+            Motors m;
+            {
+                std::lock_guard lk{g_slots_lock};
+                m = g_motors[0];
+            }
+            targets.clear();
+            for (int i = 0; i < XUSER_MAX_COUNT; i++) targets.push_back({Slot{{}, {}, nullptr, i}, m});
+            std::lock_guard lk{g_pads_lock};
+            for (const auto& p : g_pads)
+                if (p->alive) targets.push_back({Slot{{}, {}, p}, m});
+        }
+        std::lock_guard send{g_send_lock};
+        if (g_stopped) return;
+        const ULONGLONG now = GetTickCount64();
+        for (const auto& [slot, motors] : targets) {
+            if (slot.xinput >= 0) {
+                if (motors != xinput_sent[slot.xinput]) send_xinput(slot.xinput, motors);
+                xinput_sent[slot.xinput] = motors;
+            } else if (PsPad* p = slot.pad.get()) {
+                const bool refresh = p->nintendo && motors != Motors{} && now - p->rumble_at >= 50;
+                if ((motors != p->rumble || refresh) && send_rumble(*p, motors)) {
+                    p->rumble = motors;
+                    p->rumble_at = now;
+                }
+            }
+        }
+        Sleep(15);
+    }
+}
+
+// The pad leaving `player` stops, and the next pad there starts still.
+void release(int player) {
+    g_released.push_back(g_slots[player]);
+    g_motors[player] = {};
+    g_motors_changed = true;
+    g_motors_cv.notify_one();
+}
 
 }  // namespace
 
@@ -649,6 +814,7 @@ void read(Players& out, const State* keyboard) {
         Slot& s = g_slots[i];
         if (s.key.empty() || find(s.key) != now.end()) continue;
         LOG("hid: player %d left (%s disconnected)", i + 1, s.name.c_str());
+        release(i);
         s = {};
     }
     // A pad sent away by leave() may join again once its buttons are up
@@ -670,7 +836,7 @@ void read(Players& out, const State* keyboard) {
                 src.name.c_str(), orig->name.c_str());
             continue;
         }
-        *free = {src.key, src.name, src.pad, true};
+        *free = {src.key, src.name, src.pad, src.xinput, true};
         const int player = static_cast<int>(free - g_slots.begin());
         LOG("hid: player %d: %s", player + 1, src.name.c_str());
         if (src.pad) show_player(*src.pad, player);
@@ -694,12 +860,33 @@ void leave(int player) {
     LOG("hid: player %d left (the game disconnected it): %s joins again on its next press", player + 1, s.name.c_str());
     g_left.push_back(s.key);
     if (s.pad) show_player(*s.pad, -1);
+    release(player);
     s = {};
 }
 
 int connected_players() {
     std::lock_guard lk{g_slots_lock};
     return 1 + static_cast<int>(std::count_if(g_slots.begin() + 1, g_slots.end(), [](const Slot& s) { return !s.key.empty(); }));
+}
+
+void vibrate(int player, int motor, const Vibration& v) {
+    if (player < 0 || player >= MaxPlayers || motor < 0 || motor > 1) return;
+    std::lock_guard lk{g_slots_lock};
+    if (g_motors[player][motor] == v) return;
+    g_motors[player][motor] = v;
+    g_motors_changed = true;
+    g_motors_cv.notify_one();
+}
+
+void stop_vibration() {
+    // Also called while crashing: it waits a little for the vibration thread to finish sending, and skips the HID
+    // pads when the crashing thread may hold their list.
+    std::unique_lock send{g_send_lock, std::chrono::milliseconds(300)};
+    g_stopped = true;
+    for (int i = 0; i < XUSER_MAX_COUNT; i++) send_xinput(i, {});
+    std::unique_lock lk{g_pads_lock, std::try_to_lock};
+    if (!lk) return;
+    for (const auto& p : g_pads) send_rumble(*p, {});
 }
 
 }  // namespace gamepads
