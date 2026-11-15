@@ -999,6 +999,9 @@ void run_streams() {
         log_at = now;
     }
     const u64 last = g_streams.back().fence;
+    // The last stream's rendering is still open in the command buffer: closed before R forgets it, or vk_rp_sub_commit ended the
+    // command buffer inside it (VUID-vkEndCommandBuffer-commandBuffer-00060, nearly every submission: every one goes through here)
+    end_rendering(g_cur->cb);
     g_active = nullptr;
     g_streams.clear();
     g_hold_first.store(0);

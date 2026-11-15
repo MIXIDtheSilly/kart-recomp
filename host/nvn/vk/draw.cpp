@@ -1568,6 +1568,22 @@ void push_deltas(VkCommandBuffer cb, VkPipelineLayout layout, const State& s, co
     vkCmdPushConstants(cb, layout, push_stages(), DeltaBase + 8 * sh->stage, 8, v);
 }
 
+// Bisecting one shader's device loss: HOST_NVN_TEST_KEY=<vertex or pixel shader key>, HOST_NVN_TEST_MODE=vstex | pstex | skip
+// (any of them): its draws sample the placeholder in that stage, or are not drawn. 1 vstex, 2 pstex, 4 skip; 0 for other draws.
+int test_mode(const State& s) {
+    static const u64 key = getenv("HOST_NVN_TEST_KEY") ? std::strtoull(getenv("HOST_NVN_TEST_KEY"), nullptr, 16) : 0;
+    static const int mode = [] {
+        const char* m = getenv("HOST_NVN_TEST_MODE");
+        if (!key || !m) return 0;
+        const int v = (std::strstr(m, "vstex") ? 1 : 0) | (std::strstr(m, "pstex") ? 2 : 0) | (std::strstr(m, "skip") ? 4 : 0);
+        LOG("nvk: [WARNING] HOST_NVN_TEST_KEY=%016llx HOST_NVN_TEST_MODE=%s (%d)", static_cast<unsigned long long>(key), m, v);
+        return v;
+    }();
+    if (!mode) return 0;
+    const bool hit = (s.sh[SH_VS] && s.sh[SH_VS]->key == key) || (s.sh[SH_PS] && s.sh[SH_PS]->key == key);
+    return hit ? mode : 0;
+}
+
 u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nullptr, bool* fixed = nullptr) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     const bool uniform = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1588,7 +1604,8 @@ u32 resolve(const State& s, u32 st, const Binding& b, u64 out[3], Touch* t = nul
         bool sticky = true;
         // HOST_NVN_TEST_BLANK=vs (bisecting the 11-11 device loss): textures vertex shaders sample are the placeholder
         static const bool blank_vs = getenv("HOST_NVN_TEST_BLANK") && std::strstr(getenv("HOST_NVN_TEST_BLANK"), "vs");
-        if (blank_vs && b.kind == BKind::Tex && st == SH_VS) {
+        const int tm = b.kind == BKind::Tex ? test_mode(s) : 0;
+        if ((blank_vs && b.kind == BKind::Tex && st == SH_VS) || ((tm & 1) && st == SH_VS) || ((tm & 2) && st == SH_PS)) {
             g_used_placeholder = true;
             v = placeholder_view(view_type_of(b));
         } else if (b.kind == BKind::Tex && b.reg < 256) {
@@ -2892,7 +2909,7 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
         // HOST_NVN_TRACE_PS=<pixel shader key>: the draws with that pixel shader are logged as in a dump (first 20)
         static const u64 trace = getenv("HOST_NVN_TRACE_PS") ? std::strtoull(getenv("HOST_NVN_TRACE_PS"), nullptr, 16) : 0;
         const bool on = trace && s.sh[SH_PS] && s.sh[SH_PS]->key == trace;
-        dump_trace(on);
+        dump_trace(on, true);
         if (on) {
             dump_note("draw %llu with ps %016llx: %d colour targets", static_cast<unsigned long long>(g_drawn_total),
                       static_cast<unsigned long long>(trace), R.ncolor);
@@ -2906,6 +2923,7 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
         }
     }
     if (!render_enabled(s)) { g_stats[ST_DISABLED]++; return; }
+    if (test_mode(s) & 4) return;
     nvn::p_draw dtmp;
     nvn::p_draw_idx itmp;
     const nvn::p_draw* d = op == nvn::OP_DRAW ? nvn::draw_rec(a, size, &dtmp) : nullptr;

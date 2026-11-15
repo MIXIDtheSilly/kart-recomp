@@ -13,7 +13,7 @@ void dump_arm(u64 from, u64 to, const char* dir);   // dumps the frames whose pr
 void dump_ring_flash(s64 num);
 void dump_sub_begin();                       // decides whether this submission is in the dumped frame
 void dump_note(const char* fmt, ...);        // a log line while active
-void dump_trace(bool on);                    // dump_note records this draw too (HOST_NVN_TRACE_PS), kept for dump_trace_print
+void dump_trace(bool on, bool log = false);  // dump_note records this draw too (HOST_NVN_TRACE_PS), kept for dump_trace_print; log: also LOGged (the first few)
 bool dump_tracing();
 void dump_trace_print();                     // the traced draws' recent notes (at device loss)
 void dump_targets(VkCommandBuffer cb);       // the colour targets as they are now (a rendering scope just ended)

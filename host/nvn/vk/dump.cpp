@@ -33,6 +33,7 @@ struct Pending {
 std::vector<Pending> g_pending;
 bool g_active = false;
 bool g_trace = false;   // this draw is traced (HOST_NVN_TRACE_PS): its notes go to g_ring, logged at device loss
+bool g_trace_log = false;   // ...and to the log at once (HOST_NVN_TRACE_PS draws, the first few)
 std::mutex g_ring_mu;
 std::deque<std::string> g_ring;
 int g_seq = 0;
@@ -164,7 +165,11 @@ void dump_sub_begin() {
     if (!g_active && (g_no_targets || g_arm_from >= 0) && logged >= 0 && !closed) closed = true, notes_file() && std::fflush(notes_file());
 }
 
-void dump_trace(bool on) { g_trace = on; }
+void dump_trace(bool on, bool log) {
+    g_trace = on;
+    if (!on) g_trace_log = false;
+    else if (log) g_trace_log = true;   // (a first use met inside a logged draw keeps it logged)
+}
 bool dump_tracing() { return g_trace; }
 
 void dump_note(const char* fmt, ...) {
@@ -185,6 +190,9 @@ void dump_note(const char* fmt, ...) {
         return;
     }
     std::scoped_lock lk{g_ring_mu};
+    // (the first traced draws also go to the log now: whether and when the shader was drawn at all, without a device loss)
+    static int logged = 0;
+    if (g_trace_log && logged < 300) logged++, LOG("trace: %s", buf);
     g_ring.emplace_back(buf);
     if (g_ring.size() > 1500) g_ring.pop_front();
 }

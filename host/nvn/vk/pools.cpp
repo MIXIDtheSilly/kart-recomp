@@ -614,7 +614,15 @@ void pool_add(u64 addr, u64 size, u32 flags) {
     std::unique_lock lk{g_lock};
     if (auto it = g_pools.find(addr); it != g_pools.end()) {
         if (it->second.mirror) mirror_drop(addr, it->second);
-        if (it->second.own) release_import(it->second.im), bind_epoch_bump();
+        if (it->second.own) {
+            // (as pool_del: submissions in flight may still use the old import's buffer)
+            static int n = 0;
+            if (n++ < 5) LOG("nvk: memory pool %#llx+%#llx made again over a live one: its old import released after the GPU",
+                             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+            Imported im = it->second.im;
+            defer([im]() mutable { release_import(im); });
+            bind_epoch_bump();
+        }
     }
     g_pools[addr] = p;
     g_pools_gen.fetch_add(1, std::memory_order_release);
