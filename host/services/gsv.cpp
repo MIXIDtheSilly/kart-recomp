@@ -156,20 +156,19 @@ struct Syncpt : Service {
                 ev->signal();
             });
         });
-        // Cancel: the request goes and the event is cleared, not signalled (as nvhost's ClearEventWait on the Switch).
-        // Its only user is the movie module's waiter (subsdk0+0x102e0: 202 then 201 to move a slot to the next image, from
-        // its thread at subsdk0+0x4734 or from the decoder feed's when an image goes into an empty ring; also when the movie
-        // stops). Its thread (subsdk0+0x101c0) takes any signal of the slot's event for "the image is ready" and checks
-        // with nn::gs::TryWaitNativeSync, aborting when the value is not reached (svcBreak after IApplicationFunctions::22,
-        // subsdk0+0x4540 / 0x4690): a signal at the cancel did that whenever the image was not decoded yet, mostly when a
-        // button skipped a movie or left a menu playing one. Nothing waits on the cancel; that thread stops on its own event.
+        // Cancel: the request goes and the event is signalled. nn::syncpt::sdk's cancel (sdk+0x5c98c0) sends 202 only when
+        // the event is not signalled yet, then waits on it in a loop of 1 s timed waits (sdk+0x5c9960) until it is: cleared
+        // instead, the caller never returned, and the movie module, which cancels its slots before it starts a movie, hung
+        // after the course preview stopped (a black screen instead of the race). Its user is the movie module's waiter
+        // (subsdk0+0x102e0: 202 then 201 to move a slot to the next image, from its thread at subsdk0+0x4734 or from the
+        // decoder feed's when an image goes into an empty ring; also when the movie stops).
         on(202, [this](Request& r) {
             const u32 slot = W(r, 2);
             auto ev = events.get(slot);
             if (auto it = requests.find(slot); it != requests.end()) cancel(it->second);
             std::scoped_lock lk{shared->m};
             if (auto it = requests.find(slot); it != requests.end()) ++it->second.gen;   // (an action on its way: a no-op)
-            ev->clear();
+            ev->signal();
         });
     }
     ~Syncpt() override {
