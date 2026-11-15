@@ -23,6 +23,7 @@
 #include "ipc.h"
 #include "kernel.h"
 #include "memory.h"
+#include "services/gamepads.h"
 #include "video.h"
 #include "watch.h"
 
@@ -95,6 +96,7 @@ void fatal(const char* fmt, ...) {
     vlog(fmt, ap);
     va_end(ap);
     if (auto* t = kern::current_thread()) dump_guest_stack(&t->ctx);
+    gamepads::stop_vibration();
     // Started from Explorer the console closes with the process: say why (not in hidden test runs).
     if (!std::getenv("HOST_RENDER_HIDDEN")) {
         char text[1024];
@@ -463,6 +465,7 @@ LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     if (auto* t = kern::current_thread()) dump_guest_stack(&t->ctx);
     static std::atomic<bool> dumped{false};
     if (!dumped.exchange(true)) kern::dump_threads();
+    gamepads::stop_vibration();
     // Not ExitProcess: the Vulkan driver's DLL detach can wait on threads that never return.
     TerminateProcess(GetCurrentProcess(), 3);
     return EXCEPTION_CONTINUE_SEARCH;

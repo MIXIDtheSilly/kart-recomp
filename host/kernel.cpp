@@ -11,6 +11,7 @@
 
 #include "ipc.h"
 #include "memory.h"
+#include "services/gamepads.h"
 
 namespace kern {
 
@@ -909,6 +910,7 @@ void svc(Ctx* c, u32 imm) {
     }
     case 0x07:  // ExitProcess
         LOG("svcExitProcess");
+        gamepads::stop_vibration();
         ExitProcess(0);
     case 0x08: {  // CreateThread
         auto t = std::make_shared<KThread>();

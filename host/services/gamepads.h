@@ -43,7 +43,7 @@ int connected_players();
 // Vibration for motor 0 (left) or 1 (right) of `player`'s pad. Xbox and PlayStation pads have one low and one high
 // band motor: they get the stronger of the two motors' bands.
 void vibrate(int player, int motor, const Vibration& v);
-// Stops every pad's vibration now (the game is closing).
+// Stops every pad's vibration now, for good: the game is closing (or crashing: it never waits long).
 void stop_vibration();
 
 }  // namespace gamepads

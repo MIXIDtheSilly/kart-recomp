@@ -234,8 +234,9 @@ void read_reports(std::shared_ptr<PsPad> pad) {
 // with 0x30 switches it to the full report, 0x10 reads its SPI flash (the stick calibration), 0x30 sets the player
 // lights. Over USB the pad first needs the 0x80 commands (handshake, baud rate, handshake, USB only).
 
-// Overlapped read or write that gives up after `ms`: false on error or timeout. Only the pad's reader thread does
-// I/O on its handle; one event a thread (ReadFile and WriteFile reset it when they start).
+// Overlapped read or write that gives up after `ms`: false on error or timeout. The pad's reader thread does its I/O
+// on the handle, and the vibration thread writes a Pro Controller's rumble reports to it too; each thread has its own
+// event (ReadFile and WriteFile reset it when they start).
 bool hid_io(HANDLE h, bool write, u8* buf, DWORD size, DWORD& n, DWORD ms) {
     struct Event {
         HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -556,6 +557,9 @@ void start() {
             Sleep(2000);
             scan_xinput();
             scan_hid();
+            // Disconnected pads go (their handles close once the vibration thread and the slots let go of them too)
+            std::lock_guard lk{g_pads_lock};
+            std::erase_if(g_pads, [](const auto& p) { return !p->alive; });
         }
     }).detach();
 }
@@ -629,8 +633,8 @@ std::vector<Slot> g_released;
 bool g_motors_changed = false;
 std::condition_variable g_motors_cv;
 
-std::mutex g_send_lock;  // one sender at a time; stop_vibration() ends the sending for good
-bool g_stopped = false;
+std::timed_mutex g_send_lock;  // one sender at a time; stop_vibration() ends the sending for good
+std::atomic<bool> g_stopped{false};
 
 // HD rumble amplitude, 0 (none) to 100 (1.0, the safe maximum), as in dekuNukem's rumble_data_table.md: its formulas
 // above 0.12, and below that its table's quarter-octave steps from 0.011823 (step 2).
@@ -717,6 +721,18 @@ void send_vibration() {
                 if (!g_slots[i].key.empty()) targets.push_back({g_slots[i], g_motors[i]});
             for (Slot& s : g_released) targets.push_back({std::move(s), Motors{}});
             g_released.clear();
+        }
+        if (max_players() == 1) {  // nobody joins and every pad drives player 1: they all play its vibration
+            Motors m;
+            {
+                std::lock_guard lk{g_slots_lock};
+                m = g_motors[0];
+            }
+            targets.clear();
+            for (int i = 0; i < XUSER_MAX_COUNT; i++) targets.push_back({Slot{{}, {}, nullptr, i}, m});
+            std::lock_guard lk{g_pads_lock};
+            for (const auto& p : g_pads)
+                if (p->alive) targets.push_back({Slot{{}, {}, p}, m});
         }
         std::lock_guard send{g_send_lock};
         if (g_stopped) return;
@@ -863,13 +879,14 @@ void vibrate(int player, int motor, const Vibration& v) {
 }
 
 void stop_vibration() {
-    std::lock_guard send{g_send_lock};
+    // Also called while crashing: it waits a little for the vibration thread to finish sending, and skips the HID
+    // pads when the crashing thread may hold their list.
+    std::unique_lock send{g_send_lock, std::chrono::milliseconds(300)};
     g_stopped = true;
-    std::lock_guard lk{g_slots_lock};
-    for (const Slot& s : g_slots) {
-        if (s.xinput >= 0) send_xinput(s.xinput, {});
-        else if (s.pad) send_rumble(*s.pad, {});
-    }
+    for (int i = 0; i < XUSER_MAX_COUNT; i++) send_xinput(i, {});
+    std::unique_lock lk{g_pads_lock, std::try_to_lock};
+    if (!lk) return;
+    for (const auto& p : g_pads) send_rumble(*p, {});
 }
 
 }  // namespace gamepads
