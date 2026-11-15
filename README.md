@@ -27,9 +27,15 @@ half an hour on an 8-core CPU, with a progress bar. Controls, settings and how i
 ### Linux
 
 You need a Vulkan 1.3 GPU and driver, SDL 3 (Fedora `SDL3`, Debian/Ubuntu `libsdl3-0`), the C++
-standard library headers (`g++`) and Python 3.10 or later (with `venv`); libvpx plays the movies. `./kart.sh setup` puts the
-rest into the repository like the Windows launcher does (clang from LLVM, the Python packages, the .NET
-SDK, the SPIR-V tools), without root:
+standard library headers (`g++`) and Python 3.10 or later (with `venv`); libvpx plays the movies.
+
+```
+launcher/out/launcher
+```
+
+is the same launcher as on Windows: open it from your file manager or a terminal. A release has it built; in a checkout
+`./kart.sh` builds it the first time and opens it. Its Set up puts the rest into the repository (clang from LLVM, the
+Python packages, the .NET SDK, the SPIR-V tools), without root. The same steps without a window:
 
 ```
 ./kart.sh setup
@@ -42,7 +48,7 @@ Details and the differences from Windows: [docs/how-it-works.md](docs/how-it-wor
 
 Updating: unzip the new release into a new folder and click **Bring over an older version…** on
 the launcher's first step. It moves your build, tools, saves and settings over from the old folder,
-and Build then only redoes what changed. Scripted: `launcher.exe --bring-over <old folder> --build --quit`.
+and Build then only redoes what changed. Scripted: `launcher.exe --bring-over <old folder> --build --quit` (`--setup` before `--build` sets up first).
 
 ## License
 

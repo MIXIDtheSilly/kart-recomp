@@ -21,7 +21,15 @@
 // Settings are read as tools\paths.py reads them: the environment, else local.cfg, else the defaults.
 // launcher\build.bat builds it into launcher\out\launcher.exe; Direct2D and DirectWrite draw everything, in Instrument
 // Sans and DM Mono from launcher\fonts\ (SIL OFL, the licences beside them; Segoe UI and Consolas when they are missing).
+//
+// Linux: the same launcher, built by ./kart.sh (tools/linux.py launcher) into launcher/out/launcher. An SDL 3 window
+// (the library the game uses too), drawn with cairo and laid out with Pango (the fonts above, through fontconfig); the
+// questions are drawn in the window, the file dialogs are the desktop's (SDL's, through its portal). Settings are written
+// to local.linux.cfg, which tools/paths.py reads before local.cfg (whose Windows paths Linux skips); the steps run what
+// ./kart.sh runs: Set up is tools/linux.py setup <part>, the build the same tools with build_host.py linking host/out/kart.
+// The commands run through /bin/sh in a process group of their own, so Stop ends the whole tree.
 
+#ifdef _WIN32
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -35,6 +43,24 @@
 #include <dwmapi.h>
 #include <shobjidl.h>
 #include <shellapi.h>
+#else
+#include <regex>
+#include <SDL3/SDL.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <fnmatch.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <cmath>
+#include <cwchar>
+#include <cwctype>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -51,18 +77,46 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#define DS L"\\"             // the folder separator, in what the launcher shows and the commands it runs
+#define CFG_NAME L"local.cfg"  // where the launcher writes its settings
+#else
+// The few Windows names the shared code uses, and Direct2D's geometry types (the drawing below is cairo's)
+using DWORD = uint32_t;
+using UINT = unsigned;
+using ULONGLONG = unsigned long long;
+struct D2D1_RECT_F {
+    float left, top, right, bottom;
+};
+struct D2D1_POINT_2F {
+    float x, y;
+};
+struct D2D1_SIZE_F {
+    float width, height;
+};
+static ULONGLONG GetTickCount64() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000 + (ULONGLONG)ts.tv_nsec / 1000000;
+}
+#define swscanf_s swscanf
+#define _wcstoui64 wcstoull
+#define DS L"/"
+#define CFG_NAME L"local.linux.cfg"
+#endif
 
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Text
 
+#ifdef _WIN32
 static std::wstring widen(const std::string& s, UINT cp = CP_UTF8) {
     if (s.empty()) return {};
     const int n = MultiByteToWideChar(cp, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -78,6 +132,49 @@ static std::string narrow(const std::wstring& w) {
     if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
 }
+#else
+// UTF-8 to UTF-32 (wchar_t is 32 bits here); a byte that is not UTF-8 stands for itself (Latin-1), and *valid says
+// whether there was one
+static std::wstring widen(const std::string& s, bool* valid = nullptr) {
+    std::wstring w;
+    w.reserve(s.size());
+    bool ok = true;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        const int n = c < 0x80 ? 0 : (c >> 5) == 6 ? 1 : (c >> 4) == 14 ? 2 : (c >> 3) == 30 ? 3 : -1;
+        uint32_t cp = n == 0 ? c : n == 1 ? c & 31 : n == 2 ? c & 15 : c & 7;
+        bool good = n >= 0 && i + n < s.size();
+        for (int k = 1; good && k <= n; k++) {
+            const unsigned char d = (unsigned char)s[i + k];
+            good = (d >> 6) == 2;
+            cp = cp << 6 | (d & 63);
+        }
+        if (!good) {
+            ok = false;
+            w += (wchar_t)c;
+            i++;
+            continue;
+        }
+        w += (wchar_t)cp;
+        i += n + 1;
+    }
+    if (valid) *valid = ok;
+    return w;
+}
+
+static std::string narrow(const std::wstring& w) {
+    std::string s;
+    s.reserve(w.size());
+    for (const wchar_t wc : w) {
+        const uint32_t c = (uint32_t)wc;
+        if (c < 0x80) s += (char)c;
+        else if (c < 0x800) s += (char)(0xC0 | c >> 6), s += (char)(0x80 | (c & 63));
+        else if (c < 0x10000) s += (char)(0xE0 | c >> 12), s += (char)(0x80 | (c >> 6 & 63)), s += (char)(0x80 | (c & 63));
+        else s += (char)(0xF0 | c >> 18), s += (char)(0x80 | (c >> 12 & 63)), s += (char)(0x80 | (c >> 6 & 63)), s += (char)(0x80 | (c & 63));
+    }
+    return s;
+}
+#endif
 
 // Tool output: UTF-8 when it is valid UTF-8 (Python), else the console code page (cl, link); colour codes dropped
 static std::wstring decode_output(std::string s) {
@@ -92,8 +189,12 @@ static std::wstring decode_output(std::string s) {
         clean += s[i];
     }
     if (clean.empty()) return {};
+#ifdef _WIN32
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, clean.data(), (int)clean.size(), nullptr, 0) > 0) return widen(clean);
     return widen(clean, CP_OEMCP);
+#else
+    return widen(clean);
+#endif
 }
 
 static std::wstring trim(const std::wstring& s) {
@@ -122,11 +223,22 @@ static std::wstring clock_text(ULONGLONG ms) {
 static fs::path g_root;
 static std::wstring g_vcvars_found;   // vswhere's answer, looked up once
 
+#ifdef _WIN32
 static std::wstring env_var(const wchar_t* key) {
     std::wstring buf(32767, L'\0');
     const DWORD n = GetEnvironmentVariableW(key, buf.data(), (DWORD)buf.size());
     return n && n < buf.size() ? buf.substr(0, n) : L"";
 }
+#else
+static std::wstring env_var(const wchar_t* key) {
+    const char* v = getenv(narrow(key).c_str());
+    return v ? widen(v) : L"";
+}
+static void SetEnvironmentVariableW(const wchar_t* key, const wchar_t* value) {
+    if (value) setenv(narrow(key).c_str(), narrow(value).c_str(), 1);
+    else unsetenv(narrow(key).c_str());
+}
+#endif
 
 static std::vector<std::string> read_lines(const fs::path& p) {
     std::vector<std::string> lines;
@@ -139,13 +251,26 @@ static std::vector<std::string> read_lines(const fs::path& p) {
     return lines;
 }
 
+// Linux: local.cfg, less its Windows paths (C:\...), then local.linux.cfg over it (tools\paths.py _local)
 static std::map<std::wstring, std::wstring> local_cfg() {
     std::map<std::wstring, std::wstring> cfg;
-    for (const auto& l : read_lines(g_root / "local.cfg")) {
-        std::wstring w = widen(l);
-        w = w.substr(0, w.find(L'#'));
-        const size_t eq = w.find(L'=');
-        if (eq != std::wstring::npos) cfg[trim(w.substr(0, eq))] = trim(w.substr(eq + 1));
+#ifdef _WIN32
+    for (const wchar_t* name : {L"local.cfg"}) {
+#else
+    for (const wchar_t* name : {L"local.cfg", L"local.linux.cfg"}) {
+#endif
+        for (const auto& l : read_lines(g_root / name)) {
+            std::wstring w = widen(l);
+            w = w.substr(0, w.find(L'#'));
+            const size_t eq = w.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            const std::wstring v = trim(w.substr(eq + 1));
+#ifndef _WIN32
+            if (name == std::wstring(L"local.cfg") && v.size() >= 3 && iswalpha(v[0]) && v[1] == L':' && (v[2] == L'\\' || v[2] == L'/'))
+                continue;
+#endif
+            cfg[trim(w.substr(0, eq))] = v;
+        }
     }
     return cfg;
 }
@@ -161,13 +286,20 @@ static std::wstring setting(const std::wstring& key) {
     }
     if (key == L"NVN_XLATE") return (g_root / "work" / "xlate").wstring();
     if (key == L"MINGW") return (g_root / "tools" / "llvm-mingw").wstring();
+    if (key == L"LLVM") {   // tools/llvm, else the system's clang when there is one
+        const fs::path own = g_root / "tools" / "llvm";
+        return (fs::exists(own / "bin" / "clang++") || !fs::exists("/usr/bin/clang++") ? own : fs::path("/usr")).wstring();
+    }
     if (key == L"VCVARS") return g_vcvars_found;
     return L"";
 }
 
-// <key>=<value> in local.cfg, the other lines kept
+// <key>=<value> in local.cfg (Linux: local.linux.cfg), the other lines kept
 static bool save_setting(const std::wstring& key, const std::wstring& value) {
-    auto lines = read_lines(g_root / "local.cfg");
+    auto lines = read_lines(g_root / CFG_NAME);
+#ifndef _WIN32
+    if (lines.empty()) lines.push_back("# Linux settings (tools/paths.py): they come before local.cfg");
+#endif
     bool found = false;
     for (auto& l : lines) {
         std::wstring w = widen(l);
@@ -179,8 +311,12 @@ static bool save_setting(const std::wstring& key, const std::wstring& value) {
         }
     }
     if (!found) lines.push_back(narrow(key) + "=" + narrow(value));
-    std::ofstream o(g_root / "local.cfg", std::ios::binary | std::ios::trunc);
+    std::ofstream o(g_root / CFG_NAME, std::ios::binary | std::ios::trunc);
+#ifdef _WIN32
     for (const auto& l : lines) o << l << "\r\n";
+#else
+    for (const auto& l : lines) o << l << "\n";
+#endif
     return o.good();
 }
 
@@ -198,6 +334,7 @@ static bool path_exists(const fs::path& p) {
     return fs::exists(p, ec);
 }
 
+#ifdef _WIN32
 static bool any_file(const fs::path& dir, const wchar_t* pattern) {
     WIN32_FIND_DATAW fd;
     const HANDLE h = FindFirstFileExW((dir / pattern).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
@@ -210,10 +347,42 @@ static bool on_path(const wchar_t* exe) {
     wchar_t buf[MAX_PATH];
     return SearchPathW(nullptr, exe, nullptr, MAX_PATH, buf, nullptr) > 0;
 }
+#else
+// The files in <dir> whose names match <pattern> (* and ?)
+static std::vector<fs::path> files_matching(const fs::path& dir, const wchar_t* pattern, size_t most = SIZE_MAX) {
+    std::vector<fs::path> found;
+    const std::string pat = narrow(pattern);
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end && found.size() < most; it.increment(ec))
+        if (!it->is_directory(ec) && fnmatch(pat.c_str(), it->path().filename().c_str(), 0) == 0) found.push_back(it->path());
+    return found;
+}
+
+static bool any_file(const fs::path& dir, const wchar_t* pattern) {
+    return !files_matching(dir, pattern, 1).empty();
+}
+
+// Where <exe> is on PATH; '' when it is not
+static fs::path which(const wchar_t* exe) {
+    const char* path = getenv("PATH");
+    std::string rest = path ? path : "";
+    for (size_t a = 0; a <= rest.size();) {
+        size_t b = rest.find(':', a);
+        if (b == std::string::npos) b = rest.size();
+        const std::string d = rest.substr(a, b - a);
+        if (!d.empty() && access((d + "/" + narrow(exe)).c_str(), X_OK) == 0) return fs::path(d) / narrow(exe);
+        a = b + 1;
+    }
+    return {};
+}
+
+static bool on_path(const wchar_t* exe) { return !which(exe).empty(); }
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------
 // Processes
 
+#ifdef _WIN32
 static HANDLE open_nul(SECURITY_ATTRIBUTES* sa) {
     return CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, sa, OPEN_EXISTING, 0, nullptr);
 }
@@ -250,6 +419,57 @@ static std::string capture(const std::wstring& cmdline, DWORD* exit_code = nullp
     CloseHandle(rd);
     return out;
 }
+#else
+// A command line through /bin/sh, its output into <fd> (stdout and stderr), stdin empty; in a process group of its own
+// when <group> (Stop and the end of the command kill the group), in <cwd> unless that is empty. Only what is safe
+// between fork and exec in a program with threads.
+static pid_t spawn_sh(const std::string& line, const std::string& cwd, int fd, bool group) {
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (group) {
+            setpgid(0, 0);
+            prctl(PR_SET_PDEATHSIG, SIGKILL);   // the launcher gone: so is the command
+        }
+        const int nul = open("/dev/null", O_RDONLY);
+        dup2(nul, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if (!cwd.empty() && chdir(cwd.c_str())) _exit(126);
+        execl("/bin/sh", "sh", "-c", line.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+    if (pid > 0 && group) setpgid(pid, pid);
+    return pid;
+}
+
+static DWORD wait_code(pid_t pid) {
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR) return 1;
+    return WIFEXITED(st) ? (DWORD)WEXITSTATUS(st) : 128 + (DWORD)WTERMSIG(st);
+}
+
+// A short command's whole output (the tool checks at startup)
+static std::string capture(const std::wstring& cmdline, DWORD* exit_code = nullptr) {
+    if (exit_code) *exit_code = (DWORD)-1;
+    int fd[2];
+    if (pipe2(fd, O_CLOEXEC)) return {};
+    const pid_t pid = spawn_sh(narrow(cmdline), "", fd[1], false);
+    close(fd[1]);
+    std::string out;
+    if (pid > 0) {
+        char buf[4096];
+        for (ssize_t n; (n = read(fd[0], buf, sizeof buf)) != 0;) {
+            if (n > 0) out.append(buf, (size_t)n);
+            else if (errno != EINTR) break;
+        }
+        const DWORD code = wait_code(pid);
+        if (exit_code) *exit_code = code;
+    }
+    close(fd[0]);
+    return out;
+}
+#endif
 
 struct Cmd {
     std::wstring line, cwd;
@@ -269,13 +489,32 @@ struct Progress {
 };
 static Progress g_prog;
 
+#ifdef _WIN32
 constexpr UINT WM_APP_LOG = WM_APP + 1, WM_APP_DONE = WM_APP + 2;
 
 static HWND g_hwnd;
+static void post_log() { PostMessageW(g_hwnd, WM_APP_LOG, 0, 0); }
+#else
+// The window, and the events the job's threads post to it (SDL_PushEvent is safe from any thread)
+static SDL_Window* g_window;
+static Uint32 g_ev_log, g_ev_done;
+static void post_event(Uint32 type, int code = 0, bool flag = false) {
+    SDL_Event e{};
+    e.type = type;
+    e.user.code = code;
+    e.user.data1 = (void*)(intptr_t)flag;
+    SDL_PushEvent(&e);
+}
+static void post_log() { post_event(g_ev_log); }
+#endif
 static std::mutex g_mx;
 static std::deque<std::wstring> g_log;   // under g_mx
 static size_t g_log_added = 0;           // under g_mx: lines since the UI last looked
+#ifdef _WIN32
 static HANDLE g_job = nullptr;           // under g_mx: the running command's job object
+#else
+static pid_t g_job = 0;                  // under g_mx: the running command's process group
+#endif
 static std::atomic<bool> g_running{false}, g_cancel{false}, g_log_posted{false};
 static FILE* g_log_file = nullptr;       // under g_mx: --log <file>, every output line also goes there
 
@@ -291,7 +530,7 @@ static void log_line(std::wstring s) {
             g_prog.done = done;
             g_prog.total = total;
         }
-        if (!g_log_posted.exchange(true)) PostMessageW(g_hwnd, WM_APP_LOG, 0, 0);
+        if (!g_log_posted.exchange(true)) post_log();
         return;
     }
     {
@@ -304,13 +543,73 @@ static void log_line(std::wstring s) {
         g_log_added++;
         while (g_log.size() > 5000) g_log.pop_front();
     }
-    if (!g_log_posted.exchange(true)) PostMessageW(g_hwnd, WM_APP_LOG, 0, 0);
+    if (!g_log_posted.exchange(true)) post_log();
 }
 
-// One command, its output into the log; everything it starts is in a job object, so Stop ends the whole tree
+// The output of a command, line by line into the log
+struct LineSplitter {
+    std::string pending;
+    void add(const char* p, size_t n) {
+        pending.append(p, n);
+        for (size_t at; (at = pending.find('\n')) != std::string::npos;) {
+            log_line(decode_output(pending.substr(0, at)));
+            pending.erase(0, at + 1);
+        }
+    }
+    ~LineSplitter() {
+        if (!pending.empty()) log_line(decode_output(pending));
+    }
+};
+
+// One command, its output into the log; everything it starts is in a job object (Linux: a process group), so Stop
+// ends the whole tree
 static DWORD run_cmd(const Cmd& c) {
     log_line(L"> " + c.line);
     if (c.fn) return c.fn();
+#ifndef _WIN32
+    int fd[2];
+    if (pipe2(fd, O_CLOEXEC)) return 1;
+    const pid_t pid = spawn_sh(narrow(c.line), narrow(c.cwd), fd[1], true);
+    close(fd[1]);
+    if (pid < 0) {
+        log_line(L"could not start it (" + widen(strerror(errno)) + L")");
+        close(fd[0]);
+        return 1;
+    }
+    {
+        std::lock_guard lk(g_mx);
+        g_job = pid;
+    }
+    if (g_cancel) kill(-pid, SIGKILL);
+    std::atomic<bool> exited{false};
+    std::thread reader([&] {
+        LineSplitter lines;
+        char buf[8192];
+        for (;;) {
+            pollfd p{fd[0], POLLIN, 0};
+            const int r = poll(&p, 1, 200);
+            if (r == 0) {
+                if (exited) break;   // what it left running outside its group still holds the pipe: not waited for
+                continue;
+            }
+            const ssize_t n = r < 0 ? -1 : read(fd[0], buf, sizeof buf);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            lines.add(buf, (size_t)n);
+        }
+    });
+    const DWORD code = wait_code(pid);
+    // What it left running in its group (build servers) would hold the pipe open: they end with it
+    kill(-pid, SIGKILL);
+    exited = true;
+    reader.join();
+    close(fd[0]);
+    {
+        std::lock_guard lk(g_mx);
+        g_job = 0;
+    }
+    return code;
+#else
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE rd, wr;
     if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) return 1;
@@ -373,6 +672,7 @@ static DWORD run_cmd(const Cmd& c) {
     }
     CloseHandle(job);
     return code;
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -388,7 +688,11 @@ struct Row {
 struct Tools {
     std::wstring python;      // version, '' when there is no working python
     std::wstring py_missing;  // the required Python packages it lacks (tools\deps.py check), space-separated
-    bool dotnet = false, vp9 = false;
+    bool dotnet = false, vp9 = false;   // vp9: Linux: libvpx
+    // Linux: what the system has to have (Set up cannot install it): the Vulkan loader, the C++ library headers, and
+    // the python3 Set up makes tools/venv from (its version)
+    bool vulkan = false, cxx_headers = false;
+    std::wstring sys_python;
 };
 static Tools g_tools;
 
@@ -422,7 +726,11 @@ static std::wstring ver_suffix() { return g_ver ? L"-" + std::wstring(ver().name
 // Where the tools write the modules (out\, build\, gen\): tools\paths.py art()
 static fs::path art() { return g_ver ? g_root / "ver" / ver().name : g_root; }
 static std::wstring game_key() { return g_ver ? L"KART_GAME_" + std::wstring(ver().name) : L"KART_GAME"; }
+#ifdef _WIN32
 static std::wstring exe_name() { return L"kart" + ver_suffix() + L".exe"; }
+#else
+static std::wstring exe_name() { return L"kart" + ver_suffix(); }
+#endif
 static fs::path shader_dir() { return g_root / "work" / (L"nvn_shaders" + ver_suffix()); }
 // The tools see the chosen version through KART_VER (they inherit the launcher's environment)
 static void apply_version() { SetEnvironmentVariableW(L"KART_VER", g_ver ? ver().name : nullptr); }
@@ -460,11 +768,20 @@ static std::wstring build_cc() {
     return cc == L"clang-cl" ? L"clang" : cc;
 }
 // Where build_lib.py puts the module libraries for that compiler, and their extension
+#ifdef _WIN32
 static fs::path lib_dir(const fs::path& build) {
     const std::wstring cc = build_cc();
     return cc == L"mingw" ? build / "mingw" : cc == L"clang" ? build / "clang" : build;
 }
 static const wchar_t* lib_ext() { return build_cc() == L"mingw" ? L".a" : L".lib"; }
+#else
+static fs::path lib_dir(const fs::path& build) { return build / "linux"; }
+static const wchar_t* lib_ext() { return L".a"; }
+// Linux: clang from LLVM (tools\paths.py LLVM: tools/llvm, which Set up downloads, else the system's)
+static bool llvm_ok() { return path_exists(fs::path(setting(L"LLVM")) / "bin" / "clang++"); }
+#endif
+// A tool the build runs, as a command line from the repository (Python: tools\python, Linux: tools/venv, first on PATH)
+static std::wstring py(const std::wstring& tool) { return L"python tools" DS + tool; }
 
 // Python and its packages: "python <version>" and "missing <package> ..." from tools\deps.py check
 static void check_python() {
@@ -485,17 +802,83 @@ static void check_python() {
 }
 
 // The SPIR-V tools the shader stage runs (tools\paths.py VULKAN_BIN): the repository's copy, else the Vulkan SDK's
+#ifdef _WIN32
 static bool spirv_tools() {
     if (const auto v = setting(L"VULKAN_BIN"); !v.empty()) return path_exists(fs::path(v) / "spirv-val.exe");
     if (path_exists(g_root / "third_party" / "spirv" / "bin" / "spirv-val.exe")) return true;
     if (const auto sdk = env_var(L"VULKAN_SDK"); !sdk.empty()) return path_exists(fs::path(sdk) / "Bin" / "spirv-val.exe");
     return false;
 }
+#else
+// Linux: tools/spirv (Set up takes them from the Vulkan SDK), else the Vulkan SDK's, else where spirv-val is on PATH;
+// all five of them (distributions often lack spirv-cross)
+static fs::path spirv_dir() {
+    if (const auto v = setting(L"VULKAN_BIN"); !v.empty()) return v;
+    if (path_exists(g_root / "tools" / "spirv" / "spirv-val")) return g_root / "tools" / "spirv";
+    if (const auto sdk = env_var(L"VULKAN_SDK"); !sdk.empty()) return fs::path(sdk) / "bin";
+    const fs::path found = which(L"spirv-val");
+    return found.empty() ? fs::path("/usr/bin") : found.parent_path();
+}
+static bool spirv_tools() {
+    const fs::path d = spirv_dir();
+    for (const char* t : {"spirv-val", "spirv-opt", "spirv-dis", "spirv-cross", "glslangValidator"})
+        if (!path_exists(d / t)) return false;
+    return true;
+}
+#endif
 
 // Python and the .NET SDK that Set up installs into the repository when the machine has none (tools\bootstrap.ps1):
 // first on PATH for everything the launcher runs, so they take over from a missing or too old one
+#ifdef _WIN32
 static fs::path local_python() { return g_root / "tools" / "python"; }
 static fs::path local_dotnet() { return g_root / "tools" / "dotnet"; }
+#else
+// Linux: Set up makes a virtual environment from the system's python3 (distributions keep pip away from it) and puts
+// the .NET SDK into tools/dotnet when the system has none
+static fs::path local_python() { return g_root / "tools" / "venv"; }
+static fs::path local_dotnet() { return g_root / "tools" / "dotnet"; }
+static void use_local_tools() {
+    static bool on_path_done = false;
+    if (!on_path_done) {
+        on_path_done = true;
+        SetEnvironmentVariableW(L"PATH", ((local_python() / "bin").wstring() + L":" + local_dotnet().wstring() + L":" + env_var(L"PATH")).c_str());
+    }
+    if (path_exists(local_dotnet() / "dotnet")) {
+        SetEnvironmentVariableW(L"DOTNET_ROOT", local_dotnet().wstring().c_str());
+        SetEnvironmentVariableW(L"DOTNET_CLI_TELEMETRY_OPTOUT", L"1");
+        SetEnvironmentVariableW(L"DOTNET_NOLOGO", L"1");
+    }
+}
+static void check_dotnet() {
+    use_local_tools();
+    g_tools.dotnet = false;
+    if (on_path(L"dotnet")) {
+        const std::string sdks = capture(L"dotnet --list-sdks");
+        g_tools.dotnet = sdks.rfind("10.", 0) == 0 || sdks.find("\n10.") != std::string::npos;
+    }
+}
+
+static bool have_lib(const char* name) {
+    void* h = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+    if (h) dlclose(h);
+    return h != nullptr;
+}
+
+static void check_tools() {
+    use_local_tools();
+    g_tools.vulkan = have_lib("libvulkan.so.1");
+    g_tools.vp9 = false;   // libvpx, which the game loads for the movies (host\services\vdec_vpx.cpp)
+    for (int n = 12; n >= 6 && !g_tools.vp9; n--) g_tools.vp9 = have_lib(("libvpx.so." + std::to_string(n)).c_str());
+    std::error_code ec;
+    g_tools.cxx_headers = false;
+    for (fs::directory_iterator it("/usr/include/c++", ec), end; !ec && it != end; it.increment(ec))
+        g_tools.cxx_headers |= path_exists(it->path() / "vector");
+    g_tools.sys_python = trim(widen(capture(L"python3 -c \"import sys; print(sys.version.split()[0])\"")));
+    check_dotnet();
+    check_python();
+}
+#endif
+#ifdef _WIN32
 static void use_local_tools() {
     static bool on_path_done = false;
     if (!on_path_done) {
@@ -539,6 +922,7 @@ static void check_tools() {
     check_dotnet();
     check_python();
 }
+#endif
 
 // What a build stage is made from, as a hash: the tools it runs (their contents), or for the exe its sources' names,
 // sizes and times. A stage stamps the hash into <art>\build\stages\<id>.txt when it finishes, and Build runs it again
@@ -568,6 +952,9 @@ static void hash_inputs(Hasher& hs, const fs::path& spec, bool contents) {
             } else files.push_back(it->path());
         }
     } else if (leaf.find(L'*') != std::wstring::npos) {
+#ifndef _WIN32
+        for (auto& f : files_matching(spec.parent_path(), leaf.c_str())) files.push_back(std::move(f));
+#else
         WIN32_FIND_DATAW fd;
         const HANDLE h = FindFirstFileExW(spec.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
         if (h != INVALID_HANDLE_VALUE) {
@@ -576,6 +963,7 @@ static void hash_inputs(Hasher& hs, const fs::path& spec, bool contents) {
             while (FindNextFileW(h, &fd));
             FindClose(h);
         }
+#endif
     } else files.push_back(spec);
     std::sort(files.begin(), files.end());
     for (const auto& f : files) {
@@ -589,11 +977,18 @@ static void hash_inputs(Hasher& hs, const fs::path& spec, bool contents) {
             char buf[1 << 16];
             while (in.read(buf, sizeof buf) || in.gcount()) hs.add(buf, (size_t)in.gcount());
         } else {
+#ifdef _WIN32
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             if (!GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &fa)) fa = {};
             hs.add(&fa.ftLastWriteTime, sizeof fa.ftLastWriteTime);
             hs.add(&fa.nFileSizeLow, sizeof fa.nFileSizeLow);
             hs.add(&fa.nFileSizeHigh, sizeof fa.nFileSizeHigh);
+#else
+            std::error_code e1, e2;
+            const long long t = fs::last_write_time(f, e1).time_since_epoch().count(), n = (long long)fs::file_size(f, e2);
+            hs.add(&t, sizeof t);
+            hs.add(&n, sizeof n);
+#endif
         }
     }
 }
@@ -608,7 +1003,12 @@ struct Stage {
     std::function<bool()> built;        // its output is there
     std::function<std::vector<Cmd>()> cmds;
 
+#ifdef _WIN32
     fs::path stamp_file() const { return art() / "build" / "stages" / (id + L".txt"); }
+#else
+    // Apart from Windows' (a checkout both systems build): its names hash with \ and its own module libraries
+    fs::path stamp_file() const { return art() / "build" / "stages-linux" / (id + L".txt"); }
+#endif
     std::wstring hash() const {
         Hasher hs;
         for (const auto& p : inputs) hash_inputs(hs, p, !by_time);
@@ -647,13 +1047,13 @@ static std::vector<Stage> stages() {
     };
     return {
         {L"Unpack the modules", L"unpack", 0, {t / "nso.py"}, false, [=] { return all(a / "out", L".json"); },
-         [=] { return std::vector<Cmd>{{L"python tools\\nso.py \"" + g_game + L"\\exefs\" " + out, root}}; }},
+         [=] { return std::vector<Cmd>{{py(L"nso.py") + L" \"" + (fs::path(g_game) / "exefs").wstring() + L"\" " + out, root}}; }},
         {L"Find the functions", L"funcs", 0, {t / "scan.py", t / "funcs.py"}, false, [=] { return all(a / "out", L".funcs.json"); },
          [=] {
              std::vector<Cmd> v;
              for (const auto& m : mods) {
-                 v.push_back({L"python tools\\scan.py " + out + L" " + m.name, root});
-                 v.push_back({L"python tools\\funcs.py " + out + L" " + m.name, root});
+                 v.push_back({py(L"scan.py") + L" " + out + L" " + m.name, root});
+                 v.push_back({py(L"funcs.py") + L" " + out + L" " + m.name, root});
              }
              return v;
          }},
@@ -662,9 +1062,9 @@ static std::vector<Stage> stages() {
          {t / "build_all.py", t / "lift.py", t / "a64.py", t / "neon.py", t / "patches.py", t / "build_lib.py", t / "hot_*.txt",
           g_root / "runtime" / "*.h"},
          false, [=] { return all(lib_dir(a / "build"), lib_ext()); },
-         [=] { return std::vector<Cmd>{{L"python tools\\build_all.py", root}}; }},
+         [=] { return std::vector<Cmd>{{py(L"build_all.py"), root}}; }},
         {L"Module glue", L"glue", 0, {t / "gen_glue.py"}, false, [=] { return path_exists(a / "gen" / "aot_modules.cpp"); },
-         [=] { return std::vector<Cmd>{{L"python tools\\gen_glue.py", root}}; }},
+         [=] { return std::vector<Cmd>{{py(L"gen_glue.py"), root}}; }},
         // The translation (nvn_shaders.py builds the translator again when tools\xlate changed), then the renderer's
         // reflection table (nothing is drawn without it), the mesh shaders' per-vertex variants, the shaders the
         // NVIDIA driver miscompiles as they are, and the compute shaders whose barriers hang Intel GPUs (.bar.spv)
@@ -673,27 +1073,36 @@ static std::vector<Stage> stages() {
           t / "shader_split" / "*.py", t / "xlate" / "**"},
          false, [=] { return path_exists(sh / "refl.tsv") && any_file(sh, L"*.fix.spv") && any_file(sh, L"*.bar.spv"); },
          [=] {
-             return std::vector<Cmd>{{L"python tools\\nvn_shaders.py", root}, {L"python tools\\nvn_refl.py", root},
-                                     {L"python tools\\nvn_mesh.py --flat", root}, {L"python tools\\nvn_spvfix.py --all", root},
-                                     {L"python tools\\nvn_barfix.py", root}};
+             return std::vector<Cmd>{{py(L"nvn_shaders.py"), root}, {py(L"nvn_refl.py"), root},
+                                     {py(L"nvn_mesh.py") + L" --flat", root}, {py(L"nvn_spvfix.py") + L" --all", root},
+                                     {py(L"nvn_barfix.py"), root}};
          }},
-        {L"Link " + exe_name(), L"link-" + fs::path(exe_name()).stem().wstring(), 2,
+        {L"Link " + exe_name(), L"link-kart" + ver_suffix(), 2,
          {g_root / "host" / "**", g_root / "runtime" / "*.h", g_root / "third_party" / "**", t / "build_host.py",
           lib_dir(a / "build") / (std::wstring(L"*") + lib_ext()), a / "gen" / "aot_modules.cpp"},
          true, [=] { return path_exists(exe); },
          // By its full path: with NoDefaultCurrentDirectoryInExePath set (some security setups) cmd does not look in
          // the current folder
+#ifdef _WIN32
          [=] { return std::vector<Cmd>{{L"cmd /c \"\"" + (g_root / "host" / "build.bat").wstring() + L"\"\"", (g_root / "host").wstring()}}; }},
+#else
+         [=] { return std::vector<Cmd>{{py(L"build_host.py"), root}}; }},
+#endif
     };
 }
 
 // What an older install hands over to a new release beside it (all of it gitignored, none of it in the release zip):
 // the game unpacked, lifted, compiled and its shaders translated (out, gen, build, ver, work), kart.exe with its
 // objects, saves and pipeline cache (host\out), and what Set up installed
+#ifdef _WIN32
 static const wchar_t* BRING_OVER[] = {L"out", L"gen", L"build", L"ver", L"work", L"host\\out",
                                       L"tools\\llvm-mingw", L"tools\\python", L"tools\\dotnet"};
+#else
+static const wchar_t* BRING_OVER[] = {L"out", L"gen", L"build", L"ver", L"work", L"host/out",
+                                      L"tools/llvm", L"tools/venv", L"tools/dotnet", L"tools/spirv"};
+#endif
 static bool fresh_install() {
-    for (const auto* d : {L"out", L"build", L"ver", L"host\\out"})
+    for (const auto* d : {L"out", L"build", L"ver", L"host" DS L"out"})
         if (path_exists(g_root / d)) return false;
     return true;
 }
@@ -714,7 +1123,7 @@ static void refresh() {
         if (!g_game.empty()) {
             const fs::path p = fs::path(g_game) / "exefs" / m.name;
             const std::string id = path_exists(p) ? module_id(p) : "";
-            if (!path_exists(p)) r = {m.name, L"not found in exefs\\", ST_BAD};
+            if (!path_exists(p)) r = {m.name, L"not found in exefs" DS, ST_BAD};
             else if (id.empty()) r = {m.name, L"not a module (NSO) file", ST_BAD};
             else if (id != m.id && dumped >= 0 && dumped != g_ver)
                 r = {m.name, L"this dump is version " + std::wstring(VERSIONS[dumped].name) + L": pick it at the top right", ST_BAD};
@@ -727,13 +1136,43 @@ static void refresh() {
     if (g_game.empty()) game.push_back({L"romfs", L"", ST_MISSING});
     else if (path_exists(fs::path(g_game) / "romfs")) game.push_back({L"romfs", L"found", ST_OK});
     else {
-        game.push_back({L"romfs", L"not found next to exefs\\", ST_BAD});
+        game.push_back({L"romfs", L"not found next to exefs" DS, ST_BAD});
         game_ok = false;
     }
     g_done[0] = game_ok;
 
     auto& deps = g_rows[1];
     deps.clear();
+#ifndef _WIN32
+    // Linux: what Set up installs into the repository (clang, the Python packages, .NET, the SPIR-V tools, the
+    // translator), and what only the system's package manager can (red: the C++ headers, the Vulkan loader, python3)
+    const bool cc = llvm_ok(), hdr = g_tools.cxx_headers;
+    const fs::path llvm = setting(L"LLVM");
+    deps.push_back({L"C++ compiler", !cc ? L"Set up installs LLVM's clang (1.2 GB)"
+                                     : llvm == g_root / "tools" / "llvm" ? L"clang (tools/llvm)" : L"clang (" + llvm.wstring() + L")",
+                    cc ? ST_OK : ST_MISSING});
+    deps.push_back({L"C++ headers", hdr ? L"found" : L"install g++ (Fedora: gcc-c++, Debian/Ubuntu: g++)", hdr ? ST_OK : ST_BAD});
+    const bool py = !g_tools.python.empty(), pkgs = py && g_tools.py_missing.empty();
+    if (!py && g_tools.sys_python.empty()) deps.push_back({L"Python", L"install python3 (3.13 or newer)", ST_BAD});
+    else if (!py) deps.push_back({L"Python", L"Set up makes tools/venv from it", ST_MISSING, g_tools.sys_python});
+    else deps.push_back({L"Python", path_exists(local_python() / "bin" / "python") ? L"tools/venv" : L"", ST_OK, g_tools.python});
+    deps.push_back({L"Python packages", !py ? L"Set up installs them" : pkgs ? L"installed" : L"Set up installs " + g_tools.py_missing,
+                    pkgs ? ST_OK : ST_MISSING});
+    deps.push_back({L".NET 10 SDK", !g_tools.dotnet ? L"Set up installs it (220 MB)"
+                                    : path_exists(local_dotnet() / "dotnet") ? L"tools/dotnet" : L"found",
+                    g_tools.dotnet ? ST_OK : ST_MISSING});
+    const bool spirv = spirv_tools();
+    deps.push_back({L"SPIR-V tools", !spirv ? L"Set up takes them from the Vulkan SDK (370 MB)"
+                                     : spirv_dir() == g_root / "tools" / "spirv" ? L"tools/spirv" : spirv_dir().wstring(),
+                    spirv ? ST_OK : ST_MISSING});
+    deps.push_back({L"Vulkan", g_tools.vulkan ? L"loader found" : L"install the Vulkan loader (vulkan-loader, libvulkan1)",
+                    g_tools.vulkan ? ST_OK : ST_BAD});
+    deps.push_back({L"libvpx", g_tools.vp9 ? L"found" : L"optional: without it the movies show black", g_tools.vp9 ? ST_OK : ST_OPTIONAL});
+    const bool xlate = path_exists(fs::path(setting(L"NVN_XLATE")) / "dmsh_xlate");
+    deps.push_back({L"Shader translator", xlate ? L"built" : L"Set up builds it", xlate ? ST_OK : ST_MISSING});
+    g_done[1] = cc && hdr && pkgs && g_tools.dotnet && spirv && g_tools.vulkan && xlate;
+    g_can_setup = hdr && g_tools.vulkan && (py || !g_tools.sys_python.empty());
+#else
     // The C++ compiler: llvm-mingw, which Set up downloads, unless BUILD_CC asks for Visual Studio
     const bool ms = build_cc_set() && build_cc() != L"mingw";
     const bool vs = ms && !setting(L"VCVARS").empty() && path_exists(setting(L"VCVARS"));
@@ -759,6 +1198,7 @@ static void refresh() {
     deps.push_back({L"Shader translator", xlate ? L"built" : L"Set up builds it", xlate ? ST_OK : ST_MISSING});
     g_done[1] = cc && pkgs && g_tools.dotnet && spirv && xlate;
     g_can_setup = cc || !ms;   // everything else Set up installs itself
+#endif
 
     auto& build = g_rows[2];
     build.clear();
@@ -784,7 +1224,11 @@ static void refresh() {
         if (k == L"HOST_NVN_TEXCACHE") texdir = v;
     const bool tex = any_file(texdir, L"*.bc");
     play.push_back({L"Texture cache", tex ? L"filled" : L"fills as you play, or bake it", tex ? ST_OK : ST_OPTIONAL});
+#ifdef _WIN32
     const bool pipes = path_exists(g_root / "host" / "out" / (L"nvn_pipelines" + ver_suffix() + L".bin"));
+#else
+    const bool pipes = path_exists(g_root / "host" / "out" / (L"nvn_pipelines" + ver_suffix() + L"-linux.bin"));
+#endif
     play.push_back({L"Pipeline cache", pipes ? L"there" : L"made over the first runs", pipes ? ST_OK : ST_OPTIONAL});
     g_done[3] = kart && g_done[0];
 }
@@ -802,18 +1246,9 @@ constexpr uint32_t dot_hover = 0x2A2C2F;
 }
 constexpr float R_PANEL = 12, R_LOG = 8, R_CTRL = 6;
 
-static ID2D1Factory* g_d2d;
-static IDWriteFactory* g_dw;
-static IDWriteFontCollection* g_fonts;   // launcher\fonts\, or null when it is missing (the system's fonts)
-static ID2D1HwndRenderTarget* g_rt;
-static ID2D1SolidColorBrush* g_brush;
-static ID2D1StrokeStyle* g_round;
-static float g_dpi = 96;
 static float g_alpha = 1;                // what is drawn now fades in with the step it belongs to
 
 enum { F_TITLE, F_BODY, F_SMALL, F_LABEL, F_MONO, F_DOT, F_BUTTON, F_COUNT };
-static IDWriteTextFormat* g_fmt[F_COUNT];
-static IDWriteInlineObject* g_ellipsis[F_COUNT];
 static float g_track[F_COUNT];           // letter spacing in DIPs (the title is set a little tight)
 
 enum { T_LEFT = 0, T_CENTER = 1, T_RIGHT = 2, T_VCENTER = 4, T_WRAP = 8 };
@@ -825,6 +1260,20 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
     };
     return ch(16) | ch(8) | ch(0);
 }
+
+static void redraw();
+
+#ifdef _WIN32
+static ID2D1Factory* g_d2d;
+static IDWriteFactory* g_dw;
+static IDWriteFontCollection* g_fonts;   // launcher\fonts\, or null when it is missing (the system's fonts)
+static ID2D1HwndRenderTarget* g_rt;
+static ID2D1SolidColorBrush* g_brush;
+static ID2D1StrokeStyle* g_round;
+static float g_dpi = 96;
+
+static IDWriteTextFormat* g_fmt[F_COUNT];
+static IDWriteInlineObject* g_ellipsis[F_COUNT];
 
 static ID2D1SolidColorBrush* brush(uint32_t rgb) {
     g_brush->SetColor(D2D1::ColorF(rgb, g_alpha));
@@ -929,6 +1378,373 @@ static void stroke_circle(float x, float y, float r, uint32_t color, float width
     g_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), r, r), brush(color), width);
 }
 
+static void fill_rect(D2D1_RECT_F r, uint32_t color) { g_rt->FillRectangle(r, brush(color)); }
+
+static void push_clip(D2D1_RECT_F r) { g_rt->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED); }
+static void pop_clip() { g_rt->PopAxisAlignedClip(); }
+
+// A line with round ends
+static void line_round(float x0, float y0, float x1, float y1, float width, uint32_t color) {
+    g_rt->DrawLine({x0, y0}, {x1, y1}, brush(color), width, g_round);
+}
+
+static void fill_triangle(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, uint32_t color) {
+    ID2D1PathGeometry* g = nullptr;
+    ID2D1GeometrySink* s = nullptr;
+    if (FAILED(g_d2d->CreatePathGeometry(&g))) return;
+    g->Open(&s);
+    s->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
+    s->AddLine(b);
+    s->AddLine(c);
+    s->EndFigure(D2D1_FIGURE_END_CLOSED);
+    s->Close();
+    s->Release();
+    g_rt->FillGeometry(g, brush(color));
+    g->Release();
+}
+
+// What is drawn until pop_xform: scaled by <s> around (cx, cy), then moved down by <dy>
+static std::vector<D2D1_MATRIX_3X2_F> g_xforms;
+static void push_xform(float s, float cx, float cy, float dy) {
+    D2D1_MATRIX_3X2_F old;
+    g_rt->GetTransform(&old);
+    g_xforms.push_back(old);
+    g_rt->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {cx, cy}) * D2D1::Matrix3x2F::Translation(0, dy) * old);
+}
+static void pop_xform() {
+    g_rt->SetTransform(g_xforms.back());
+    g_xforms.pop_back();
+}
+
+// A frame: the target made when there is none (or the device was lost), cleared to the background
+static bool frame_begin() {
+    if (!g_rt) {
+        RECT rc;
+        GetClientRect(g_hwnd, &rc);
+        const auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(), g_dpi, g_dpi);
+        if (FAILED(g_d2d->CreateHwndRenderTarget(props, D2D1::HwndRenderTargetProperties(g_hwnd, D2D1::SizeU(rc.right, rc.bottom)), &g_rt)))
+            return false;
+        g_rt->CreateSolidColorBrush(D2D1::ColorF(0), &g_brush);
+    }
+    g_rt->BeginDraw();
+    g_rt->Clear(D2D1::ColorF(col::bg));
+    return true;
+}
+static D2D1_SIZE_F frame_size() { return g_rt->GetSize(); }
+static void frame_end() {
+    if (g_rt->EndDraw() == D2DERR_RECREATE_TARGET) {
+        g_brush->Release();
+        g_rt->Release();
+        g_brush = nullptr;
+        g_rt = nullptr;
+        redraw();
+    }
+}
+#else
+// cairo, Pango and fontconfig: the few calls the launcher makes, declared here so that only the libraries are needed
+// (libcairo.so.2, libpango-1.0.so.0, libpangocairo-1.0.so.0, libgobject-2.0.so.0, libfontconfig.so.1: every desktop
+// has them), not their -devel packages
+extern "C" {
+typedef struct _cairo cairo_t;
+typedef struct _cairo_surface cairo_surface_t;
+typedef struct _cairo_font_options cairo_font_options_t;
+cairo_surface_t* cairo_image_surface_create(int format, int width, int height);
+unsigned char* cairo_image_surface_get_data(cairo_surface_t* s);
+int cairo_image_surface_get_stride(cairo_surface_t* s);
+void cairo_surface_flush(cairo_surface_t* s);
+void cairo_surface_destroy(cairo_surface_t* s);
+cairo_t* cairo_create(cairo_surface_t* target);
+void cairo_destroy(cairo_t* cr);
+void cairo_save(cairo_t* cr);
+void cairo_restore(cairo_t* cr);
+void cairo_identity_matrix(cairo_t* cr);
+void cairo_translate(cairo_t* cr, double tx, double ty);
+void cairo_scale(cairo_t* cr, double sx, double sy);
+void cairo_set_source_rgba(cairo_t* cr, double r, double g, double b, double a);
+void cairo_paint(cairo_t* cr);
+void cairo_fill(cairo_t* cr);
+void cairo_stroke(cairo_t* cr);
+void cairo_clip(cairo_t* cr);
+void cairo_new_path(cairo_t* cr);
+void cairo_new_sub_path(cairo_t* cr);
+void cairo_close_path(cairo_t* cr);
+void cairo_move_to(cairo_t* cr, double x, double y);
+void cairo_line_to(cairo_t* cr, double x, double y);
+void cairo_arc(cairo_t* cr, double xc, double yc, double radius, double angle1, double angle2);
+void cairo_rectangle(cairo_t* cr, double x, double y, double width, double height);
+void cairo_set_line_width(cairo_t* cr, double width);
+void cairo_set_line_cap(cairo_t* cr, int cap);
+void cairo_set_line_join(cairo_t* cr, int join);
+cairo_font_options_t* cairo_font_options_create(void);
+void cairo_font_options_destroy(cairo_font_options_t* o);
+void cairo_font_options_set_antialias(cairo_font_options_t* o, int antialias);
+void cairo_font_options_set_hint_style(cairo_font_options_t* o, int style);
+void cairo_font_options_set_hint_metrics(cairo_font_options_t* o, int metrics);
+
+typedef struct _PangoContext PangoContext;
+typedef struct _PangoLayout PangoLayout;
+typedef struct _PangoFontDescription PangoFontDescription;
+typedef struct _PangoAttrList PangoAttrList;
+typedef struct _PangoAttribute PangoAttribute;
+struct PangoRectangle {
+    int x, y, width, height;
+};
+PangoContext* pango_cairo_create_context(cairo_t* cr);
+void pango_cairo_context_set_font_options(PangoContext* context, const cairo_font_options_t* options);
+void pango_cairo_update_context(cairo_t* cr, PangoContext* context);
+void pango_cairo_show_layout(cairo_t* cr, PangoLayout* layout);
+PangoLayout* pango_layout_new(PangoContext* context);
+void pango_layout_set_text(PangoLayout* layout, const char* text, int length);
+void pango_layout_set_font_description(PangoLayout* layout, const PangoFontDescription* desc);
+void pango_layout_set_width(PangoLayout* layout, int width);
+void pango_layout_set_wrap(PangoLayout* layout, int wrap);
+void pango_layout_set_ellipsize(PangoLayout* layout, int ellipsize);
+void pango_layout_set_alignment(PangoLayout* layout, int alignment);
+void pango_layout_set_attributes(PangoLayout* layout, PangoAttrList* attrs);
+void pango_layout_get_extents(PangoLayout* layout, PangoRectangle* ink_rect, PangoRectangle* logical_rect);
+PangoFontDescription* pango_font_description_new(void);
+void pango_font_description_set_family(PangoFontDescription* desc, const char* family);
+void pango_font_description_set_weight(PangoFontDescription* desc, int weight);
+void pango_font_description_set_absolute_size(PangoFontDescription* desc, double size);
+PangoAttrList* pango_attr_list_new(void);
+void pango_attr_list_unref(PangoAttrList* list);
+void pango_attr_list_insert(PangoAttrList* list, PangoAttribute* attr);
+PangoAttribute* pango_attr_letter_spacing_new(int letter_spacing);
+void g_object_unref(void* object);
+
+typedef struct _FcConfig FcConfig;
+FcConfig* FcConfigGetCurrent(void);
+int FcConfigAppFontAddFile(FcConfig* config, const unsigned char* file);
+}
+enum { CAIRO_FORMAT_RGB24 = 1, CAIRO_LINE_CAP_ROUND = 1, CAIRO_LINE_JOIN_ROUND = 1, CAIRO_ANTIALIAS_GRAY = 2,
+       CAIRO_HINT_STYLE_SLIGHT = 2, CAIRO_HINT_METRICS_OFF = 1 };
+constexpr float PANGO_SCALE = 1024;
+enum { PANGO_WRAP_WORD = 0, PANGO_ELLIPSIZE_END = 3, PANGO_ALIGN_LEFT = 0, PANGO_ALIGN_CENTER = 1,
+       PANGO_ALIGN_RIGHT = 2 };
+
+// The window's pixels: a cairo image, copied into an SDL texture each frame. g_scale: pixels per DIP (the display's
+// scale: 1.25 on a desktop set to 125%), so the layout below is the same as on Windows at any scale.
+static SDL_Renderer* g_ren;
+static SDL_Texture* g_tex;
+static int g_px_w, g_px_h;
+static cairo_surface_t* g_surf;
+static cairo_t* g_cr;
+static PangoContext* g_pctx;
+static float g_scale = 1;
+static PangoFontDescription* g_font[F_COUNT];
+
+static void source(uint32_t rgb) {
+    cairo_set_source_rgba(g_cr, ((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0, (rgb & 255) / 255.0, g_alpha);
+}
+
+// Fonts: Instrument Sans at 400 for text and 500 for headings, buttons and labels; DM Mono for output and build ids
+// (launcher/fonts, given to fontconfig for this process only); the desktop's sans-serif and monospace without them
+static void create_formats() {
+    bool own_sans = false, own_mono = false;
+    FcConfig* fc = FcConfigGetCurrent();
+    std::error_code ec;
+    for (fs::directory_iterator it(g_root / "launcher" / "fonts", ec), end; !ec && it != end; it.increment(ec)) {
+        if (lower(it->path().extension().wstring()) != L".ttf") continue;
+        if (!FcConfigAppFontAddFile(fc, (const unsigned char*)it->path().c_str())) continue;
+        const std::wstring n = lower(it->path().filename().wstring());
+        own_sans |= n.rfind(L"instrumentsans", 0) == 0;
+        own_mono |= n.rfind(L"dmmono", 0) == 0;
+    }
+    const char* sans = own_sans ? "Instrument Sans" : "sans-serif";
+    const char* mono = own_mono ? "DM Mono" : "monospace";
+    const int head = own_sans ? 500 : 600;
+    struct F {
+        const char* family;
+        int weight;
+        float size, track;
+    } fs_[F_COUNT] = {
+        {sans, head, 26, own_sans ? -0.7f : 0}, {sans, 400, 14, 0}, {sans, 400, 12.5f, 0}, {sans, head, 12.5f, 0},
+        {mono, 400, 12.5f, 0}, {sans, head, 15, 0}, {sans, head, 14, 0},
+    };
+    for (int i = 0; i < F_COUNT; i++) {
+        g_font[i] = pango_font_description_new();
+        pango_font_description_set_family(g_font[i], fs_[i].family);
+        pango_font_description_set_weight(g_font[i], fs_[i].weight);
+        pango_font_description_set_absolute_size(g_font[i], fs_[i].size * PANGO_SCALE);
+        g_track[i] = fs_[i].track;
+    }
+    // Grey antialiasing and outlines at their true size (no hinted metrics), as DirectWrite lays text out
+    cairo_surface_t* one = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
+    cairo_t* cr = cairo_create(one);
+    g_pctx = pango_cairo_create_context(cr);
+    cairo_font_options_t* fo = cairo_font_options_create();
+    cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(fo, CAIRO_HINT_STYLE_SLIGHT);
+    cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_OFF);
+    pango_cairo_context_set_font_options(g_pctx, fo);
+    cairo_font_options_destroy(fo);
+    cairo_destroy(cr);
+    cairo_surface_destroy(one);
+}
+
+// <s> laid out <w> wide: one line ending in an ellipsis when it does not fit, or wrapped at words (T_WRAP)
+static PangoLayout* make_layout(const std::wstring& s, int f, float w, int flags) {
+    PangoLayout* l = pango_layout_new(g_pctx);
+    const std::string u = narrow(s);
+    pango_layout_set_text(l, u.c_str(), (int)u.size());
+    pango_layout_set_font_description(l, g_font[f]);
+    pango_layout_set_width(l, (int)(w * PANGO_SCALE));
+    if (flags & T_WRAP) pango_layout_set_wrap(l, PANGO_WRAP_WORD);
+    else pango_layout_set_ellipsize(l, PANGO_ELLIPSIZE_END);
+    pango_layout_set_alignment(l, flags & T_CENTER ? PANGO_ALIGN_CENTER : flags & T_RIGHT ? PANGO_ALIGN_RIGHT : PANGO_ALIGN_LEFT);
+    if (g_track[f]) {
+        PangoAttrList* al = pango_attr_list_new();
+        pango_attr_list_insert(al, pango_attr_letter_spacing_new((int)(g_track[f] * PANGO_SCALE)));
+        pango_layout_set_attributes(l, al);
+        pango_attr_list_unref(al);
+    }
+    return l;
+}
+
+static void text(const std::wstring& s, int f, D2D1_RECT_F r, uint32_t color, int flags = 0) {
+    if (s.empty() || r.right <= r.left) return;
+    PangoLayout* l = make_layout(s, f, r.right - r.left, flags);
+    PangoRectangle ink, logical;
+    pango_layout_get_extents(l, &ink, &logical);
+    float y = r.top;
+    if (flags & T_VCENTER) y += ((r.bottom - r.top) - (float)logical.height / PANGO_SCALE) / 2;
+    cairo_save(g_cr);
+    cairo_rectangle(g_cr, r.left, r.top, r.right - r.left, r.bottom - r.top);
+    cairo_clip(g_cr);
+    source(color);
+    cairo_move_to(g_cr, r.left, y);
+    pango_cairo_show_layout(g_cr, l);
+    cairo_restore(g_cr);
+    g_object_unref(l);
+}
+
+static D2D1_SIZE_F measure(const std::wstring& s, int f, float maxw, int flags = 0) {
+    PangoLayout* l = make_layout(s, f, maxw, flags);
+    PangoRectangle ink, logical;
+    pango_layout_get_extents(l, &ink, &logical);
+    g_object_unref(l);
+    return {(float)logical.width / PANGO_SCALE, (float)logical.height / PANGO_SCALE};
+}
+
+static void round_path(D2D1_RECT_F r, float radius) {
+    radius = std::min({radius, (r.right - r.left) / 2, (r.bottom - r.top) / 2});
+    cairo_new_path(g_cr);
+    cairo_new_sub_path(g_cr);
+    cairo_arc(g_cr, r.right - radius, r.top + radius, radius, -M_PI / 2, 0);
+    cairo_arc(g_cr, r.right - radius, r.bottom - radius, radius, 0, M_PI / 2);
+    cairo_arc(g_cr, r.left + radius, r.bottom - radius, radius, M_PI / 2, M_PI);
+    cairo_arc(g_cr, r.left + radius, r.top + radius, radius, M_PI, 3 * M_PI / 2);
+    cairo_close_path(g_cr);
+}
+
+static void fill_round(D2D1_RECT_F r, float radius, uint32_t color) {
+    round_path(r, radius);
+    source(color);
+    cairo_fill(g_cr);
+}
+
+// A 1px line just inside <r>
+static void stroke_round(D2D1_RECT_F r, float radius, uint32_t color) {
+    round_path({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, radius - 0.5f);
+    source(color);
+    cairo_set_line_width(g_cr, 1);
+    cairo_stroke(g_cr);
+}
+
+static void fill_circle(float x, float y, float r, uint32_t color) {
+    cairo_new_path(g_cr);
+    cairo_arc(g_cr, x, y, r, 0, 2 * M_PI);
+    source(color);
+    cairo_fill(g_cr);
+}
+
+static void stroke_circle(float x, float y, float r, uint32_t color, float width) {
+    cairo_new_path(g_cr);
+    cairo_arc(g_cr, x, y, r, 0, 2 * M_PI);
+    source(color);
+    cairo_set_line_width(g_cr, width);
+    cairo_stroke(g_cr);
+}
+
+static void fill_rect(D2D1_RECT_F r, uint32_t color) {
+    cairo_new_path(g_cr);
+    cairo_rectangle(g_cr, r.left, r.top, r.right - r.left, r.bottom - r.top);
+    source(color);
+    cairo_fill(g_cr);
+}
+
+static void push_clip(D2D1_RECT_F r) {
+    cairo_save(g_cr);
+    cairo_new_path(g_cr);
+    cairo_rectangle(g_cr, r.left, r.top, r.right - r.left, r.bottom - r.top);
+    cairo_clip(g_cr);
+}
+static void pop_clip() { cairo_restore(g_cr); }
+
+// A line with round ends
+static void line_round(float x0, float y0, float x1, float y1, float width, uint32_t color) {
+    cairo_new_path(g_cr);
+    cairo_move_to(g_cr, x0, y0);
+    cairo_line_to(g_cr, x1, y1);
+    cairo_set_line_cap(g_cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(g_cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_line_width(g_cr, width);
+    source(color);
+    cairo_stroke(g_cr);
+}
+
+static void fill_triangle(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, uint32_t color) {
+    cairo_new_path(g_cr);
+    cairo_move_to(g_cr, a.x, a.y);
+    cairo_line_to(g_cr, b.x, b.y);
+    cairo_line_to(g_cr, c.x, c.y);
+    cairo_close_path(g_cr);
+    source(color);
+    cairo_fill(g_cr);
+}
+
+// What is drawn until pop_xform: scaled by <s> around (cx, cy), then moved down by <dy>
+static void push_xform(float s, float cx, float cy, float dy) {
+    cairo_save(g_cr);
+    cairo_translate(g_cr, cx, cy + dy);
+    cairo_scale(g_cr, s, s);
+    cairo_translate(g_cr, -cx, -cy);
+}
+static void pop_xform() { cairo_restore(g_cr); }
+
+// A frame: the image (and the texture it goes to) made again when the window's size in pixels changed
+static bool frame_begin() {
+    int pw = 0, ph = 0;
+    SDL_GetWindowSizeInPixels(g_window, &pw, &ph);
+    if (pw <= 0 || ph <= 0) return false;
+    const float sc = SDL_GetWindowDisplayScale(g_window);
+    g_scale = sc > 0 ? sc : 1;
+    if (!g_surf || pw != g_px_w || ph != g_px_h) {
+        if (g_cr) cairo_destroy(g_cr);
+        if (g_surf) cairo_surface_destroy(g_surf);
+        if (g_tex) SDL_DestroyTexture(g_tex);
+        g_surf = cairo_image_surface_create(CAIRO_FORMAT_RGB24, pw, ph);
+        g_cr = cairo_create(g_surf);
+        g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, pw, ph);
+        g_px_w = pw, g_px_h = ph;
+    }
+    if (!g_tex) return false;
+    cairo_identity_matrix(g_cr);
+    cairo_scale(g_cr, g_scale, g_scale);
+    pango_cairo_update_context(g_cr, g_pctx);
+    source(col::bg);
+    cairo_paint(g_cr);
+    return true;
+}
+static D2D1_SIZE_F frame_size() { return {g_px_w / g_scale, g_px_h / g_scale}; }
+static void frame_end() {
+    cairo_surface_flush(g_surf);
+    SDL_UpdateTexture(g_tex, nullptr, cairo_image_surface_get_data(g_surf), cairo_image_surface_get_stride(g_surf));
+    SDL_RenderTexture(g_ren, g_tex, nullptr, nullptr);
+    SDL_RenderPresent(g_ren);
+}
+#endif
+
 // ---------------------------------------------------------------------------------------------------------------
 // UI state
 
@@ -950,7 +1766,7 @@ static std::wstring g_nup_dest;    // the folder a .nup is being unpacked into (
 static bool g_unpack_log = false;  // the Game step shows the unpacking's status and output
 static bool g_bringing = false;    // an older version being brought over (bring_over)
 
-// A scripted run, launcher.exe [--bring-over <older folder>] [--build] [--quit] [--log <file>]: what the buttons do,
+// A scripted run, launcher.exe [--bring-over <older folder>] [--setup] [--build] [--quit] [--log <file>]: what the buttons do,
 // one action after the other, each once the one before finished well. --quit closes the launcher at the end, or at
 // the first failure, with exit code 0 or 1 (--log keeps the output).
 static std::deque<std::pair<std::wstring, std::wstring>> g_script;
@@ -961,14 +1777,40 @@ static void run_script();
 static const wchar_t* STEP_NAMES[4] = {L"Game", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TITLES[4] = {L"Your game dump", L"Dependencies", L"Build", L"Play"};
 static const wchar_t* STEP_TEXT[4] = {
-    L"Pick your own dump of the game (the folder with exefs\\ and romfs\\) or a .nup file of it.",
+    L"Pick your own dump of the game (the folder with exefs" DS L" and romfs" DS L") or a .nup file of it.",
+#ifdef _WIN32
     L"Set up installs what is missing into the repository. No admin rights or Visual Studio needed.",
+#else
+    L"Set up installs what is missing into the repository, no root needed. What is marked red comes from your distribution's packages.",
+#endif
     L"Lifts the game to C++, compiles it and translates its shaders. The first build takes about half an hour; after an update only what changed is built again.",
     L"Starts the game. Bake textures once so the first races do not hitch.",
 };
 
+#ifdef _WIN32
 static void redraw() {
     InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+#else
+static bool g_dirty = true;   // the window is drawn again once the events waiting are handled
+static void redraw() { g_dirty = true; }
+#endif
+
+// A message, or a question answered Yes or No (M_ASK, M_WARN): true for Yes. Windows' message box; Linux: drawn in
+// the window (modal_box)
+enum { M_INFO, M_ERROR, M_ASK, M_WARN };
+#ifndef _WIN32
+static bool modal_box(const std::wstring& text, const wchar_t* title, int kind);
+#endif
+static bool msg_box(const std::wstring& text, const wchar_t* title, int kind) {
+#ifdef _WIN32
+    const UINT f = kind == M_INFO ? MB_ICONINFORMATION : kind == M_ERROR ? MB_ICONERROR : kind == M_ASK ? MB_YESNO | MB_ICONQUESTION
+                                                                                                        : MB_YESNO | MB_ICONWARNING;
+    const int r = MessageBoxW(g_hwnd, text.c_str(), title, f);
+    return kind < M_ASK || r == IDYES;
+#else
+    return modal_box(text, title, kind);
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -983,7 +1825,9 @@ static std::map<int, Anim> g_anim;
 static bool g_motion = true, g_moving = false;
 static ULONGLONG g_frame_ms = 0, g_step_ms = 0;
 static int g_shown_step = -1;
+#ifdef _WIN32
 constexpr UINT_PTR TIMER_JOB = 1, TIMER_ANIM = 2;
+#endif
 
 static float ease(float p) {   // an ease-out close to cubic-bezier(.2, .8, .2, 1)
     p = std::clamp(p, 0.f, 1.f);
@@ -1026,15 +1870,12 @@ static bool step_anims() {
 
 // Draws with a control's hover rise and press sink around <r>'s centre
 struct Lift {
-    D2D1_MATRIX_3X2_F old;
     Lift(D2D1_RECT_F r, const Anim& a, float rise = 1) {
-        g_rt->GetTransform(&old);
         const float h = ease(a.hov), p = ease(a.press), s = 1 - 0.015f * p;
         const float dy = -rise * h * (1 - p) + p;
-        g_rt->SetTransform(D2D1::Matrix3x2F::Scale(s, s, {(r.left + r.right) / 2, (r.top + r.bottom) / 2}) *
-                           D2D1::Matrix3x2F::Translation(0, dy) * old);
+        push_xform(s, (r.left + r.right) / 2, (r.top + r.bottom) / 2, dy);
     }
-    ~Lift() { g_rt->SetTransform(old); }
+    ~Lift() { pop_xform(); }
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1150,7 +1991,7 @@ static void draw_log(D2D1_RECT_F r) {
         text(L"Output shows up here.", F_MONO, in, col::dim);
         return;
     }
-    g_rt->PushAxisAlignedClip(in, D2D1_ANTIALIAS_MODE_ALIASED);
+    push_clip(in);
     const int first = std::max(0, total - vis - g_log_scroll);
     for (int i = first, k = 0; i < total && k < vis; i++, k++) {
         const std::wstring& l = g_log[i];
@@ -1160,28 +2001,16 @@ static void draw_log(D2D1_RECT_F r) {
         else if (bad_line(lo)) c = col::red;
         text(l, F_MONO, {in.left, in.top + k * lh, in.right, in.top + (k + 1) * lh}, c);
     }
-    g_rt->PopAxisAlignedClip();
+    pop_clip();
 }
 
 static void draw_check(float x, float y, uint32_t color) {
-    auto* b = brush(color);
-    g_rt->DrawLine({x - 6.5f, y + 0.5f}, {x - 2.2f, y + 4.8f}, b, 2.4f, g_round);
-    g_rt->DrawLine({x - 2.2f, y + 4.8f}, {x + 7, y - 5}, b, 2.4f, g_round);
+    line_round(x - 6.5f, y + 0.5f, x - 2.2f, y + 4.8f, 2.4f, color);
+    line_round(x - 2.2f, y + 4.8f, x + 7, y - 5, 2.4f, color);
 }
 
 static void draw_play_icon(float x, float y, uint32_t color) {
-    ID2D1PathGeometry* g = nullptr;
-    ID2D1GeometrySink* s = nullptr;
-    if (FAILED(g_d2d->CreatePathGeometry(&g))) return;
-    g->Open(&s);
-    s->BeginFigure({x - 5, y - 8}, D2D1_FIGURE_BEGIN_FILLED);
-    s->AddLine({x + 8.5f, y});
-    s->AddLine({x - 5, y + 8});
-    s->EndFigure(D2D1_FIGURE_END_CLOSED);
-    s->Close();
-    s->Release();
-    g_rt->FillGeometry(g, brush(color));
-    g->Release();
+    fill_triangle({x - 5, y - 8}, {x + 8.5f, y}, {x - 5, y + 8}, color);
 }
 
 // The game version: one segmented control, right-aligned in the title row; returns where it starts
@@ -1213,6 +2042,7 @@ static float draw_versions(float x1, float y, bool enabled) {
 
 // The C++ compiler: a segmented control at (x0, y), BUILD_CC=mingw or cl in local.cfg; returns the y below it.
 // clang (clang-cl) counts as Visual Studio, whose tools it builds with.
+#ifdef _WIN32
 static const wchar_t* const CC_NAMES[] = {L"LLVM MinGW", L"Visual Studio"};
 static float draw_compiler(float x0, float x1, float y, bool enabled) {
     const int cur = build_cc() == L"mingw" ? 0 : 1;
@@ -1244,6 +2074,7 @@ static float draw_compiler(float x0, float x1, float y, bool enabled) {
     text(note, F_SMALL, {box.right + 14, box.top, x1, box.bottom}, col::muted, T_VCENTER | T_WRAP);
     return box.bottom + 22;
 }
+#endif
 
 static void paint_steps(D2D1_RECT_F p) {
     const float x0 = p.left + 36, x1 = p.right - 36;
@@ -1297,7 +2128,9 @@ static void paint_steps(D2D1_RECT_F p) {
         break;
     }
     case 1: {
+#ifdef _WIN32
         y = draw_compiler(x0, x1, y, !busy);
+#endif
         y = draw_rows(g_rows[1], 2, x0, x1, y) + 18;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -1319,9 +2152,13 @@ static void paint_steps(D2D1_RECT_F p) {
         }
         y = draw_rows(rows, 2, x0, x1, y);
         const std::wstring mp = env_var(L"BUILD_MP");
+#ifdef _WIN32
         text(std::wstring(CC_NAMES[build_cc() == L"mingw" ? 0 : 1]) + L" (chosen in Dependencies), up to " + mp +
                  L" compiler processes at once (BUILD_MP)", F_SMALL,
              {x0, y + 6, x1, y + 26}, col::muted);
+#else
+        text(L"clang, up to " + mp + L" compiler processes at once (BUILD_MP)", F_SMALL, {x0, y + 6, x1, y + 26}, col::muted);
+#endif
         y += 40;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -1342,8 +2179,13 @@ static void paint_steps(D2D1_RECT_F p) {
         y = draw_rows(g_rows[3], 2, x0, x1, y);
         std::wstring settings;
         for (const auto& [k, v] : game_env()) settings += (settings.empty() ? L"" : L"   ") + k + L"=" + v;
+#ifdef _WIN32
         text(L"Settings: " + (settings.empty() ? std::wstring(L"the defaults") : settings) + L"   (HOST_* lines in local.cfg)", F_SMALL,
              {x0, y + 6, x1, y + 26}, col::muted);
+#else
+        text(L"Settings: " + (settings.empty() ? std::wstring(L"the defaults") : settings) + L"   (HOST_* lines in local.linux.cfg or local.cfg)",
+             F_SMALL, {x0, y + 6, x1, y + 26}, col::muted);
+#endif
         y += 40;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
@@ -1364,37 +2206,29 @@ static void paint_panel(D2D1_RECT_F p) {
     fill_round(p, R_PANEL, col::panel);
     stroke_round(p, R_PANEL, col::line);
     const float t = g_motion && g_step_ms ? ease((GetTickCount64() - g_step_ms) / 200.f) : 1;
-    D2D1_MATRIX_3X2_F old;
-    g_rt->GetTransform(&old);
-    g_rt->SetTransform(D2D1::Matrix3x2F::Translation(0, (1 - t) * 6) * old);
+    push_xform(1, 0, 0, (1 - t) * 6);
     g_alpha = t;
     paint_steps(p);
     g_alpha = 1;
-    g_rt->SetTransform(old);
+    pop_xform();
 }
 
+#ifndef _WIN32
+static void paint_modal(D2D1_SIZE_F sz);
+#endif
+
 static void paint() {
-    if (!g_rt) {
-        RECT rc;
-        GetClientRect(g_hwnd, &rc);
-        const auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(), g_dpi, g_dpi);
-        if (FAILED(g_d2d->CreateHwndRenderTarget(props, D2D1::HwndRenderTargetProperties(g_hwnd, D2D1::SizeU(rc.right, rc.bottom)), &g_rt)))
-            return;
-        g_rt->CreateSolidColorBrush(D2D1::ColorF(0), &g_brush);
-    }
     const bool moving = step_anims();
-    g_rt->BeginDraw();
-    g_rt->Clear(D2D1::ColorF(col::bg));
+    if (!frame_begin()) return;
     g_hits.clear();
     g_log_rect = {};
-    const D2D1_SIZE_F sz = g_rt->GetSize();
+    const D2D1_SIZE_F sz = frame_size();
     const float m = 32, r = 18, cy = 58;
 
     // The steps: dots on a line, the finished ones white
     float cx[4];
     for (int i = 0; i < 4; i++) cx[i] = m + 46 + (sz.width - 2 * m - 92) * i / 3.f;
-    for (int i = 0; i < 3; i++)
-        g_rt->FillRectangle({cx[i] + r, cy - 1, cx[i + 1] - r, cy + 1}, brush(g_done[i] && g_done[i + 1] ? col::accent : col::line));
+    for (int i = 0; i < 3; i++) fill_rect({cx[i] + r, cy - 1, cx[i + 1] - r, cy + 1}, g_done[i] && g_done[i + 1] ? col::accent : col::line);
     for (int i = 0; i < 4; i++) {
         const D2D1_RECT_F hit{cx[i] - r - 8, cy - r - 8, cx[i] + r + 8, cy + r + 30};
         g_hits.push_back({B_DOT + i, hit});
@@ -1419,18 +2253,17 @@ static void paint() {
     }
 
     paint_panel({m, cy + r + 48, sz.width - m, sz.height - m});
+#ifndef _WIN32
+    paint_modal(sz);   // a question over it all
+#endif
 
-    if (g_rt->EndDraw() == D2DERR_RECREATE_TARGET) {
-        g_brush->Release();
-        g_rt->Release();
-        g_brush = nullptr;
-        g_rt = nullptr;
-        redraw();
-    }
+    frame_end();
     // The next frame while something moves; the timer stops once everything rests
     g_moving = moving;
+#ifdef _WIN32
     if (moving) SetTimer(g_hwnd, TIMER_ANIM, 15, nullptr);
     else KillTimer(g_hwnd, TIMER_ANIM);
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1453,7 +2286,9 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
         std::lock_guard lk(g_mx);
         g_prog = {};
     }
+#ifdef _WIN32
     SetTimer(g_hwnd, TIMER_JOB, 500, nullptr);
+#endif
     std::thread([cmds = std::move(cmds)] {
         DWORD code = 0;
         for (const auto& c : cmds) {
@@ -1465,7 +2300,11 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
             if (code || g_cancel) break;
             if (c.after) c.after();
         }
+#ifdef _WIN32
         PostMessageW(g_hwnd, WM_APP_DONE, code, g_cancel ? 1 : 0);
+#else
+        post_event(g_ev_done, (int)code, g_cancel);
+#endif
     }).detach();
     redraw();
 }
@@ -1473,12 +2312,18 @@ static void start_job(const std::wstring& name, std::vector<Cmd> cmds) {
 static void stop_job() {
     g_cancel = true;
     std::lock_guard lk(g_mx);
+#ifdef _WIN32
     if (g_job) TerminateJobObject(g_job, 1);
+#else
+    if (g_job) kill(-g_job, SIGKILL);
+#endif
 }
 
 static void job_done(DWORD code, bool cancelled) {
     g_running = false;
+#ifdef _WIN32
     KillTimer(g_hwnd, TIMER_JOB);
+#endif
     const std::wstring took = clock_text(GetTickCount64() - g_job_start);
     if (cancelled) {
         g_status = L"Stopped after " + took;
@@ -1499,7 +2344,7 @@ static void job_done(DWORD code, bool cancelled) {
             apply_version();
             save_setting(L"LAUNCHER_VERSION", ver().name);
         }
-        if (!save_setting(game_key(), dest)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+        if (!save_setting(game_key(), dest)) msg_box(L"Could not write " CFG_NAME L".", L"Launcher", M_ERROR);
         g_status = L"Unpacked in " + took + L" into " + dest;
     }
     // An older version brought over: its game version, Python and .NET (tools\python, tools\dotnet) are here now
@@ -1535,33 +2380,9 @@ static void select_version(int v) {
     refresh();
 }
 
+static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start);
 static void browse() {
-    IFileOpenDialog* d = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
-    DWORD o = 0;
-    d->GetOptions(&o);
-    d->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    d->SetTitle(L"The game dump: the folder holding exefs and romfs");
-    if (!g_game.empty()) {
-        IShellItem* si = nullptr;
-        if (SUCCEEDED(SHCreateItemFromParsingName(g_game.c_str(), nullptr, IID_PPV_ARGS(&si)))) {
-            d->SetFolder(si);
-            si->Release();
-        }
-    }
-    std::wstring picked;
-    if (SUCCEEDED(d->Show(g_hwnd))) {
-        IShellItem* it = nullptr;
-        if (SUCCEEDED(d->GetResult(&it))) {
-            PWSTR p = nullptr;
-            if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
-                picked = p;
-                CoTaskMemFree(p);
-            }
-            it->Release();
-        }
-    }
-    d->Release();
+    std::wstring picked = pick(true, L"The game dump: the folder holding exefs and romfs", g_game);
     if (picked.empty()) return;
     // exefs\ or romfs\ itself picked: the dump is the folder above
     const fs::path pp = picked;
@@ -1569,13 +2390,14 @@ static void browse() {
     if ((leaf == L"exefs" || leaf == L"romfs") && !path_exists(pp / "exefs")) picked = pp.parent_path().wstring();
     // A dump of another known version switches to it, and is saved as that version's dump
     if (const int v = dump_version(picked); v >= 0 && v != g_ver) select_version(v);
-    if (!save_setting(game_key(), picked)) MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+    if (!save_setting(game_key(), picked)) msg_box(L"Could not write " CFG_NAME L".", L"Launcher", M_ERROR);
     g_unpack_log = false;
     refresh();
     redraw();
 }
 
-// A file or folder dialog; '' when cancelled
+// A file or folder dialog; '' when cancelled (Linux: in the window section, through SDL)
+#ifdef _WIN32
 static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start) {
     IFileOpenDialog* d = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
@@ -1609,6 +2431,7 @@ static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& 
     d->Release();
     return picked;
 }
+#endif
 
 // A .nup (one file holding the game, its updates and add-ons): tools\nup.py says which version it holds, and unpacks it
 // (the newest update over the base, as Eglantine boots it) into a folder named after that version in a folder the user
@@ -1619,8 +2442,8 @@ static void open_nup() {
     // This comes before the Dependencies step, but unpacking needs Python and its zstd package
     check_python();
     if (g_tools.python.empty()) {
-        MessageBoxW(g_hwnd, L"Unpacking a .nup needs Python, which is not installed yet. Run Set up in the Dependencies "
-                            L"step (2) first, then open the .nup again.", L"Open .nup", MB_ICONINFORMATION);
+        msg_box(L"Unpacking a .nup needs Python, which is not installed yet. Run Set up in the Dependencies "
+                L"step (2) first, then open the .nup again.", L"Open .nup", M_INFO);
         return;
     }
     const bool install_pkgs = !g_tools.py_missing.empty();
@@ -1639,13 +2462,13 @@ static void open_nup() {
     if (code != 0 || version.empty()) {
         std::wstring why = trim(decode_output(out));
         if (why.size() > 600) why = L"…" + why.substr(why.size() - 600);
-        MessageBoxW(g_hwnd, (L"tools\\nup.py could not read this file.\n\n" + why).c_str(), L"Open .nup", MB_ICONERROR);
+        msg_box(L"tools" DS L"nup.py could not read this file.\n\n" + why, L"Open .nup", M_ERROR);
         return;
     }
     const bool known = std::any_of(std::begin(VERSIONS), std::end(VERSIONS), [&](const Version& v) { return version == v.name; });
-    if (!known && MessageBoxW(g_hwnd, (L"This .nup holds version " + version + L", which is not one this recompilation is made "
-                                       L"for (1.0.0 and 1.8.0). Unpack it anyway?").c_str(),
-                              L"Open .nup", MB_YESNO | MB_ICONWARNING) != IDYES)
+    if (!known && !msg_box(L"This .nup holds version " + version + L", which is not one this recompilation is made "
+                                                                     L"for (1.0.0 and 1.8.0). Unpack it anyway?",
+                           L"Open .nup", M_WARN))
         return;
     const std::wstring title = L"Where to unpack version " + version + L" (a folder \"" + version + L"\" is made in it)";
     const std::wstring parent = pick(true, title.c_str(), fs::path(file).parent_path().wstring());
@@ -1653,18 +2476,30 @@ static void open_nup() {
     fs::path dest = parent;
     if (lower(dest.filename().wstring()) != lower(version)) dest /= version;
     // Room for it: the files still to write, less what an earlier unpacking there already wrote (roughly)
+#ifdef _WIN32
     ULARGE_INTEGER room{};
-    if (GetDiskFreeSpaceExW(parent.c_str(), &room, nullptr, nullptr) && !path_exists(dest / "romfs") &&
-        room.QuadPart < bytes + (1ull << 30)) {
+    const bool room_known = GetDiskFreeSpaceExW(parent.c_str(), &room, nullptr, nullptr);
+    const unsigned long long free_bytes = room.QuadPart;
+#else
+    std::error_code sec;
+    const fs::space_info room = fs::space(parent, sec);
+    const bool room_known = !sec;
+    const unsigned long long free_bytes = room.available;
+#endif
+    if (room_known && !path_exists(dest / "romfs") && free_bytes < bytes + (1ull << 30)) {
         wchar_t msg[256];
-        swprintf(msg, 256, L"Version %s needs %.1f GB, and only %.1f GB are free there. Unpack anyway?", version.c_str(),
-                 bytes / 1e9, room.QuadPart / 1e9);
-        if (MessageBoxW(g_hwnd, msg, L"Open .nup", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+        swprintf(msg, 256, L"Version %ls needs %.1f GB, and only %.1f GB are free there. Unpack anyway?", version.c_str(),
+                 bytes / 1e9, free_bytes / 1e9);
+        if (!msg_box(msg, L"Open .nup", M_WARN)) return;
     }
     g_nup_dest = dest.wstring();
     g_unpack_log = true;
     std::vector<Cmd> cmds;
+#ifdef _WIN32
     if (install_pkgs) cmds.push_back({L"python tools\\deps.py install", g_root.wstring(), L"Python packages"});
+#else
+    if (install_pkgs) cmds.push_back({L"python3 tools/linux.py setup python", g_root.wstring(), L"Python packages"});
+#endif
     cmds.push_back({nup_py + L" extract \"" + file + L"\" \"" + g_nup_dest + L"\"", g_root.wstring(), L"Unpacking"});
     for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
     start_job(L"Unpacking version " + version, cmds);
@@ -1677,7 +2512,7 @@ static void open_nup() {
 // False when nothing started.
 static bool bring_over_from(const fs::path& picked, bool interactive) {
     const auto fail = [&](const wchar_t* why) {
-        if (interactive) MessageBoxW(g_hwnd, why, L"Bring over", MB_ICONINFORMATION);
+        if (interactive) msg_box(why, L"Bring over", M_INFO);
         else log_line(std::wstring(L"bring over: ") + why);
         return false;
     };
@@ -1687,30 +2522,51 @@ static bool bring_over_from(const fs::path& picked, bool interactive) {
             old = d;
             break;
         }
-        if (d == d.parent_path()) return fail(L"That is not a kart-recomp folder (it has no tools\\paths.py).");
+        if (d == d.parent_path()) return fail(L"That is not a kart-recomp folder (it has no tools" DS L"paths.py).");
     }
     std::error_code ec;
     if (fs::equivalent(old, g_root, ec)) return fail(L"That is this folder. Pick the older version's folder.");
     std::vector<std::wstring> items;
     for (const auto* d : BRING_OVER)
         if (path_exists(old / d) && !path_exists(g_root / d)) items.push_back(d);
-    const bool cfg = path_exists(old / "local.cfg");
-    if (items.empty() && !cfg) return fail(L"Nothing to bring over: that folder has no build and no local.cfg.");
+    const bool cfg = path_exists(old / CFG_NAME);
+    if (items.empty() && !cfg) return fail(L"Nothing to bring over: that folder has no build and no " CFG_NAME L".");
+#ifdef _WIN32
     wchar_t va[MAX_PATH] = {}, vb[MAX_PATH] = {};
     GetVolumePathNameW(old.c_str(), va, MAX_PATH);
     GetVolumePathNameW(g_root.c_str(), vb, MAX_PATH);
     const bool same = lower(va) == lower(vb);
+#else
+    struct stat sa{}, sb{};
+    const bool same = stat(old.c_str(), &sa) == 0 && stat(g_root.c_str(), &sb) == 0 && sa.st_dev == sb.st_dev;
+#endif
     const std::wstring ask = std::wstring(same ? L"Move" : L"Copy") +
         L" the build, the tools Set up installed, your saves and settings from\n\n" + old.wstring() + L"\n\ninto this folder?\n\n" +
         (same ? L"Moving is instant (same drive). The older version will not run afterwards."
               : L"It is on another drive, so this copies (it can take a few minutes). The older version stays as it is.");
-    if (interactive && MessageBoxW(g_hwnd, ask.c_str(), L"Bring over an older version", MB_YESNO | MB_ICONQUESTION) != IDYES)
-        return false;
+    if (interactive && !msg_box(ask, L"Bring over an older version", M_ASK)) return false;
 
     std::vector<Cmd> cmds;
     for (const auto& d : items) {
         const fs::path src = old / d, dst = g_root / d;
         Cmd c{std::wstring(same ? L"move " : L"copy ") + src.wstring(), g_root.wstring(), L"Bringing over " + d};
+#ifndef _WIN32
+        if (same) {
+            c.fn = [src, dst]() -> DWORD {
+                std::error_code e;
+                fs::create_directories(dst.parent_path(), e);
+                if (rename(src.c_str(), dst.c_str()) == 0) return 0;
+                log_line(L"could not move it (" + widen(strerror(errno)) + L")");
+                return 1;
+            };
+        } else {
+            // cp -a keeps the files' times (build_lib.py and build_host.py go by them)
+            c.fn = [src, dst]() -> DWORD {
+                return run_cmd({L"mkdir -p \"" + dst.parent_path().wstring() + L"\" && cp -a \"" + src.wstring() + L"\" \"" +
+                                    dst.wstring() + L"\"", L""});
+            };
+        }
+#else
         if (same) {
             c.fn = [src, dst]() -> DWORD {
                 std::error_code e;
@@ -1734,15 +2590,16 @@ static bool bring_over_from(const fs::path& picked, bool interactive) {
                 return code < 8 ? 0 : code;
             };
         }
+#endif
         cmds.push_back(c);
     }
     if (cfg) {
-        Cmd c{L"settings from " + (old / "local.cfg").wstring(), g_root.wstring(), L"Settings"};
+        Cmd c{L"settings from " + (old / CFG_NAME).wstring(), g_root.wstring(), L"Settings"};
         c.fn = [old]() -> DWORD {
             const auto have = local_cfg();
             const std::wstring from = lower(old.wstring());
             int n = 0;
-            for (const auto& l : read_lines(old / "local.cfg")) {
+            for (const auto& l : read_lines(old / CFG_NAME)) {
                 std::wstring w = widen(l);
                 w = w.substr(0, w.find(L'#'));
                 const size_t eq = w.find(L'=');
@@ -1777,7 +2634,15 @@ static void run_script() {
     while (!g_running) {
         if (g_script.empty() || g_exit_code) {
             log_line(g_exit_code ? L"script: failed" : L"script: done");
+#ifdef _WIN32
             if (g_script_quit) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+#else
+            if (g_script_quit) {
+                SDL_Event e{};
+                e.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&e);
+            }
+#endif
             g_scripting = false;
             return;
         }
@@ -1786,6 +2651,17 @@ static void run_script() {
         log_line(L"script: " + what + (arg.empty() ? L"" : L" " + arg));
         if (what == L"bring-over") {
             if (!bring_over_from(arg, false)) g_exit_code = 1;
+        } else if (what == L"setup") {
+            refresh();
+            if (g_done[1]) {
+                log_line(L"script: set up already");
+            } else if (!g_can_setup) {
+                log_line(L"script: cannot set up: what is marked red on the Dependencies step is missing");
+                g_exit_code = 1;
+            } else {
+                g_step = 1;
+                click(B_SETUP);
+            }
         } else if (what == L"build") {
             refresh();
             if (!g_can_build) {
@@ -1810,8 +2686,7 @@ static void click(int id) {
     } else if (id == B_CC || id == B_CC + 1) {
         // Each compiler keeps its own module libraries (build\mingw\*.a, build\*.lib), so switching back costs
         // nothing; switching to one not built yet makes Build compile the game with it (the Build step shows that)
-        if (!save_setting(L"BUILD_CC", id == B_CC ? L"mingw" : L"cl"))
-            MessageBoxW(g_hwnd, L"Could not write local.cfg.", L"Launcher", MB_ICONERROR);
+        if (!save_setting(L"BUILD_CC", id == B_CC ? L"mingw" : L"cl")) msg_box(L"Could not write " CFG_NAME L".", L"Launcher", M_ERROR);
         g_status.clear();
         refresh();
     } else if (id == B_BROWSE) {
@@ -1829,6 +2704,16 @@ static void click(int id) {
         // when the machine has none, the C++ compiler (llvm-mingw, from GitHub, checked against its SHA-256), the
         // Python packages (pip, from PyPI), then the translator from the NuGet packages in tools\xlate\packages
         std::vector<Cmd> cmds;
+#ifndef _WIN32
+        // Linux: tools/linux.py setup, one part per step (clang from LLVM's release, a virtual environment with the
+        // Python packages, .NET into tools/dotnet, the SPIR-V tools from the Vulkan SDK, the translator)
+        const std::wstring setup = L"python3 tools/linux.py setup ";
+        if (!llvm_ok()) cmds.push_back({setup + L"clang", root, L"C++ compiler"});
+        if (g_tools.python.empty() || !g_tools.py_missing.empty()) cmds.push_back({setup + L"python", root, L"Python packages"});
+        if (!g_tools.dotnet) cmds.push_back({setup + L"dotnet", root, L".NET SDK"});
+        if (!spirv_tools()) cmds.push_back({setup + L"spirv", root, L"SPIR-V tools"});
+        cmds.push_back({setup + L"xlate", root, L"Shader translator"});
+#else
         const std::wstring bootstrap = L"powershell -NoProfile -ExecutionPolicy Bypass -File tools\\bootstrap.ps1 ";
         if (g_tools.python.empty()) cmds.push_back({bootstrap + L"python", root, L"Python"});
         if (!g_tools.dotnet) cmds.push_back({bootstrap + L"dotnet", root, L".NET SDK"});
@@ -1837,12 +2722,11 @@ static void click(int id) {
         if (g_tools.python.empty() || !g_tools.py_missing.empty()) cmds.push_back({L"python tools\\deps.py install", root, L"Python packages"});
         cmds.push_back({L"dotnet build -c Release -o \"" + setting(L"NVN_XLATE") + L"\" tools\\xlate\\dmsh_xlate\\dmsh_xlate.csproj",
                         root, L"Shader translator"});
+#endif
         for (size_t i = 0; i < cmds.size(); i++) cmds[i].stage_i = (int)i + 1, cmds[i].stage_n = (int)cmds.size();
         start_job(L"Setting up", cmds);
     } else if (id == B_BUILD || id == B_REBUILD) {
-        if (id == B_REBUILD &&
-            MessageBoxW(g_hwnd, L"Unpack, lift and compile everything again? It takes about half an hour.", L"Rebuild everything",
-                        MB_YESNO | MB_ICONQUESTION) != IDYES)
+        if (id == B_REBUILD && !msg_box(L"Unpack, lift and compile everything again? It takes about half an hour.", L"Rebuild everything", M_ASK))
             return;
         const auto st = stages();
         // Build: in each chain, from the first stage that is not done (its output missing, or its tools changed:
@@ -1881,9 +2765,11 @@ static void click(int id) {
 // ---------------------------------------------------------------------------------------------------------------
 // Window
 
+#ifdef _WIN32
 static D2D1_POINT_2F to_dip(LPARAM lp) {
     return {GET_X_LPARAM(lp) * 96.f / g_dpi, GET_Y_LPARAM(lp) * 96.f / g_dpi};
 }
+#endif
 
 static int hit_test(D2D1_POINT_2F p) {
     for (const auto& h : g_hits)
@@ -1891,6 +2777,7 @@ static int hit_test(D2D1_POINT_2F p) {
     return B_NONE;
 }
 
+#ifdef _WIN32
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -2057,6 +2944,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         for (int i = 1; argv && i < argc; i++) {
             const std::wstring a = argv[i];
             if (a == L"--bring-over" && i + 1 < argc) g_script.push_back({L"bring-over", argv[++i]});
+            else if (a == L"--setup") g_script.push_back({L"setup", L""});
             else if (a == L"--build") g_script.push_back({L"build", L""});
             else if (a == L"--quit") g_script_quit = true;
             else if (a == L"--log" && i + 1 < argc) g_log_file = _wfopen(argv[++i], L"wb");
@@ -2124,3 +3012,338 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
     return (int)msg.wParam;
 }
+#else
+// ---------------------------------------------------------------------------------------------------------------
+// Linux: questions drawn over the window (Windows' message boxes), the desktop's file dialogs, the SDL window
+
+struct Modal {
+    std::wstring title, text;
+    int kind;
+    int answer = -1;   // 1 Yes (OK), 0 No; -1 while it is asked
+};
+static Modal* g_modal;                 // the question being asked
+static bool g_waiting_dialog = false;  // a file dialog is open: the window only draws itself
+static bool g_quit_asked = false;      // the window's close button (or --quit), handled by the main loop
+static float g_wheel = 0;              // wheel steps not yet scrolled (touchpads send fractions)
+static SDL_Cursor *g_cur_arrow, *g_cur_hand;
+enum { B_YES = 40, B_NO = 41 };
+
+// The question: the window dimmed, a panel with its title, text and buttons; only the buttons answer the pointer
+static void paint_modal(D2D1_SIZE_F sz) {
+    if (!g_modal && !g_waiting_dialog) return;
+    g_hits.clear();
+    g_alpha = 0.65f;
+    fill_rect({0, 0, sz.width, sz.height}, col::bg);
+    g_alpha = 1;
+    if (!g_modal) return;
+    const float pad = 28, w = std::min(540.f, sz.width - 64);
+    const float th = measure(g_modal->text, F_BODY, w - 2 * pad, T_WRAP).height;
+    const float h = pad + 26 + 12 + th + 28 + 40 + pad;
+    const float x0 = (sz.width - w) / 2, y0 = std::max(24.f, (sz.height - h) / 2);
+    const D2D1_RECT_F box{x0, y0, x0 + w, y0 + h};
+    fill_round(box, R_PANEL, col::panel);
+    stroke_round(box, R_PANEL, col::line_strong);
+    float y = y0 + pad, tx = x0 + pad;
+    if (g_modal->kind == M_ERROR || g_modal->kind == M_WARN) {
+        fill_circle(tx + 5, y + 13, 4.5f, col::red);
+        tx += 20;
+    }
+    text(g_modal->title, F_DOT, {tx, y, x0 + w - pad, y + 26}, col::text, T_VCENTER);
+    y += 26 + 12;
+    text(g_modal->text, F_BODY, {x0 + pad, y, x0 + w - pad, y + th + 4}, col::muted, T_WRAP);
+    y += th + 28;
+    const bool ask = g_modal->kind >= M_ASK;
+    const std::wstring yes = ask ? L"Yes" : L"OK";
+    const float bx = x0 + w - pad - button_width(yes);
+    button(B_YES, yes, bx, y, true, true);
+    if (ask) button(B_NO, L"No", bx - 12 - button_width(L"No"), y, false, true);
+}
+
+static D2D1_POINT_2F to_dip(float x, float y) {
+    const float d = SDL_GetWindowPixelDensity(g_window);
+    return {x * d / g_scale, y * d / g_scale};
+}
+
+static void set_cursor() { SDL_SetCursor(g_hover != B_NONE ? g_cur_hand : g_cur_arrow); }
+
+static void handle_event(const SDL_Event& e) {
+    if (e.type == g_ev_log) {
+        g_log_posted = false;
+        size_t added;
+        {
+            std::lock_guard lk(g_mx);
+            added = g_log_added;
+            g_log_added = 0;
+        }
+        if (g_log_scroll > 0) g_log_scroll += (int)added;   // scrolled back: the view stays where it is
+        redraw();
+        return;
+    }
+    if (e.type == g_ev_done) {
+        job_done((DWORD)e.user.code, e.user.data1 != nullptr);
+        return;
+    }
+    switch (e.type) {
+    case SDL_EVENT_QUIT:
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        g_quit_asked = true;
+        break;
+    case SDL_EVENT_WINDOW_EXPOSED:
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+    case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+        redraw();
+        break;
+    case SDL_EVENT_MOUSE_MOTION: {
+        const int h = g_waiting_dialog ? B_NONE : hit_test(to_dip(e.motion.x, e.motion.y));
+        if (h != g_hover) g_hover = h, redraw();
+        set_cursor();
+        break;
+    }
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        if (g_hover != B_NONE) g_hover = B_NONE, redraw();
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (e.button.button == SDL_BUTTON_LEFT && !g_waiting_dialog) {
+            g_pressed = hit_test(to_dip(e.button.x, e.button.y));
+            SDL_CaptureMouse(true);
+            redraw();
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (e.button.button == SDL_BUTTON_LEFT) {
+            const int h = g_waiting_dialog ? B_NONE : hit_test(to_dip(e.button.x, e.button.y)), p = g_pressed;
+            g_pressed = B_NONE;
+            SDL_CaptureMouse(false);
+            if (h != B_NONE && h == p) {
+                if (g_modal) g_modal->answer = h == B_YES ? 1 : 0;
+                else click(h);
+            }
+            redraw();
+        }
+        break;
+    case SDL_EVENT_MOUSE_WHEEL: {
+        if (g_modal || g_waiting_dialog) break;
+        const D2D1_POINT_2F p = to_dip(e.wheel.mouse_x, e.wheel.mouse_y);
+        if (p.x >= g_log_rect.left && p.x < g_log_rect.right && p.y >= g_log_rect.top && p.y < g_log_rect.bottom) {
+            g_wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            const int steps = (int)g_wheel;
+            g_wheel -= (float)steps;
+            g_log_scroll = std::max(0, g_log_scroll + steps * 3);
+            redraw();
+        }
+        break;
+    }
+    case SDL_EVENT_KEY_DOWN:
+        if (g_modal && (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER)) g_modal->answer = 1;
+        else if (g_modal && e.key.key == SDLK_ESCAPE) g_modal->answer = g_modal->kind >= M_ASK ? 0 : 1;
+        break;
+    }
+}
+
+// Events handled and the window drawn until <done>: a question or a file dialog waits like this, as Windows' modal
+// boxes do (a job's output keeps coming in meanwhile)
+static void modal_loop(const std::function<bool()>& done) {
+    while (!done()) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, g_moving ? 15 : 100))
+            do handle_event(e);
+            while (!done() && SDL_PollEvent(&e));
+        if (g_quit_asked && g_modal) g_modal->answer = 0;   // closing the window answers No; the main loop then asks to quit
+        if (g_running || g_moving) redraw();
+        if (g_dirty) {
+            g_dirty = false;
+            paint();
+        }
+    }
+}
+
+static bool modal_box(const std::wstring& text, const wchar_t* title, int kind) {
+    if (!g_window) {
+        fprintf(stderr, "%s: %s\n", narrow(title).c_str(), narrow(text).c_str());
+        return false;
+    }
+    Modal m{title, text, kind};
+    Modal* outer = g_modal;
+    g_modal = &m;
+    g_hover = g_pressed = B_NONE;
+    redraw();
+    modal_loop([&] { return m.answer >= 0; });
+    g_modal = outer;
+    g_hover = B_NONE;
+    redraw();
+    return m.answer == 1;
+}
+
+// The desktop's file dialog (SDL's: the XDG portal, else zenity), waited for in modal_loop
+struct Picked {
+    std::mutex mx;
+    bool done = false;
+    std::string path, error;
+};
+static void SDLCALL picked(void* ud, const char* const* list, int) {
+    auto* r = (Picked*)ud;
+    {
+        std::lock_guard lk(r->mx);
+        if (!list) r->error = SDL_GetError();
+        else if (list[0]) r->path = list[0];
+        r->done = true;
+    }
+    post_log();   // wakes the loop
+}
+
+static std::wstring pick(bool folder, const wchar_t* title, const std::wstring& start) {
+    static const SDL_DialogFileFilter nup[] = {{"NUP game container (*.nup)", "nup"}, {"All files", "*"}};
+    const SDL_PropertiesID props = SDL_CreateProperties();
+    const std::string t = narrow(title), loc = narrow(start) + "/";
+    SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, t.c_str());
+    SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, g_window);
+    if (!start.empty() && fs::is_directory(start)) SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_LOCATION_STRING, loc.c_str());
+    if (!folder) {
+        SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, (void*)nup);
+        SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, 2);
+    }
+    Picked r;
+    g_waiting_dialog = true;
+    g_hover = g_pressed = B_NONE;
+    set_cursor();
+    redraw();
+    SDL_ShowFileDialogWithProperties(folder ? SDL_FILEDIALOG_OPENFOLDER : SDL_FILEDIALOG_OPENFILE, picked, &r, props);
+    modal_loop([&] {
+        std::lock_guard lk(r.mx);
+        return r.done;
+    });
+    SDL_DestroyProperties(props);
+    g_waiting_dialog = false;
+    redraw();
+    if (!r.error.empty())
+        msg_box(L"No file dialog could open (" + widen(r.error) + L"). Install xdg-desktop-portal (with your desktop's portal) or "
+                L"zenity, or set the folder in " CFG_NAME L" or with ./kart.sh game <folder>.", L"Launcher", M_ERROR);
+    return widen(r.path);
+}
+
+int main(int argc, char** argv) {
+    // The repository: the folder above holding tools/paths.py (the program is launcher/out/launcher)
+    std::error_code ec;
+    for (fs::path d = fs::read_symlink("/proc/self/exe", ec).parent_path();; d = d.parent_path()) {
+        if (path_exists(d / "tools" / "paths.py")) {
+            g_root = d;
+            break;
+        }
+        if (d.empty() || d == d.parent_path()) {
+            fprintf(stderr, "Run the launcher from inside the repository (./kart.sh, or launcher/out/launcher).\n");
+            return 1;
+        }
+    }
+    signal(SIGPIPE, SIG_IGN);
+
+    // A scripted run (g_script)
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--bring-over" && i + 1 < argc) g_script.push_back({L"bring-over", widen(argv[++i])});
+        else if (a == "--setup") g_script.push_back({L"setup", L""});
+        else if (a == "--build") g_script.push_back({L"build", L""});
+        else if (a == "--quit") g_script_quit = true;
+        else if (a == "--log" && i + 1 < argc) g_log_file = fopen(argv[++i], "wb");
+    }
+    g_scripting = !g_script.empty() || g_script_quit;
+
+    // For the tools it runs: Python output as it comes, in UTF-8; builds on every core unless BUILD_MP says
+    setenv("PYTHONUNBUFFERED", "1", 1);
+    setenv("PYTHONIOENCODING", "utf-8", 1);
+    setenv("PYTHONUTF8", "1", 1);
+    setenv("KART_PROGRESS", "1", 1);   // the tools' @@progress lines, drawn as a bar
+    if (env_var(L"BUILD_MP").empty()) {
+        std::wstring mp = local_cfg()[L"BUILD_MP"];
+        if (mp.empty()) mp = std::to_wstring(std::max(1u, std::thread::hardware_concurrency()));
+        SetEnvironmentVariableW(L"BUILD_MP", mp.c_str());
+    }
+
+    // The game version: KART_VER in the environment, else the one chosen last time
+    {
+        std::wstring want = env_var(L"KART_VER");
+        if (want.empty()) want = local_cfg()[L"LAUNCHER_VERSION"];
+        for (int v = 0; v < VERSION_COUNT; v++)
+            if (want == VERSIONS[v].name) g_ver = v;
+        apply_version();
+    }
+
+    check_tools();
+    refresh();
+    g_step = 3;
+    for (int i = 0; i < 4; i++)
+        if (!g_done[i]) {
+            g_step = i;
+            break;
+        }
+    // The desktop's "animations" switch (GNOME's; off: every state is reached at once)
+    g_motion = trim(widen(capture(L"gsettings get org.gnome.desktop.interface enable-animations 2>/dev/null"))) != L"false";
+
+    SDL_SetHint(SDL_HINT_APP_ID, "kart-recomp");
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "launcher: no window (%s)\n", SDL_GetError());
+        return 1;
+    }
+    g_ev_log = SDL_RegisterEvents(2);
+    g_ev_done = g_ev_log + 1;
+    g_window = SDL_CreateWindow("kart-recomp", 900, 780, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
+    if (!g_window || !(g_ren = SDL_CreateRenderer(g_window, nullptr))) {
+        fprintf(stderr, "launcher: no window (%s)\n", SDL_GetError());
+        return 1;
+    }
+    SDL_SetRenderVSync(g_ren, 1);
+    // 900 x 780 DIPs, or less on a small screen (window units are DIPs times the display's scale over the pixel density:
+    // 1 on Wayland, the scale on X11)
+    {
+        const float k = SDL_GetWindowDisplayScale(g_window) / std::max(0.01f, SDL_GetWindowPixelDensity(g_window));
+        int w = (int)(900 * k), h = (int)(780 * k);
+        SDL_Rect work{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(g_window), &work) && work.w > 0) {
+            w = std::min(w, (int)(work.w * 0.95f));
+            h = std::min(h, (int)(work.h * 0.95f));
+        }
+        SDL_SetWindowMinimumSize(g_window, std::min(w, (int)(760 * k)), std::min(h, (int)(660 * k)));
+        SDL_SetWindowSize(g_window, w, h);
+        SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+    create_formats();
+    g_cur_arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
+    g_cur_hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+    SDL_ShowWindow(g_window);
+    if (g_scripting) run_script();
+
+    // Events; a frame once they are handled when something changed, every 15 ms while something moves, and every
+    // half second while a job runs (its clock)
+    ULONGLONG tick = 0;
+    for (;;) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, g_dirty ? 0 : g_moving ? 15 : g_running ? 500 : -1))
+            do handle_event(e);
+            while (SDL_PollEvent(&e));
+        if (g_quit_asked) {
+            g_quit_asked = false;
+            if (!g_running || msg_box(g_job_name + L" is still running. Stop it and quit?", L"Launcher", M_ASK)) {
+                stop_job();   // its process group, and with this process what it started
+                break;
+            }
+        }
+        if (g_moving) redraw();
+        if (g_running && GetTickCount64() - tick >= 500) {
+            tick = GetTickCount64();
+            redraw();
+        }
+        if (g_dirty) {
+            g_dirty = false;
+            paint();
+        }
+    }
+    {
+        std::lock_guard lk(g_mx);
+        if (g_log_file) fclose(g_log_file);
+        g_log_file = nullptr;
+    }
+    SDL_Quit();
+    _exit(g_exit_code);   // not through the static destructors: a stopped job's thread may still be finishing
+}
+#endif
