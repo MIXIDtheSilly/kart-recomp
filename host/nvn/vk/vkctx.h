@@ -40,6 +40,11 @@ struct Features {
     // HOST_NVN_LEAN_IMPORTS=0/1 overrides.
     bool lean_imports = false;
     u64 import_alignment = 4096;
+    // The stages whose pipelines ask for 32-wide subgroups (subgroup size control): the translated shaders are NVIDIA warp
+    // code (ballots and lane masks are 32 bits, shuffles index lanes 0-31), so an AMD wave64 or an Intel SIMD16 runs them
+    // wrong. Empty where the GPU's subgroups are always 32 wide (NVIDIA). HOST_NVN_SUBGROUP32=0/1 overrides.
+    VkShaderStageFlags subgroup32 = 0;
+    u32 max_workgroup_subgroups = 0;   // (a compute workgroup asking for 32-wide subgroups has at most this many)
 };
 
 struct Device {

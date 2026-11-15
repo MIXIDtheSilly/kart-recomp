@@ -185,6 +185,7 @@ Set them in the environment, or as `HOST_*` lines in `local.cfg`.
 | `HOST_PRESENT_MODE=fifo\|immediate` | swapchain present mode; mailbox by default |
 | `HOST_VULKAN_DEVICE=<index>` | which GPU; by default the discrete GPU with the most memory |
 | `HOST_NVN_UMA=0\|1` | unified-memory mode off / forced; on by itself for an integrated GPU |
+| `HOST_NVN_SUBGROUP32=0\|1` | pipelines asking for 32-wide subgroups off / forced; on by itself where the GPU could run another width (AMD, Intel): the translated shaders are 32-lane warp code |
 | `HOST_FPS_MODE=dynamic\|60\|30\|game` | the game's present interval; dynamic keeps the game clock at real time when frames run late |
 | `HOST_AUDIO_MUTE=1`, `HOST_AUDIO_LEVEL=1` | silence the output / log its peak level |
 | `HOST_NO_OVERLAY=1` | no performance overlay |

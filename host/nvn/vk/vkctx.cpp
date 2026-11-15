@@ -304,6 +304,26 @@ void create_device(Device& c) {
     vkq::install_cmd_proxy();   // (HOST_NVN_CMD_PROXY: recording on the driver thread too)
     vkGetDeviceQueue(c.dev, c.family, 0, &c.queue);
 
+    {   // Subgroup sizes (see Features::subgroup32)
+        VkPhysicalDeviceSubgroupProperties sp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        sp.pNext = &p13;
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &sp;
+        vkGetPhysicalDeviceProperties2(c.phys, &p2);
+        const bool can = f13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32;
+        const bool varies = p13.minSubgroupSize != 32 || p13.maxSubgroupSize != 32 || sp.subgroupSize != 32;
+        const char* v = getenv("HOST_NVN_SUBGROUP32");
+        const bool on = v ? *v != '0' : varies;
+        if (on && can) c.feat.subgroup32 = p13.requiredSubgroupSizeStages;
+        c.feat.max_workgroup_subgroups = p13.maxComputeWorkgroupSubgroups;
+        LOG("nvk: subgroups %u wide (%u to %u, size control %d, for stages %#x): %s", sp.subgroupSize, p13.minSubgroupSize,
+            p13.maxSubgroupSize, f13.subgroupSizeControl, p13.requiredSubgroupSizeStages,
+            c.feat.subgroup32 ? "pipelines ask for 32 (the shaders are 32-wide warp code)"
+            : !varies ? "always 32" : !on ? "left to the driver (HOST_NVN_SUBGROUP32=0)" : "32 cannot be asked for");
+        if (on && varies && !can) LOG("[RED] nvk: this GPU cannot run shaders in 32-wide subgroups: some effects may come out wrong");
+    }
+
     if (c.feat.host_import) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};

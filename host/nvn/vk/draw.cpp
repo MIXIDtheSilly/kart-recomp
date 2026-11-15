@@ -764,6 +764,8 @@ VkPipeline make_graphics(const PipeDesc& d, const Shader* ts, const Shader* vs, 
     const bool mesh = d.kind == 1;
     Device& c = ctx();
     VkPipelineShaderStageCreateInfo st[3]{};
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg32{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+                                                                   nullptr, 32};
     u32 nst = 0;
     for (const Shader* s : {ts, vs, ps}) {
         if (!s) continue;
@@ -771,6 +773,7 @@ VkPipeline make_graphics(const PipeDesc& d, const Shader* ts, const Shader* vs, 
         st[nst].stage = s->vk_stage;
         st[nst].module = s->module;
         st[nst].pName = "main";
+        if (c.feat.subgroup32 & s->vk_stage) st[nst].pNext = &sg32;
         nst++;
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -844,6 +847,11 @@ VkPipeline make_compute(const Shader* cs, VkPipelineLayout layout) {
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = cs->module;
     ci.stage.pName = "main";
+    // 32-wide subgroups where the GPU could pick another width (Features::subgroup32), as long as the workgroup fits
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg32{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+                                                                   nullptr, 32};
+    const u64 threads = static_cast<u64>(cs->local[0]) * cs->local[1] * cs->local[2];
+    if ((ctx().feat.subgroup32 & VK_SHADER_STAGE_COMPUTE_BIT) && threads <= 32ull * ctx().feat.max_workgroup_subgroups) ci.stage.pNext = &sg32;
     ci.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     HitchTimer ht{HI_PIPELINE};
