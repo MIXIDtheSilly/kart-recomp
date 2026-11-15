@@ -337,7 +337,6 @@ struct VideoSession : Service {
     std::map<u32, Fence> release_fences;
     std::deque<Output> outputs;  // finished, for 213
     bool flush = false, quit = false;
-    bool at_end = false;  // the frame marked end of stream is out and no input came since
     std::thread worker, ticker;
 
     VideoSession(std::shared_ptr<NativeObjects> objects_, const char* name)
@@ -345,8 +344,8 @@ struct VideoSession : Service {
         on(1, [this](Request& r) { return_session(r, std::make_shared<VideoSession>(objects, "nx2:vdecsvc")); });
         on(3, [this](Request& r) { get_event(r); });
         for (u32 c : {6u, 115u, 200u}) on(c, [](Request&) {});  // start, finalize, initialize
-        on(8, [this](Request& r) { flush_queue(r, "flush"); });
-        on(207, [this](Request& r) { flush_queue(r, "stop"); });
+        on(8, [this](Request&) { flush_queue(false); });
+        on(207, [this](Request&) { flush_queue(true); });
         on(101, [this](Request& r) { configure(r); });
         on(109, [this](Request& r) { submit(r); });
         on(212, [this](Request& r) {
@@ -421,20 +420,18 @@ struct VideoSession : Service {
             free_images.push_back(image);
             if (release) release_fences[image] = *release;
             value = sync_base + ++handed;
-            release_unfilled();
         }
         cv.notify_all();
         reply(r, {~syncpoint, 0, value, 0});
     }
 
-    // At the end of the stream (nothing left to decode), the images handed out that no frame will fill: their values
-    // signalled all the same, without an output (213 answers "nothing finished", which the client skips). When the
-    // movie stops, the client drains its ring of handed-out images and aborts on a value not reached
-    // (subsdk0+0x4540 after nn::gs::TryWaitNativeSync: svcBreak after IApplicationFunctions::22); stopping after the
-    // last frame with images still out did that now and then. (m held)
-    // Also at a flush or stop (any_time), where nothing queued will fill them either. Returns how many.
-    u32 release_unfilled(bool any_time = false) {
-        if ((!any_time && (!at_end || !inputs.empty() || !decoded.empty())) || syncpoint == NoSyncpoint) return 0;
+    // The images handed out that no frame will fill get their values without an output (213 answers "nothing finished",
+    // which the client skips). Only at a stop: the movie module then drains its ring of handed-out images and aborts on a
+    // value not reached (subsdk0+0x4540 after nn::gs::TryWaitNativeSync: svcBreak after IApplicationFunctions::22). At
+    // the end of the stream or a flush they stay queued: a looping movie (the menu's, the start gate's screens) flushes
+    // and submits the stream again, and the images it handed out wait for those frames. (m held) Returns how many.
+    u32 release_unfilled() {
+        if (syncpoint == NoSyncpoint) return 0;
         u32 n = 0;
         for (; !free_images.empty(); free_images.pop_front(), n++) {
             release_fences.erase(free_images.front());
@@ -450,19 +447,16 @@ struct VideoSession : Service {
             std::scoped_lock lk{m};
             inputs.push_back(std::move(input));
             room = inputs.size() < MaxQueuedInputs;
-            at_end = false;
         }
         cv.notify_all();
         reply64(r, {++submitted});
     }
 
-    // 8 flush / 207 stop: drop queued input and frames not yet in an image. The images handed out that are not being
-    // written now get their values without a frame (as at the end of the stream: 213 answers "nothing finished"), so the
-    // sync values stay in step with the client's ring: a movie stopped mid-stream drains its ring and aborted on a value
-    // never reached (subsdk0+0x4540, svcBreak after IApplicationFunctions::22, with no end of stream in the log). An
-    // image the decode loop is writing now was already taken off free_images and gets its value when written.
-    void flush_queue(Request&, const char* what) {
-        u32 released, queued;
+    // 8 flush / 207 stop: drop queued input and frames not yet in an image. A stop also gives the images handed out
+    // their values (release_unfilled); an image the decode loop is writing now was already taken off free_images and
+    // gets its value when written.
+    void flush_queue(bool stop) {
+        u32 released = 0, queued;
         u64 frames;
         {
             std::scoped_lock lk{m};
@@ -472,10 +466,11 @@ struct VideoSession : Service {
             decoded.clear();
             flush = true;
             room = true;
-            released = release_unfilled(true);
+            if (stop) released = release_unfilled();
         }
         cv.notify_all();
-        LOG("%s %s after %llu frames: %u queued dropped, %u handed-out images given their values", name.c_str(), what,
+        LOG("%s %s after %llu frames: %u queued dropped, %u handed-out images given their values", name.c_str(),
+            stop ? "stop" : "flush",
             static_cast<unsigned long long>(frames), queued, released);
     }
 
@@ -540,7 +535,6 @@ struct VideoSession : Service {
                 last_pts = frame.pts;
                 sync::increment(syncpoint);
                 ++frames_out;
-                if (frame.end) at_end = true, release_unfilled();
                 if (frames_out == 1 || frames_out % 600 == 0 || frame.end)
                     LOG("%s frame %llu (%ux%u, pts %llu us%s) in image %u", name.c_str(), frames_out, w, h,
                         frame.pts, frame.end ? ", end of stream" : "", image);
@@ -571,8 +565,6 @@ struct VideoSession : Service {
                 if (!decoded.empty()) decoded.back().end = true;
                 else if (!outputs.empty()) {
                     outputs.back().end = true;
-                    at_end = true;
-                    release_unfilled();
                     LOG("%s frame %llu marked end of stream (the decoder had nothing left)", name.c_str(), frames_out);
                 } else {
                     decoded.push_back({std::nullopt, input.pts == ~0ull ? last_pts : input.pts, true});
