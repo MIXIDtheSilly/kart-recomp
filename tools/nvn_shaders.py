@@ -351,7 +351,7 @@ def main():
             errs.update(e); done += 1
             paths.progress(done, len(chunks), 'translating shaders to SPIR-V')
             if done % 20 == 0 or done == len(chunks):
-                print(f'  chunks {done}/{len(chunks)}  failed so far {len(errs)}  {time.time() - t0:.0f}s', flush=True)
+                print(f'  chunks {done}/{len(chunks)}  not translated so far {len(errs)}  {time.time() - t0:.0f}s', flush=True)
     shutil.rmtree(w, ignore_errors=True)
     ok = [j['key'] for j in jobs if os.path.exists(os.path.join(outdir, j['key'] + '.spv')) and j['key'] not in errs]
     summary = {k: {**meta.get(k, {}), 'status': 'ok' if k in ok else 'failed', **({'error': errs[k]} if k in errs else {})} for k in list(meta) + [k for k in errs if k not in meta]}
@@ -368,9 +368,11 @@ def main():
     with open(os.path.join(outdir, 'build_summary.json'), 'w') as f:
         json.dump(summary, f, indent=0)
     st = collections.Counter((v['stage'], v['status']) for v in summary.values() if 'stage' in v)
-    print(f'total {len(summary)}  translated {len(ok)}  failed {len(summary) - len(ok)}')
+    # (not "failed": the launcher shows such lines red, and a few shaders the translator cannot do are expected; the game
+    # runs without them, their draws skipped)
+    print(f'total {len(summary)}  translated {len(ok)}  not translated {len(summary) - len(ok)} (their draws are skipped)')
     for s in sorted({s for s, _ in st}):
-        print(f'  {s}: ok {st[(s, "ok")]}  failed {st[(s, "failed")]}')
+        print(f'  {s}: ok {st[(s, "ok")]}  not translated {st[(s, "failed")]}')
     reasons = collections.Counter(re.sub(r'\b[0-9a-f]{16}\b', 'KEY', v.get('error', ''))[:110] for v in summary.values() if v['status'] == 'failed')
     for r, n in reasons.most_common(20):
         print(f'  [{n:5d}] {r}')
