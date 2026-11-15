@@ -100,13 +100,14 @@ def records(d):
     return [d[x:(r[k + 1] if k + 1 < len(r) else len(d))] for k, x in enumerate(r)]
 
 
-SPLIT_DRIVER = r'''# Driver for the reference shader_split.py on Windows: provides the `zstd -d -c -q` CLI it shells out to via backports.zstd (no zstd.exe needed).
+SPLIT_DRIVER = r'''# Driver for the reference shader_split.py on Windows: provides the `zstd -d -c -q` CLI it shells out to via compression.zstd (Python 3.14+) or backports.zstd (no zstd.exe needed).
 import sys, os, subprocess
 sys.dont_write_bytecode = True
 _run = subprocess.run
 def run(args, *a, **k):
     if isinstance(args, list) and args[:1] == ['zstd'] and args[1:4] == ['-d', '-c', '-q']:
-        from backports import zstd
+        try: from compression import zstd
+        except ImportError: from backports import zstd
         r = subprocess.CompletedProcess(args, 0)
         try: r.stdout = zstd.decompress(k['input']); r.stderr = b''
         except Exception as e:
