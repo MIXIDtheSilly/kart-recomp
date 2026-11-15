@@ -1098,6 +1098,18 @@ void bake_file(const std::filesystem::path& path, bool write, BakeStats& st) {
     }
 }
 
+// A progress line for the launcher, which sets KART_PROGRESS=1 and draws "@@progress <done> <total> <what>" as a bar
+// (as tools/paths.py progress() does for the build's tools)
+void progress(size_t done, size_t total, const char* what) {
+    static const bool on = [] {
+        const char* v = getenv("KART_PROGRESS");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (!on) return;
+    std::printf("@@progress %zu %zu %s\n", done, total, what);
+    std::fflush(stdout);
+}
+
 // The folder's files still in the one-block format written again in pieces (version 3), on `threads` threads.
 void repack_disk(u32 threads) {
     std::vector<u64> keys;
@@ -1105,11 +1117,11 @@ void repack_disk(u32 threads) {
     for (const auto& f : std::filesystem::directory_iterator(disk_dir(), ec))
         if (f.path().extension() == ".bc") keys.push_back(std::strtoull(f.path().stem().string().c_str(), nullptr, 16));
     const u64 t0 = host_ns();
-    std::atomic<size_t> next{0}, repacked{0}, failed{0};
+    std::atomic<size_t> next{0}, checked{0}, repacked{0}, failed{0};
     std::vector<std::thread> pool;
     for (u32 i = 0; i < threads; i++)
         pool.emplace_back([&] {
-            for (size_t k; (k = next++) < keys.size();) {
+            for (size_t k; (k = next++) < keys.size(); checked++) {
                 FILE* f = std::fopen(disk_file(keys[k]).c_str(), "rb");
                 if (!f) continue;
                 DiskHead h{};
@@ -1122,7 +1134,12 @@ void repack_disk(u32 threads) {
                 else failed++;
             }
         });
+    while (checked.load() < keys.size()) {
+        progress(checked.load(), keys.size(), "Checking the texture cache");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
     for (std::thread& t : pool) t.join();
+    progress(keys.size(), keys.size(), "Checking the texture cache");
     LOG("bake: %zu cache files written again in pieces, %zu failed, of %zu (%llu s)", repacked.load(), failed.load(), keys.size(),
         static_cast<unsigned long long>((host_ns() - t0) / 1'000'000'000));
 }
@@ -1168,11 +1185,13 @@ int bake_textures(const std::filesystem::path& game, size_t check) {
             static_cast<unsigned long long>(st.failed.load()));
     };
     while (st.files.load() < files.size()) {
+        progress(st.files.load(), files.size(), "Baking textures");
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const u64 secs = (host_ns() - t0) / 1'000'000'000;
         if (secs >= said + 10) said = secs, report("at", secs);
     }
     for (std::thread& t : threads) t.join();
+    progress(files.size(), files.size(), "Baking textures");
     report("done:", (host_ns() - t0) / 1'000'000'000);
     return 0;
 }
