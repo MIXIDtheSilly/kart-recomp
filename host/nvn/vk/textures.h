@@ -76,7 +76,8 @@ inline void bind_epoch_bump(bool objects = true) {
 // A view of img as NVN view v (null = the whole texture as created). `attachment`: a single level for
 // rendering (all of v's layers). `want`: the view type a shader declares (sampled and storage views), when
 // the image can be seen that way.
-VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageViewType want = VK_IMAGE_VIEW_TYPE_MAX_ENUM);
+VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageViewType want = VK_IMAGE_VIEW_TYPE_MAX_ENUM,
+                    bool storage = false);   // storage: for a shader to write (null when this GPU cannot)
 
 // The view texture object t asks for with its view v (null = the whole texture): v, or, when t shares an image made in another
 // (compatible) format (textures.cpp format_class), v in t's format. tmp holds the latter.

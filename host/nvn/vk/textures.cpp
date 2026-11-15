@@ -660,7 +660,8 @@ void image_pool_gone(u64 lo, u64 hi) {
     sweep(host_ns());
 }
 
-VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageViewType want) {
+VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageViewType want, bool storage) {
+    if (attachment) storage = false;
     img->last_use = nvn::g_frame.load(std::memory_order_relaxed);
     u32 base_level = 0, nlevels = img->levels, base_layer = 0, nlayers = img->layers;
     int target = img->desc.target;
@@ -688,11 +689,33 @@ VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageVi
     const Format& f = format(fmt);
     VkFormat vkf = f.kind == FmtKind::None ? img->format : (format(img->nvn_format).kind == FmtKind::Astc ? img->format : f.vk);
     if (!img->mutable_ok) vkf = img->format;   // made without MUTABLE_FORMAT (see image_of's retries)
+    // A shader writes it (a storage image): the image needs storage use and the view's format the storage feature on this
+    // GPU, else there is no view to give (it stays unbound). The view is made with storage use only when both hold, and
+    // a storage descriptor of a view without it is undefined: NVIDIA's driver goes along, AMD's can crash in
+    // vkUpdateDescriptorSets (issues #11, #23, #29: 0xC0000005 at the first dispatch that writes the froxel images).
+    if (storage && !(img->storage_ok && (features(vkf) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))) {
+        static std::mutex mu;
+        static std::unordered_set<int> told;
+        std::scoped_lock lk{mu};
+        if (told.insert(vkf).second)
+            LOG("[RED] nvk: image %llu (NVN format %#x) is written by a shader as Vulkan format %d, which this GPU cannot write "
+                "as a storage image%s: those writes are dropped", static_cast<unsigned long long>(img->serial), fmt, vkf,
+                img->storage_ok ? "" : " (the image was made without storage use)");
+        return VK_NULL_HANDLE;
+    }
+    if (storage) {   // each format a shader writes, once: what a GPU that lacks one would lose
+        static std::mutex mu;
+        static std::unordered_set<int> seen;
+        std::scoped_lock lk{mu};
+        if (seen.insert(vkf).second)
+            LOG("nvk: storage image format %d (NVN %#x), first image %llu %ux%ux%u", vkf, fmt,
+                static_cast<unsigned long long>(img->serial), img->width, img->height, img->depth);
+    }
     const u64 key = static_cast<u64>(base_level) | static_cast<u64>(nlevels) << 5 | static_cast<u64>(base_layer) << 10 |
                     static_cast<u64>(nlayers) << 23 | static_cast<u64>(target & 15) << 36 | static_cast<u64>(vkf) << 40 |
                     static_cast<u64>(attachment) << 63 | static_cast<u64>(stencil) << 62 |
                     static_cast<u64>(sw[0] | sw[1] << 3 | sw[2] << 6 | sw[3] << 9) * 0x9E3779B97F4A7C15ull ^
-                    (static_cast<u64>(want) + 1) * 0xC2B2AE3D27D4EB4Full;
+                    (static_cast<u64>(want) + 1) * 0xC2B2AE3D27D4EB4Full ^ (storage ? 0x5BD1E9955BD1E995ull : 0);
     if (auto it = img->views.find(key); it != img->views.end()) return it->second;
 
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -741,6 +764,7 @@ VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageVi
             if (noalpha && sw[i] == NVN_TEXTURE_SWIZZLE_A) c[i] = VK_COMPONENT_SWIZZLE_ONE;
         }
         vi.components = {c[0], c[1], c[2], c[3]};
+        if (storage) vi.components = {};   // (a storage image view must have the identity swizzle)
     }
     VkImageAspectFlags aspect = img->aspect;
     if (!attachment && (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) aspect = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
