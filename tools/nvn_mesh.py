@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nvn_shaders as ns
 
 BIN = ns.paths.get('VULKAN_BIN')   # third_party\spirv\bin (VULKAN_BIN overrides)
-EXE = lambda n: os.path.join(BIN, n + '.exe')
+EXE = lambda n: os.path.join(BIN, n + ns.paths.EXE)
 SKEW = 32
 PER = {1: 1, 2: 2, 3: 3}
 

@@ -29,8 +29,8 @@ MAIN = os.environ.get('KART_MAIN') or (os.path.join(_GAME, 'exefs', 'main') if _
 OUT = os.path.join(WORK, 'nvn_shaders' + ('-' + paths.get('KART_VER') if paths.get('KART_VER') else ''))  # kart-<KART_VER>.exe reads nvn_shaders-<KART_VER>
 SPLIT = os.path.join(OUT, 'split')
 XLATE_DIR = paths.get('NVN_XLATE')
-XLATE_EXE = os.path.join(XLATE_DIR, 'dmsh_xlate.exe')
-SPIRV_VAL = os.environ.get('SPIRV_VAL') or os.path.join(paths.get('VULKAN_BIN'), 'spirv-val.exe')
+XLATE_EXE = os.path.join(XLATE_DIR, 'dmsh_xlate' + paths.EXE)
+SPIRV_VAL = os.environ.get('SPIRV_VAL') or os.path.join(paths.get('VULKAN_BIN'), 'spirv-val' + paths.EXE)
 XLATE_PROJ = os.path.join(RECOMP, 'tools', 'xlate', 'dmsh_xlate', 'dmsh_xlate.csproj')
 
 CTL_MAGIC = bytes.fromhex('34127698')

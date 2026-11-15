@@ -1,5 +1,8 @@
 r"""Builds host\out\kart.exe (kart-<KART_VER>.exe) with llvm-mingw's clang: what host\build.bat does with Visual Studio.
 host\build.bat runs it when BUILD_CC=mingw (the default; tools\toolchain.py downloads llvm-mingw; see paths.py).
+On Linux (host/build.sh runs it) it builds host/out/kart (kart-<KART_VER>) with clang from LLVM, objects in
+host/out/obj-linux, against the system's C and C++ libraries and SDL 3 (libSDL3.so.0: window, input, sound; the
+headers are in third_party/SDL3).
 
 Objects go to host\out\obj-mingw. A file is compiled again only when it, a header it includes (clang's .d files) or the
 flags changed: <obj>.k records each such file's time, size and hash, so a file unzipped from a release with an older
@@ -14,7 +17,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import paths
 
@@ -22,22 +25,30 @@ ROOT = Path(__file__).resolve().parent.parent
 HOST = ROOT / "host"
 TP = ROOT / "third_party"
 OUT = HOST / "out"
-OBJ = OUT / "obj-mingw"
+LINUX = paths.LINUX
+OBJ = OUT / ("obj-linux" if LINUX else "obj-mingw")
 
 DEFS = ["-DNDEBUG", "-DNOMINMAX", "-DWIN32_LEAN_AND_MEAN", "-DUNICODE", "-D_UNICODE", "-D_CRT_SECURE_NO_WARNINGS",
         "-D_WIN32_WINNT=0x0A00", "-DWINVER=0x0A00"]
 # -fms-extensions: __try/__except (main.cpp) and the MSVC intrinsics; -mcx16: the 128-bit compare-and-swap.
 # -g -gcodeview: a PDB beside the exe (--pdb below), which the stall and crash reports read function names from.
 CXX = ["-std=c++20", "-O2", "-g", "-gcodeview", "-fms-extensions", "-mcx16", "-ffp-contract=off", "-w", *DEFS]
+if LINUX:
+    # -g1: line tables only (the crash and stall reports name functions from the symbol table); -fno-pie: kart links at
+    # a fixed address, like the game's modules (build_lib.py LINUX_FLAGS)
+    CXX = ["-std=c++20", "-O2", "-g1", "-mcx16", "-ffp-contract=off", "-fno-pie", "-pthread", "-w", "-DNDEBUG"]
 HOST_FLAGS = [*CXX, "-fno-rtti", f"-I{HOST}", f"-I{ROOT / 'runtime'}", *(f"-I{TP / d}" for d in
-              ("vulkan/include", "vma", "lz4", "zstd", "opus/include", "stb"))]
-AUDIO_FLAGS = [*CXX, f"-I{HOST}"]   # audio_core (adapted from Eden) uses RTTI
-C_FLAGS = ["-O2", "-w", "-DNDEBUG", "-D_CRT_SECURE_NO_WARNINGS"]
+              ("vulkan/include", "vma", "lz4", "zstd", "opus/include", "stb", *(["SDL3/include"] if LINUX else [])))]
+AUDIO_FLAGS = [*CXX, f"-I{HOST}", *([f"-I{TP / 'SDL3/include'}"] if LINUX else [])]   # audio_core (adapted from Eden) uses RTTI
+C_FLAGS = ["-O2", "-w", "-DNDEBUG", *(["-fno-pie"] if LINUX else ["-D_CRT_SECURE_NO_WARNINGS"])]
 OPUS = ["-DOPUS_BUILD", "-DUSE_ALLOCA", "-DHAVE_LRINT", "-DHAVE_LRINTF", "-DDISABLE_DEBUG_FLOAT",
         *(f"-I{TP / 'opus' / d}" for d in ("", "include", "celt", "silk", "silk/float"))]
 LIBS = ["user32", "gdi32", "shell32", "ole32", "oleaut32", "advapi32", "winmm", "bcrypt", "ntdll", "ws2_32", "uuid",
         "version", "setupapi", "dbghelp", "imm32", "cfgmgr32", "avrt", "ksuser", "hid", "xinput1_4", "synchronization",
         "mfplat", "mfuuid", "iphlpapi"]   # xinput1_4: mingw's libxinput.a is XINPUT1_3.dll, which Windows does not have
+# Linux: SDL 3 by its soname (distributions ship libSDL3.so.0 with the system; the unversioned libSDL3.so link only comes
+# with the -devel package), dlopen for the Vulkan loader and libvpx, pthread.
+LINUX_LIBS = ["-l:libSDL3.so.0", "-ldl", "-lpthread"]
 
 
 def sources(art):
@@ -140,18 +151,21 @@ def fmt(sec):
 
 def main():
     t0 = time.time()
-    env = paths.mingw_env()
-    bindir = Path(paths.get("MINGW")) / "bin"
+    env = paths.llvm_env() if LINUX else paths.mingw_env()
+    bindir = Path(paths.get("LLVM" if LINUX else "MINGW")) / "bin"
     art = paths.art()
-    exe = OUT / f"kart{'-' + paths.get('KART_VER') if paths.get('KART_VER') else ''}.exe"
+    exe = OUT / f"kart{'-' + paths.get('KART_VER') if paths.get('KART_VER') else ''}{paths.EXE}"
+    libdir = "linux" if LINUX else "mingw"
     rsp = art / "gen" / "aot_libs.rsp"
     if not rsp.exists():
         sys.exit(f"{rsp} is missing: run python tools\\gen_glue.py first")
-    mods = [Path(l.strip().strip('"')).stem for l in rsp.read_text().splitlines() if l.strip()]
-    libs = [art / "build" / "mingw" / f"{m}.a" for m in mods]
+    # (either separator: the list may have been written on the other system)
+    mods = [PureWindowsPath(l.strip().strip('"')).stem for l in rsp.read_text().splitlines() if l.strip()]
+    libs = [art / "build" / libdir / f"{m}.a" for m in mods]
     missing = [str(l) for l in libs if not l.exists()]
     if missing:
-        sys.exit("module libraries missing (python tools\\build_all.py with BUILD_CC=mingw makes them): " + ", ".join(missing))
+        sys.exit("module libraries missing (python tools/build_all.py makes them" + ("" if LINUX else " with BUILD_CC=mingw") + "): "
+                 + ", ".join(missing))
 
     OBJ.mkdir(parents=True, exist_ok=True)
     # New flags or another llvm-mingw: compile everything again
@@ -165,13 +179,13 @@ def main():
     todo = [(s, cc, fl) for s, cc, fl in sources(art) if stale(s, obj_of(s))]
     allsrc = sources(art)
     workers = int(os.environ.get("BUILD_MP") or os.cpu_count())
-    print(f"{len(allsrc)} host sources, {len(todo)} to compile ({workers} at a time) with llvm-mingw clang", flush=True)
+    print(f"{len(allsrc)} host sources, {len(todo)} to compile ({workers} at a time) with {'clang' if LINUX else 'llvm-mingw clang'}", flush=True)
 
     def one(item):
         s, cc, fl = item
         o = obj_of(s)
         tmp = o.with_suffix(".o.tmp")
-        r = subprocess.run([str(bindir / f"{cc}.exe"), "-c", *fl, "-MMD", "-MF", str(o.with_suffix(".d")), "-o", str(tmp), str(s)],
+        r = subprocess.run([str(bindir / f"{cc}{paths.EXE}"), "-c", *fl, "-MMD", "-MF", str(o.with_suffix(".d")), "-o", str(tmp), str(s)],
                            env=env, capture_output=True, text=True, errors="replace")
         if r.returncode == 0:
             os.replace(tmp, o)
@@ -201,9 +215,15 @@ def main():
     q = lambda p: '"' + Path(p).as_posix() + '"'
     link_rsp.write_text("\n".join([*(q(obj_of(s)) for s, _, _ in allsrc), "-Wl,--start-group", *map(q, libs),
                                    "-Wl,--end-group"]))
-    pdb = exe.with_suffix(".pdb")
-    r = subprocess.run([str(bindir / "clang++.exe"), "-static", "-g", f"-Wl,--pdb={pdb}", "-o", str(exe), f"@{link_rsp}",
-                        *(f"-l{l}" for l in LIBS)], env=env, capture_output=True, text=True, errors="replace")
+    if LINUX:
+        # lld; no PIE (the module tables hold 300 k function addresses: no relocations to apply at start); the symbol table
+        # stays in (main.cpp names functions from it in crash and stall reports)
+        cmd = [str(bindir / "clang++"), "-fuse-ld=lld", "-no-pie", "-pthread", "-o", str(exe), f"@{link_rsp}", *LINUX_LIBS]
+    else:
+        pdb = exe.with_suffix(".pdb")
+        cmd = [str(bindir / "clang++.exe"), "-static", "-g", f"-Wl,--pdb={pdb}", "-o", str(exe), f"@{link_rsp}",
+               *(f"-l{l}" for l in LIBS)]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace")
     out = (r.stdout + r.stderr).strip()
     if r.returncode:
         hint = "\n(is the game running? close it and build again)" if "permission denied" in out.lower() else ""

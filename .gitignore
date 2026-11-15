@@ -20,13 +20,23 @@ __pycache__/
 # Local paths and settings (tools/paths.py); deps/ held the external dependencies before third_party/
 /deps/
 /local.cfg
+/local.linux.cfg
 
 # What the launcher's Set up downloads: the C++ toolchain (tools/toolchain.py), Python and the .NET SDK when missing (tools/bootstrap.ps1)
 /tools/llvm-mingw/
 /tools/python/
 /tools/dotnet/
+/tools/venv/
+/tools/spirv/
+/tools/spirv.tmp/
+/tools/vulkansdk-linux-*.tar.xz
+/tools/dotnet-install.sh
 /tools/llvm-mingw.tmp/
 /tools/llvm-mingw-*.zip
+# Linux: LLVM's release (tools/toolchain.py install)
+/tools/llvm/
+/tools/llvm.tmp/
+/tools/LLVM-*-Linux-X64.tar.*
 
 # Built by dotnet (tools/nvn_shaders.py builds the shader translator into work/xlate)
 /tools/xlate/**/bin/

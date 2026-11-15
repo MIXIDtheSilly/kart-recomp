@@ -18,7 +18,7 @@ import argparse, concurrent.futures, json, os, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paths
 BIN = paths.get('VULKAN_BIN')   # third_party\spirv\bin (VULKAN_BIN overrides)
-EXE = lambda n: os.path.join(BIN, n + '.exe')
+EXE = lambda n: os.path.join(BIN, n + paths.EXE)
 FIXES = ['87c52decaf1a8e68', 'c3e3a664e970c1bc']
 
 

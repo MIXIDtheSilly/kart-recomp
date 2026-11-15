@@ -3,3 +3,6 @@
 
 # cmd finds goto labels reliably only in CRLF files
 *.bat text eol=crlf
+
+# Shell scripts run on Linux straight from a checkout made on Windows (core.autocrlf): keep their line ends LF
+*.sh text eol=lf

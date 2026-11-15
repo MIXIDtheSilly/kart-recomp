@@ -4,7 +4,7 @@ Usage: python build_lib.py <gen dir> <module> <build dir> [--opt /O2]
 
 Produces <build dir>/<module>.lib from <gen dir>/<module>_*.cpp with MSVC (BUILD_CC=cl), <build dir>/clang/<module>.lib
 with clang-cl (BUILD_CC=clang) or <build dir>/mingw/<module>.a with llvm-mingw's clang (BUILD_CC=mingw, the default;
-tools/toolchain.py downloads it; see paths.py). Objects are only rebuilt when their source is newer, so re-running
+tools/toolchain.py downloads it; see paths.py). On Linux: <build dir>/linux/<module>.a with clang from LLVM. Objects are only rebuilt when their source is newer, so re-running
 after lifting a subset is cheap.
 """
 import argparse
@@ -36,24 +36,24 @@ def main():
     # BUILD_CC=clang: clang-cl (LLVM) instead of cl, objects in <build>/clang so the cl ones stay for switching back.
     # BUILD_CC=mingw: llvm-mingw's clang, objects and <module>.a in <build>/mingw.
     cc = paths.build_cc()
-    clang, mingw = cc == "clang", cc == "mingw"
+    clang, mingw, linux = cc == "clang", cc == "mingw", cc == "linux"
     # BUILD_PGO=gen: instrumented objects (link clang_rt.profile, run with KART_PGO_DUMP); BUILD_PGO=<x.profdata>:
     # optimized with that profile. Each has its own object folder.
     pgo = os.environ.get("BUILD_PGO", "")
     if clang:
         build = build / ("clang" if not pgo else "clang_pgogen" if pgo == "gen" else "clang_pgo")
-    if mingw:
-        build = build / "mingw"
+    if mingw or linux:
+        build = build / ("mingw" if mingw else "linux")
         lib = build / (a.module + ".a")
     build.mkdir(parents=True, exist_ok=True)
     sources = sorted(gen.glob(f"{a.module}_*.cpp"))
     stale = [s for s in sources if not (build / (s.stem + ".obj")).exists()
              or (build / (s.stem + ".obj")).stat().st_mtime < s.stat().st_mtime]
-    if mingw:
+    if mingw or linux:
         # BUILD_ARCH (default none: any x86-64 CPU, like cl's build) sets the target CPU; a change recompiles everything.
         arch = os.environ.get("BUILD_ARCH", "")
         stamp = build / f"{a.module}_arch.txt"
-        key = " ".join(["mingw", *MINGW_FLAGS, arch])
+        key = " ".join(["mingw", *MINGW_FLAGS, arch] if mingw else ["linux", *LINUX_FLAGS, arch])
         if not stamp.exists() or stamp.read_text() != key:
             # New flags: the objects go and the stamp is written at once, so a build that fails later redoes only the
             # files that did not compile
@@ -86,8 +86,8 @@ def main():
     print(f"{len(sources)} sources, {len(stale)} to compile")
     if clang:
         build_clang(a, sources, stale, build, lib, arch, stamp, key)
-    elif mingw:
-        build_mingw(a, sources, stale, build, lib, arch, stamp, key)
+    elif mingw or linux:
+        build_mingw(a, sources, stale, build, lib, arch, stamp, key, linux)
     else:
         build_cl(a, sources, stale, build, lib)
     rt_stamp.write_text(rt_key)
@@ -134,10 +134,19 @@ def fmt(sec):
     return f"{sec // 3600}:{sec // 60 % 60:02}:{sec % 60:02}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02}"
 
 
+OUT_ENCODING = "utf-8" if paths.LINUX else "oem"   # what the compilers print in (Windows: the console's code page)
 FILE_GIB, HOT_GIB = 1.0, 3.0   # a compiler on one generated file / one hot file: 0.63 / 2.25 GB at most (measured), plus margin
 
 
 def free_ram_gib():
+    if paths.LINUX:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+        except OSError:
+            pass
+        return 64.0
     import ctypes
 
     class MS(ctypes.Structure):
@@ -178,7 +187,7 @@ def compile_all(module, stale, build, cmd, env, log, t0):
             mem.wait_for(lambda: in_use[0] == 0 or in_use[0] + need(s) <= budget)
             in_use[0] += need(s)
         try:
-            r = subprocess.run(cmd(s, tmp), env=env, capture_output=True, encoding="oem", errors="replace")
+            r = subprocess.run(cmd(s, tmp), env=env, capture_output=True, encoding=OUT_ENCODING, errors="replace")
         finally:
             with mem:
                 in_use[0] -= need(s)
@@ -264,9 +273,12 @@ def build_clang(a, sources, stale, build, lib, arch, stamp, key):
 
 
 MINGW_FLAGS = ["-mcx16", "-fms-extensions", "-fms-volatile", "-ffp-contract=off"]   # (see build_mingw; the stamp holds them)
+# Linux: the same without -fms-extensions (runtime/cpu.h has its own versions of the MSVC intrinsics there), and code for a
+# fixed address (the host links kart without PIE: no relocations for the function tables, and shorter code).
+LINUX_FLAGS = ["-mcx16", "-fms-volatile", "-ffp-contract=off", "-fno-pie"]
 
 
-def build_mingw(a, sources, stale, build, lib, arch, stamp, key):
+def build_mingw(a, sources, stale, build, lib, arch, stamp, key, linux=False):
     """clang from llvm-mingw: no Visual Studio, and several times faster than cl on these files (a hot file ~30 s
     instead of ~7 min: cl needs /d2OptimizeHugeFunctions to optimize their huge functions at all).
     -fms-extensions: the MSVC intrinsics runtime/cpu.h uses (with -mcx16 for the 128-bit compare-and-swap).
@@ -274,10 +286,11 @@ def build_mingw(a, sources, stale, build, lib, arch, stamp, key):
     plain loads and check the volatile ctx.halt between them: with ISO volatile clang kept the first load in a register
     and spun on halt alone, so a guest spinlock that another thread released never looked free (1.8.0 hung while loading).
     -ffp-contract=off: never fuse a separate guest multiply and add into an FMA (the guest rounds twice)."""
-    env = paths.mingw_env()
-    bindir = Path(paths.get("MINGW")) / "bin"
+    env = paths.llvm_env() if linux else paths.mingw_env()
+    bindir = Path(paths.get("LLVM" if linux else "MINGW")) / "bin"
     opt = "-O0" if a.opt.lower() == "/od" else "-" + a.opt.lstrip("/-")
-    flags = [str(bindir / "clang++.exe"), "-c", opt, "-std=c++20", "-w", *MINGW_FLAGS, *arch.split(), f"-I{ROOT / 'runtime'}"]
+    flags = [str(bindir / ("clang++" + paths.EXE)), "-c", opt, "-std=c++20", "-w", *(LINUX_FLAGS if linux else MINGW_FLAGS),
+             *arch.split(), f"-I{ROOT / 'runtime'}"]
     t = time.time()
 
     def cmd(s, out):
@@ -293,7 +306,7 @@ def build_mingw(a, sources, stale, build, lib, arch, stamp, key):
         # llvm-ar reads the response file the GNU way (a backslash escapes): forward slashes
         rsp.write_text("\n".join(f'"{(build / (s.stem + ".obj")).as_posix()}"' for s in sources))
         lib.unlink(missing_ok=True)   # 'r' would keep members of sources that are gone
-        r = subprocess.run([str(bindir / "llvm-ar.exe"), "rcs", str(lib), f"@{rsp}"], env=env, capture_output=True,
+        r = subprocess.run([str(bindir / ("llvm-ar" + paths.EXE)), "rcs", str(lib), f"@{rsp}"], env=env, capture_output=True,
                            text=True, errors="replace")
         out = r.stdout + r.stderr
         log.write(out)
@@ -309,7 +322,7 @@ def build_mingw(a, sources, stale, build, lib, arch, stamp, key):
                 sys.exit("build failed")
             continue
         sys.exit(f"llvm-ar failed:\n{out[-3000:]}")
-    print(f"built {a.module}.a with llvm-mingw clang {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
+    print(f"built {a.module}.a with {'clang' if linux else 'llvm-mingw clang'} {arch} ({lib.stat().st_size / 2**20:.0f} MiB) in {fmt(time.time() - t)}")
 
 
 if __name__ == "__main__":

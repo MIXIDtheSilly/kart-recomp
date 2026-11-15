@@ -1,19 +1,24 @@
 r"""Where the game dump and the compilers are: one place for the build scripts and tools.
 
 Each setting comes from the environment, else from local.cfg at the repository root (KEY=VALUE lines, # starts
-a comment; the file is not committed), else from the default below.
+a comment; the file is not committed), else from the default below. On Linux, local.linux.cfg (same format) comes
+before local.cfg, and local.cfg values that are Windows paths (C:\...) are skipped: one checkout can serve both systems.
 
   KART_GAME  the game dump: the folder holding exefs/ and romfs/            (none)
              (with KART_VER set, KART_GAME_<KART_VER> comes first)
   NVN_XLATE  folder the shader translator (dmsh_xlate.exe, from tools/xlate) is built into   (work/xlate)
   BUILD_CC   the C++ compiler: mingw (clang from llvm-mingw, which the launcher's Set up downloads: no Visual Studio
              needed), cl (Visual Studio) or clang (clang-cl with Visual Studio's libraries)
-                                                             (mingw)
+                                                             (mingw; on Linux always clang from LLVM, see below)
+  LLVM       Linux: the folder holding bin/clang++, bin/ld.lld and bin/llvm-ar (python tools/toolchain.py install puts
+             LLVM's release in tools/llvm; LLVM=/usr takes the distribution's clang)
+                                                             (tools/llvm, else /usr when it has clang++)
   MINGW      the llvm-mingw toolchain (python tools\toolchain.py install puts it there)    (tools\llvm-mingw)
   VCVARS     Visual Studio's vcvars64.bat, for BUILD_CC=cl or clang         (found with vswhere)
   CLANG      clang-cl.exe, for BUILD_CC=clang                               (C:\Program Files\LLVM\bin)
   VULKAN_BIN folder with spirv-val, spirv-opt, spirv-dis, spirv-cross and glslangValidator
-             (third_party\spirv\bin, which the repository carries; else the Vulkan SDK's Bin)
+             (third_party\spirv\bin, which the repository carries; else the Vulkan SDK's Bin. Linux: tools/spirv,
+             which ./kart.sh setup fills from the Vulkan SDK, else the Vulkan SDK's, else where spirv-val is on PATH)
   KART_VER   another game version, built next to the default one: its out/, gen/ and build/ go to
              ver/<KART_VER>/ and host\build.bat links host\out\kart-<KART_VER>.exe   (none)
              Set it in the environment for that build only: in local.cfg it would switch every build.
@@ -27,7 +32,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ["KART_GAME", "NVN_XLATE", "BUILD_CC", "MINGW", "VCVARS", "CLANG", "VULKAN_BIN", "KART_VER"]
+KEYS = ["KART_GAME", "NVN_XLATE", "BUILD_CC", "MINGW", "LLVM", "VCVARS", "CLANG", "VULKAN_BIN", "KART_VER"]
+LINUX = sys.platform.startswith("linux")
+EXE = "" if LINUX else ".exe"   # what programs end in on this system
 NOT_PATHS = ("BUILD_CC", "VCVARS", "CLANG", "KART_VER")
 
 
@@ -55,15 +62,24 @@ def _excepthook(kind, exc, tb):
 sys.excepthook = _excepthook
 
 
+def _windows_path(v):
+    return len(v) >= 3 and v[0].isalpha() and v[1] == ":" and v[2] in "\\/"
+
+
 def _local():
     cfg = {}
-    f = ROOT / "local.cfg"
-    if f.exists():
+    for name in (["local.cfg", "local.linux.cfg"] if LINUX else ["local.cfg"]):
+        f = ROOT / name
+        if not f.exists():
+            continue
         for line in f.read_text(encoding="utf-8").splitlines():
             line = line.split("#", 1)[0].strip()
             if "=" in line:
                 k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip('"')
+                k, v = k.strip(), v.strip().strip('"')
+                if LINUX and name == "local.cfg" and _windows_path(v):
+                    continue   # a Windows setting of a checkout both systems use
+                cfg[k] = v
     return cfg
 
 
@@ -80,6 +96,14 @@ def _find_vcvars():
 
 
 def _find_vulkan_bin():
+    if LINUX:   # the Vulkan SDK's tools Set up put in tools/spirv, the Vulkan SDK's, else the distribution's
+        if (ROOT / "tools" / "spirv" / "spirv-val").exists():
+            return str(ROOT / "tools" / "spirv")
+        if os.environ.get("VULKAN_SDK"):
+            return str(Path(os.environ["VULKAN_SDK"]) / "bin")
+        import shutil
+        found = shutil.which("spirv-val")
+        return str(Path(found).parent) if found else "/usr/bin"
     own = ROOT / "third_party" / "spirv" / "bin"
     if (own / "spirv-val.exe").exists():
         return str(own)
@@ -106,6 +130,9 @@ def get(key):
         return str(ROOT / "work" / "xlate")
     if key == "MINGW":
         return str(ROOT / "tools" / "llvm-mingw")
+    if key == "LLVM":
+        own = ROOT / "tools" / "llvm"
+        return str(own) if (own / "bin" / "clang++").exists() or not Path("/usr/bin/clang++").exists() else "/usr"
     if key == "BUILD_CC":
         return "mingw"   # ~50% faster game than cl (race ~150 fps against ~100); mingw_env says how to get it
     if key == "VCVARS":
@@ -140,7 +167,9 @@ def progress(done, total, what=""):
 
 
 def build_cc():
-    """mingw, cl or clang (BUILD_CC; clang-cl counts as clang)."""
+    """mingw, cl or clang (BUILD_CC; clang-cl counts as clang); linux on Linux."""
+    if LINUX:
+        return "linux"
     cc = get("BUILD_CC").lower()
     return "clang" if cc == "clang-cl" else cc
 
@@ -151,6 +180,17 @@ def mingw_env():
     if not (b / "clang++.exe").exists():
         sys.exit(f"llvm-mingw is not in {b.parent}: run python tools\\toolchain.py install (the launcher's Set up does), "
                  "or set BUILD_CC=cl to build with Visual Studio")
+    env = dict(os.environ)
+    env["PATH"] = str(b) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def llvm_env():
+    """Linux: the environment with LLVM's bin folder first on PATH; exits with a message when clang is not there."""
+    b = Path(get("LLVM")) / "bin"
+    if not (b / "clang++").exists():
+        sys.exit(f"clang is not in {b}: run python3 tools/toolchain.py install, or install clang and lld from your "
+                 "distribution and set LLVM=/usr in local.linux.cfg")
     env = dict(os.environ)
     env["PATH"] = str(b) + os.pathsep + env.get("PATH", "")
     return env
