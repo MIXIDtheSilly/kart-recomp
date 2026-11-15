@@ -330,11 +330,15 @@ struct VideoSession : Service {
     std::string codec;
     u32 width = 0, height = 0;
     u32 handed = 0;  // output images handed out (registered or released) so far
-    u64 frames_out = 0;
+    u64 frames_out = 0, frames_out_owed = 0;
     u64 last_pts = 0;  // of the newest frame written
     std::deque<Input> inputs;
     std::deque<Decoded> decoded;
     std::deque<u32> free_images;  // in the order the client acquires them
+    // Images given their values without a frame (release_unfilled) at the end of the stream or a flush: the client still
+    // counts on a frame in each, so a looping movie (end of stream, flush 8, the same frames again) writes its next frames
+    // into them (without counting them again on the syncpoint). Given back (311/314) or stopped (207), they are done.
+    std::deque<u32> owed_images;
     std::map<u32, Fence> release_fences;
     std::deque<Output> outputs;  // finished, for 213
     bool flush = false, quit = false;
@@ -419,6 +423,7 @@ struct VideoSession : Service {
         u32 value;
         {
             std::scoped_lock lk{m};
+            std::erase(owed_images, image);
             free_images.push_back(image);
             if (release) release_fences[image] = *release;
             value = sync_base + ++handed;
@@ -439,6 +444,7 @@ struct VideoSession : Service {
         u32 n = 0;
         for (; !free_images.empty(); free_images.pop_front(), n++) {
             release_fences.erase(free_images.front());
+            owed_images.push_back(free_images.front());
             sync::increment(syncpoint);
         }
         return n;
@@ -462,7 +468,7 @@ struct VideoSession : Service {
     // sync values stay in step with the client's ring: a movie stopped mid-stream drains its ring and aborted on a value
     // never reached (subsdk0+0x4540, svcBreak after IApplicationFunctions::22, with no end of stream in the log). An
     // image the decode loop is writing now was already taken off free_images and gets its value when written.
-    void flush_queue(Request&, const char* what) {
+    void flush_queue(Request& r, const char* what) {
         u32 released, queued;
         u64 frames;
         {
@@ -474,6 +480,7 @@ struct VideoSession : Service {
             flush = true;
             room = true;
             released = release_unfilled(true);
+            if (r.cmd == 207) owed_images.clear();   // stopped: no more frames come for them
         }
         cv.notify_all();
         LOG("%s %s after %llu frames: %u queued dropped, %u handed-out images given their values", name.c_str(), what,
@@ -508,7 +515,7 @@ struct VideoSession : Service {
         std::unique_lock lk{m};
         for (;;) {
             cv.wait(lk, [&] {
-                return quit || flush || (!decoded.empty() && !free_images.empty()) ||
+                return quit || flush || (!decoded.empty() && (!free_images.empty() || !owed_images.empty())) ||
                        (!inputs.empty() && decoded.size() < MaxDecodedAhead);
             });
             if (quit) return;
@@ -522,11 +529,15 @@ struct VideoSession : Service {
                 }
                 continue;
             }
-            if (!decoded.empty() && !free_images.empty()) {
+            if (!decoded.empty() && (!free_images.empty() || !owed_images.empty())) {
                 Decoded frame = std::move(decoded.front());
                 decoded.pop_front();
-                const u32 image = free_images.front();
-                free_images.pop_front();
+                // An owed image first: the client handed it out before any free one and already has its value
+                const bool owed = !owed_images.empty();
+                std::deque<u32>& from = owed ? owed_images : free_images;
+                const u32 image = from.front();
+                from.pop_front();
+                if (owed && frames_out_owed++ == 0) LOG("%s looped: frames go into the %zu images given their values without one", name.c_str(), owed_images.size() + 1);
                 std::optional<Fence> fence;
                 if (auto it = release_fences.find(image); it != release_fences.end()) {
                     fence = it->second;
@@ -539,7 +550,7 @@ struct VideoSession : Service {
                 // Even an image written during a flush counts: the client waits for its value.
                 outputs.push_back({image, w, h, frame.pts, frame.end});
                 last_pts = frame.pts;
-                sync::increment(syncpoint);
+                if (!owed) sync::increment(syncpoint);
                 ++frames_out;
                 if (frame.end) at_end = true, release_unfilled();
                 if (frames_out == 1 || frames_out % 600 == 0 || frame.end)
