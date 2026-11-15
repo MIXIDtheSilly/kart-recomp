@@ -116,6 +116,22 @@ def run(args, *a, **k):
         return r
     return _run(args, *a, **k)
 subprocess.run = run
+# lz4 has no wheel yet for the newest Python (3.15, issue #30), and the split's nso.py imports lz4.block for the
+# compressed segments of exefs/main: tools/nso.py's plain-Python LZ4 decoder stands in for it then.
+try: import lz4.block
+except ImportError:
+    import importlib.util, types
+    _s = importlib.util.spec_from_file_location('kart_nso', os.path.join(os.environ['SPLIT_TOOLS'], '..', 'nso.py'))
+    _m = importlib.util.module_from_spec(_s); _s.loader.exec_module(_m)
+    class LZ4BlockError(Exception): pass
+    def _decompress(src, uncompressed_size=-1, **k):
+        try: out = _m.lz4_block_decompress(bytes(src), uncompressed_size)
+        except IndexError as e: raise LZ4BlockError('truncated block') from e
+        if uncompressed_size >= 0 and len(out) != uncompressed_size: raise LZ4BlockError(f'{len(out)} bytes, not {uncompressed_size}')
+        return out
+    _blk = types.ModuleType('lz4.block'); _blk.decompress = _decompress; _blk.LZ4BlockError = LZ4BlockError
+    _pkg = types.ModuleType('lz4'); _pkg.block = _blk; _pkg.__path__ = []
+    sys.modules['lz4'] = _pkg; sys.modules['lz4.block'] = _blk
 sys.path.insert(0, os.environ['SPLIT_TOOLS'])
 if __name__ == '__main__':
     import shader_split
