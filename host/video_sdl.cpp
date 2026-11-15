@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 
+#include "memory.h"
 #include "os.h"
 #include "services/gamepads.h"
 #include "video.h"
@@ -44,9 +45,10 @@ void note_pixel_size() {
     g_pixel_size = static_cast<u64>(w) << 32 | static_cast<u32>(h);
 }
 
-// The process's memory with each guest page counted once: the guest view and the pool's backing view map the same pages,
-// which the resident set counts twice. The proportional set size (smaps_rollup) splits a page between its mappings.
-// Read every 2 s on a thread of its own (it walks every mapping).
+// The process's memory with each guest page counted once: the guest view and the pool's backing view map the same pages
+// (shared memory, which the resident set counts per mapping), so it is the anonymous and file pages from the kernel's
+// counters plus the pool's own pages (mem::pool_resident_bytes). Not smaps_rollup: it walks all ~5000 mappings with the
+// process's memory map lock held (~100 ms every 2 s), and every thread mapping or protecting memory waited for it.
 std::atomic<u64> g_ram_bytes{0};
 void start_ram_count() {
     std::thread([] {
@@ -54,12 +56,11 @@ void start_ram_count() {
         os::set_thread_priority(os::Priority::Lowest);
         for (;; std::this_thread::sleep_for(std::chrono::seconds(2))) {
             if (!g_overlay_on) continue;
-            std::ifstream f("/proc/self/smaps_rollup");
+            u64 kb = 0;
+            std::ifstream f("/proc/self/status");
             for (std::string line; std::getline(f, line);)
-                if (line.rfind("Pss:", 0) == 0) {
-                    g_ram_bytes = std::strtoull(line.c_str() + 4, nullptr, 10) << 10;
-                    break;
-                }
+                if (line.rfind("RssAnon:", 0) == 0 || line.rfind("RssFile:", 0) == 0) kb += std::strtoull(line.c_str() + 8, nullptr, 10);
+            g_ram_bytes = (kb << 10) + mem::pool_resident_bytes();
         }
     }).detach();
 }

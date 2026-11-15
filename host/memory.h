@@ -74,6 +74,9 @@ u8* phys_ptr(u64 phys);
 std::vector<PhysRun> pin(const void* host, u64 size);
 void unpin(const std::vector<PhysRun>& runs);
 u64 phys_pool_bytes();  // size of the whole pool
+#ifndef _WIN32
+u64 pool_resident_bytes();  // pages of the pool in RAM, each once (the memfd's allocated blocks)
+#endif
 
 void set_perm(u64 addr, u64 size, u32 perm);
 void set_attr(u64 addr, u64 size, u32 mask, u32 attr);

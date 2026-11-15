@@ -5,6 +5,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <fstream>
@@ -608,6 +609,12 @@ void unpin(const std::vector<PhysRun>& runs) {
 
 u8* phys_ptr(u64 phys) { return g_backing + phys; }
 u64 phys_pool_bytes() { return g_phys_size; }
+#ifndef _WIN32
+u64 pool_resident_bytes() {
+    struct stat st{};
+    return g_pool_fd >= 0 && fstat(g_pool_fd, &st) == 0 ? static_cast<u64>(st.st_blocks) * 512 : 0;
+}
+#endif
 
 std::vector<RemapListener> g_remap_listeners;
 
