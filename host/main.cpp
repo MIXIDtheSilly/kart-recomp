@@ -245,16 +245,33 @@ std::string host_symbol(u64 rip) {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
         return SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
     }();
-    if (!init) return "?";
+    // Outside kart.exe (the Vulkan driver, system DLLs): the module and offset too, as a driver's symbols are only its
+    // exports and the nearest one can be far away.
+    std::string mod;
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(rip), &hm) && hm != GetModuleHandleW(nullptr)) {
+        wchar_t path[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(hm, path, MAX_PATH);
+        const wchar_t* name = path;
+        for (DWORD i = 0; i < n; i++)
+            if (path[i] == L'\\' || path[i] == L'/') name = path + i + 1;
+        char m8[MAX_PATH * 3];
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, m8, sizeof m8, nullptr, nullptr);
+        char b[MAX_PATH * 3 + 24];
+        snprintf(b, sizeof b, "%s+%#llx", m8, rip - reinterpret_cast<u64>(hm));
+        mod = b;
+    }
+    if (!init) return mod.empty() ? "?" : mod;
     alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
     auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
     sym->SizeOfStruct = sizeof(SYMBOL_INFO);
     sym->MaxNameLen = 255;
     DWORD64 disp = 0;
-    if (!SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) return "?";
+    if (!SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) return mod.empty() ? "?" : mod;
     char out[400];
     snprintf(out, sizeof out, "%s+%#llx", sym->Name, disp);
-    return out;
+    return mod.empty() ? std::string(out) : mod + " (" + out + ")";
 }
 
 // The code addresses of a suspended thread's host stack, innermost first.
@@ -294,10 +311,29 @@ static void dump_host_stacks() {
         if (!h) continue;
         u64 pcs[28];
         int n = 0;
+        bool locked = false;
         if (SuspendThread(h) != static_cast<DWORD>(-1)) {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_FULL;
-            if (GetThreadContext(h, &ctx)) n = walk_host_stack(ctx, pcs, 28);
+            // The walk looks up unwind data under the loader's and the function tables' locks: a thread suspended while
+            // holding one (a driver thread loading a DLL as it compiles a pipeline) would block it, and this thread with
+            // it, leaving the other suspended for good (issue #23: the dump stopped after the guest threads and the game
+            // never went on). So it walks on a helper and gives up after half a second.
+            struct Walk {
+                CONTEXT ctx{};
+                u64 pcs[28]{};
+                int n = 0;
+                HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                ~Walk() { CloseHandle(done); }
+            };
+            auto w = std::make_shared<Walk>();
+            w->ctx.ContextFlags = CONTEXT_FULL;
+            if (w->done && GetThreadContext(h, &w->ctx)) {
+                std::thread([w] {
+                    w->n = walk_host_stack(w->ctx, w->pcs, 28);
+                    SetEvent(w->done);
+                }).detach();
+                if (WaitForSingleObject(w->done, 500) == WAIT_OBJECT_0) n = w->n, std::memcpy(pcs, w->pcs, sizeof pcs);
+                else locked = true;
+            }
             ResumeThread(h);
         }
         PWSTR desc = nullptr;
@@ -312,6 +348,7 @@ static void dump_host_stacks() {
             line += i ? " < " : " ";
             line += s;
         }
+        if (locked) line = " (not read: it holds a lock the stack walk needs)";
         if (pool_idle) idle++;   // (a thread-pool thread with nothing to do)
         else LOG("stack of host thread %lu (%ls):%s", te.th32ThreadID, desc && *desc ? desc : L"-", line.c_str());
         if (desc) LocalFree(desc);
@@ -468,6 +505,28 @@ LONG CALLBACK crash_handler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// A fault nobody handled: crash_handler leaves those outside kart.exe to their module (the Vulkan driver handles some
+// of its own), so a crash inside the driver used to end the process with 0xC0000005 and nothing in host.log (issues
+// #23, #26, #29). Logs where it happened and the thread's stack, then lets Windows end the process as before.
+LONG WINAPI last_chance(EXCEPTION_POINTERS* ep) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    const u64 rip = ep->ContextRecord->Rip;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        log_line("[RED] crash: exception %#lx at %s (rip %#llx), %s %#llx, thread %lu", er->ExceptionCode, host_symbol(rip).c_str(), rip,
+                 er->ExceptionInformation[0] == 8 ? "executing" : er->ExceptionInformation[0] ? "writing" : "reading",
+                 static_cast<unsigned long long>(er->ExceptionInformation[1]), GetCurrentThreadId());
+    else
+        log_line("[RED] crash: exception %#lx at %s (rip %#llx), thread %lu", er->ExceptionCode, host_symbol(rip).c_str(), rip,
+                 GetCurrentThreadId());
+    u64 pcs[32];
+    const int n = walk_host_stack(*ep->ContextRecord, pcs, 32);
+    for (int i = 1; i < n; i++) log_line("  #%-2d %s", i, host_symbol(pcs[i]).c_str());
+    if (g_log_file) fflush(g_log_file);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 }  // namespace
 
 std::string describe_guest(u64 addr) {
@@ -618,6 +677,7 @@ int main(int argc, char** argv) {
     if (argc > 2 && std::strcmp(argv[2], "--bake-textures") == 0) return nvk::bake_textures(game, argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0);
 
     AddVectoredExceptionHandler(0, crash_handler);
+    SetUnhandledExceptionFilter(last_chance);
     // The finest host timer resolution (0.5 ms), for the renderer's acquire polling and the game's short timed waits.
     LOG("host timer resolution %lu us", finest_timer_resolution() / 10);
     mem::init();

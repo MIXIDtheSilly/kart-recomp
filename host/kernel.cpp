@@ -843,8 +843,10 @@ void dump_threads() {
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL;
             if (SuspendThread(h) != static_cast<DWORD>(-1)) {
-                if (GetThreadContext(h, &ctx)) where = host_symbol(ctx.Rip);
+                const bool got = GetThreadContext(h, &ctx);
                 ResumeThread(h);
+                // (named after it runs again: the lookup takes the heap and loader locks, which it may hold)
+                if (got) where = host_symbol(ctx.Rip);
             }
         }
         // What a waiter waits on: the arbiter word, or the mutex word (its owner's thread handle, bit 30 = has waiters;
