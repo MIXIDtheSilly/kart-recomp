@@ -451,12 +451,19 @@ void present(VkImage image, VkFormat format, u32 w, u32 h, const int* crop, u64 
     } else if (r != VK_SUCCESS) {
         vk_fail(r, "vkQueuePresentKHR");
     }
-    // Presents a second, every 5 s
-    static u64 t_last = host_ns(), n = 0;
+    // Presents a second, every 5 s, with the longest gap between presents and how many gaps ran past 25 / 50 ms
+    // (stutters)
+    static u64 t_last = host_ns(), t_prev = t_last, n = 0, worst = 0, slow = 0, very_slow = 0;
     n++;
-    if (const u64 now = host_ns(); now - t_last >= 5'000'000'000ull) {
-        LOG("nvk: %.1f fps", static_cast<double>(n) * 1e9 / static_cast<double>(now - t_last));
-        t_last = now, n = 0;
+    const u64 now = host_ns(), gap = now - t_prev;
+    t_prev = now;
+    worst = std::max(worst, gap);
+    slow += gap >= 25'000'000ull;
+    very_slow += gap >= 50'000'000ull;
+    if (now - t_last >= 5'000'000'000ull) {
+        LOG("nvk: %.1f fps (worst %.1f ms, %llu over 25 ms, %llu over 50 ms)", static_cast<double>(n) * 1e9 / static_cast<double>(now - t_last),
+            static_cast<double>(worst) / 1e6, static_cast<unsigned long long>(slow), static_cast<unsigned long long>(very_slow));
+        t_last = now, n = worst = slow = very_slow = 0;
     }
 }
 

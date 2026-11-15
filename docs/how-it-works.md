@@ -84,10 +84,17 @@ A `.nup` dump unpacks with `python tools\nup.py extract <file> <folder>`. For 1.
 ## Linux
 
 The same game and host, built with clang from LLVM 23.1.4 (the clang llvm-mingw has) against the system's C and C++
-libraries. `./kart.sh` (`tools/linux.py`) does what the launcher does, on the command line:
+libraries. `./kart.sh` opens the launcher, the Windows one built for Linux (`launcher/launcher.cpp`: an SDL 3 window
+drawn with cairo and Pango, the desktop's file dialogs; `tools/linux.py launcher` builds it into `launcher/out/launcher`
+when the source is newer). Its steps, settings and buttons are the Windows ones; Set up runs `./kart.sh setup <part>`
+for each part that is missing, and Build runs the same stages, linking with `build_host.py`. The launcher stamps the
+stages it ran in `build/stages-linux/` (beside Windows' `build/stages/`, so a checkout both systems build keeps both); a
+build from the command line leaves no stamps, so the launcher's next Build runs every stage once more (each redoes only
+what changed). `./kart.sh <command>` does the steps on the command line:
 
 | command | what |
 |---------|------|
+| `./kart.sh` | the launcher (`./kart.sh help` lists the commands) |
 | `./kart.sh setup` | checks SDL 3, the Vulkan loader, libvpx and the C++ headers; puts LLVM's release in `tools/llvm/` (`tools/toolchain.py`; `LLVM=/usr` in `local.linux.cfg` takes the distribution's clang instead), the Python packages in a virtual environment `tools/venv/`, the .NET 10 SDK in `tools/dotnet/` (when the system has none) and the Vulkan SDK's SPIR-V tools in `tools/spirv/` (when some are missing: Fedora has no spirv-cross) |
 | `./kart.sh game <folder>` | the dump, as `KART_GAME` (or `KART_GAME_<version>` with `--version`) in `local.linux.cfg` |
 | `./kart.sh build` | the build steps of [Building by hand](#building-by-hand), each one that is not done yet (`--force`: all) |

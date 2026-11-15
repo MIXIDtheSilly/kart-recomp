@@ -1,6 +1,8 @@
 r"""The way from a game dump to playing on Linux, the steps the Windows launcher (launcher/launcher.cpp) takes, on the
-command line. ./kart.sh runs it.
+command line, and the launcher itself. ./kart.sh runs it.
 
+  ./kart.sh                           the launcher (launcher/launcher.cpp, built into launcher/out/launcher the first
+                                      time): these steps in a window, as on Windows
   ./kart.sh setup                     what the build needs: clang (LLVM's release into tools/llvm, tools/toolchain.py),
                                       the Python packages (a virtual environment in tools/venv, tools/deps.py), the .NET
                                       SDK for the shader translator (into tools/dotnet when the system has none) and the
@@ -87,30 +89,34 @@ def have_lib(name):
         return False
 
 
-def setup(args):
+def check_system():
+    """The system's libraries and headers, which setup cannot install (no root): the problems found."""
     problems = []
     # The libraries the game loads (no -devel packages: the headers are in third_party/)
-    for lib, what, need in (("libSDL3.so.0", "SDL 3 (window, input, sound): the SDL3 package (Fedora: SDL3, Debian/Ubuntu: libsdl3-0)", True),
-                            ("libvulkan.so.1", "the Vulkan loader (Fedora: vulkan-loader, Debian/Ubuntu: libvulkan1) and your GPU's Vulkan driver", True),
-                            ("libvpx.so.9", "", False)):
-        if lib == "libvpx.so.9":
-            ok = any(have_lib(f"libvpx.so.{n}") for n in (12, 11, 10, 9, 8, 7, 6))
-            say(f"  libvpx              {'found' if ok else 'missing: the movies show black (install libvpx)'}")
-            continue
+    for lib, what in (("libSDL3.so.0", "SDL 3 (window, input, sound): the SDL3 package (Fedora: SDL3, Debian/Ubuntu: libsdl3-0)"),
+                      ("libvulkan.so.1", "the Vulkan loader (Fedora: vulkan-loader, Debian/Ubuntu: libvulkan1) and your GPU's Vulkan driver")):
         ok = have_lib(lib)
         say(f"  {lib:20}{'found' if ok else 'MISSING: ' + what}")
-        if not ok and need:
+        if not ok:
             problems.append(what)
+    ok = any(have_lib(f"libvpx.so.{n}") for n in (12, 11, 10, 9, 8, 7, 6))
+    say(f"  libvpx              {'found' if ok else 'missing: the movies show black (install libvpx)'}")
     # The C++ library headers clang compiles against (libstdc++, glibc)
     if not list(Path("/usr/include/c++").glob("*/vector")):
         problems.append("the C++ standard library headers (Fedora: gcc-c++, Debian/Ubuntu: g++)")
         say("  C++ headers         MISSING: install g++ (gcc-c++)")
-    # clang
+    return problems
+
+
+def setup_clang():
     if (Path(paths.get("LLVM")) / "bin" / "clang++").exists():
         say(f"  clang               {paths.get('LLVM')}")
-    else:
-        say("  clang               installing LLVM's release into tools/llvm (1.2 GB download)")
-        run([sys.executable, TOOLS / "toolchain.py", "install"], tool_env(""))
+        return
+    say("  clang               installing LLVM's release into tools/llvm (1.2 GB download)")
+    run([sys.executable, TOOLS / "toolchain.py", "install"], tool_env(""))
+
+
+def setup_python():
     # Python packages in a virtual environment (distributions keep pip away from the system's Python)
     if not (VENV / "bin" / "python").exists():
         say("  Python packages     making tools/venv")
@@ -118,16 +124,22 @@ def setup(args):
         if r.returncode:
             sys.exit("python3 -m venv failed: install your distribution's python3-venv package")
     run([python(), TOOLS / "deps.py", "install"], tool_env(""))
+
+
+def setup_dotnet():
     # .NET SDK (the shader translator, tools/xlate)
     if shutil.which("dotnet") or (DOTNET / "dotnet").exists():
         say("  .NET SDK            found")
-    else:
-        say("  .NET SDK            installing the .NET 10 SDK into tools/dotnet (dotnet-install.sh)")
-        script = TOOLS / "dotnet-install.sh"
-        with urllib.request.urlopen("https://dot.net/v1/dotnet-install.sh", timeout=60) as r:
-            script.write_bytes(r.read())
-        run(["bash", script, "--channel", "10.0", "--install-dir", DOTNET, "--no-path"], tool_env(""))
-        script.unlink(missing_ok=True)
+        return
+    say("  .NET SDK            installing the .NET 10 SDK into tools/dotnet (dotnet-install.sh)")
+    script = TOOLS / "dotnet-install.sh"
+    with urllib.request.urlopen("https://dot.net/v1/dotnet-install.sh", timeout=60) as r:
+        script.write_bytes(r.read())
+    run(["bash", script, "--channel", "10.0", "--install-dir", DOTNET, "--no-path"], tool_env(""))
+    script.unlink(missing_ok=True)
+
+
+def setup_spirv():
     # SPIR-V tools (the shader steps; distributions often lack spirv-cross)
     bin_dir = Path(paths.get("VULKAN_BIN"))
     lack = [t for t in SPIRV_TOOLS if not (bin_dir / t).exists()]
@@ -136,10 +148,32 @@ def setup(args):
         spirv_install()
         bin_dir = Path(paths.get("VULKAN_BIN"))
     say(f"  SPIR-V tools        {bin_dir}")
+
+
+def setup_xlate():
+    # The shader translator (tools/xlate), built from the NuGet packages in tools/xlate/packages
+    env = tool_env("")
+    xlate = paths.get("NVN_XLATE")
+    say(f"  shader translator   building it into {xlate}")
+    dotnet = shutil.which("dotnet", path=env["PATH"]) or "dotnet"
+    run([dotnet, "build", "-c", "Release", "-o", xlate, TOOLS / "xlate" / "dmsh_xlate" / "dmsh_xlate.csproj"], env)
+
+
+SETUP_PARTS = {"clang": setup_clang, "python": setup_python, "dotnet": setup_dotnet, "spirv": setup_spirv, "xlate": setup_xlate}
+
+
+def setup(args):
+    if args.parts:   # the launcher's Set up: only what is missing, one part per step
+        for part in args.parts:
+            SETUP_PARTS[part]()
+        return
+    problems = check_system()
+    for fn in SETUP_PARTS.values():
+        fn()
     if problems:
         say("\nStill missing (install with your package manager, then run ./kart.sh setup again):\n  - " + "\n  - ".join(problems))
         sys.exit(1)
-    say("\nSet up. Next: ./kart.sh game <dump folder>, then ./kart.sh build")
+    say("\nSet up. Next: ./kart.sh game <dump folder>, then ./kart.sh build (or ./kart.sh for the launcher)")
 
 
 def spirv_install():
@@ -280,6 +314,37 @@ def bake(args):
     play(args, [game, "--bake-textures"])
 
 
+# ------------------------------------------------------------------ launcher
+
+LAUNCHER_LIBS = ["libSDL3.so.0", "libcairo.so.2", "libpango-1.0.so.0", "libpangocairo-1.0.so.0", "libgobject-2.0.so.0",
+                 "libfontconfig.so.1"]
+
+
+def launcher(args):
+    """Builds launcher/out/launcher when launcher.cpp is newer (with LLVM's clang from tools/llvm, else the system's
+    C++ compiler; with neither, tools/toolchain.py downloads LLVM first) and opens it."""
+    src = ROOT / "launcher" / "launcher.cpp"
+    exe = ROOT / "launcher" / "out" / "launcher"
+    lack = [lib for lib in LAUNCHER_LIBS if not have_lib(lib)]
+    if lack:
+        sys.exit("the launcher needs " + ", ".join(lack) + " (SDL 3, cairo, Pango, fontconfig: a desktop has them); "
+                 "the steps work without it: ./kart.sh help")
+    if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
+        llvm = Path(paths.get("LLVM")) / "bin" / "clang++"
+        cxx = str(llvm) if llvm.exists() else shutil.which("clang++") or shutil.which("g++") or shutil.which("c++")
+        if not cxx:
+            say("No C++ compiler: installing LLVM's release into tools/llvm first (1.2 GB download)")
+            run([sys.executable, TOOLS / "toolchain.py", "install"], tool_env(""))
+            cxx = str(Path(paths.get("LLVM")) / "bin" / "clang++")
+        if not list(Path("/usr/include/c++").glob("*/vector")):
+            sys.exit("the C++ standard library headers are missing: install g++ (Fedora: gcc-c++, Debian/Ubuntu: g++)")
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        say(f"building the launcher ({Path(cxx).name})")
+        run([cxx, "-O2", "-std=c++20", "-pthread", *(["-fuse-ld=lld"] if "clang" in Path(cxx).name and llvm.exists() else []),
+             f"-I{ROOT / 'third_party' / 'SDL3' / 'include'}", src, "-o", exe, *[f"-l:{lib}" for lib in LAUNCHER_LIBS]], tool_env(""))
+    os.execv(str(exe), [str(exe), *args.rest])
+
+
 def main():
     if not paths.LINUX:
         sys.exit("this is the Linux front end: on Windows the launcher does this (launcher\\build.bat, launcher\\out\\launcher.exe)")
@@ -287,7 +352,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", help="the game version (1.8.0); default: LAUNCHER_VERSION, else the default build")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("setup", help="install and check what the build needs")
+    sub.add_parser("launcher", help="the launcher: these steps in a window (the default)").add_argument("rest", nargs=argparse.REMAINDER)
+    sp = sub.add_parser("setup", help="install and check what the build needs")
+    sp.add_argument("parts", nargs="*", choices=[[], *SETUP_PARTS], help=argparse.SUPPRESS)
+    sub.add_parser("help", help="this list")
     g = sub.add_parser("game", help="the dump folder to build and play")
     g.add_argument("folder")
     b = sub.add_parser("build", help="build what is not built yet")
@@ -307,8 +375,12 @@ def main():
         play(args)
     elif args.cmd == "bake":
         bake(args)
-    else:
+    elif args.cmd == "help":
         ap.print_help()
+    else:
+        if args.cmd is None:
+            args.rest = []
+        launcher(args)
 
 
 if __name__ == "__main__":

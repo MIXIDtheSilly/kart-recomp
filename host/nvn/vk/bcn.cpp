@@ -111,8 +111,10 @@ struct Pool {
 };
 
 Pool& pool() {
-    static Pool p;
-    return p;
+    // Never destroyed: its detached threads wait on its condition variables until the process ends (glibc's
+    // pthread_cond_destroy at exit would wait for them forever)
+    static Pool* p = new Pool;
+    return *p;
 }
 
 using BlockEncoder = void (*)(u8* block_output, const u8* block_input, bool any_alpha);
