@@ -45,6 +45,30 @@ bool sync_ready(u32 id, u32 value) { return sync::ready(id, value); }
 template <typename F> sync::Handle on_sync(u32 id, u32 value, F&& f) { return sync::on_reach(id, value, std::forward<F>(f)); }
 void cancel_sync(u32 id, sync::Handle h) { sync::cancel(id, h); }
 
+// The syncpoint values the guest reads (the RO page of nx2:gsv 204: nn::gs::TryWaitNativeSync and the syncpt SDK
+// read them there), and how many it has; 0 before the game attaches it.
+std::atomic<u64> g_syncpt_ro{0};
+std::atomic<u32> g_syncpt_count{0};
+constexpr u32 SyncptValuesOffset = 0x40;
+
+u64& guest_u64(u64 addr) { return *reinterpret_cast<u64*>(mem::backing_ptr(addr & ~(mem::PageSize - 1)) + (addr & (mem::PageSize - 1))); }
+
+// Raises a guest syncpoint value to v, never lowers it (the poller and a wait's action write it from two threads).
+void raise_value(u64& slot, u64 v) {
+    std::atomic_ref<u64> a{slot};
+    u64 cur = a.load(std::memory_order_relaxed);
+    while (static_cast<s32>(static_cast<u32>(v) - static_cast<u32>(cur)) > 0 && !a.compare_exchange_weak(cur, v)) {}
+}
+
+// Syncpoint `id`'s value into the guest's page now. A wait's event is signalled at once when the value is reached, but
+// the page was only refreshed every 500 us: the movie module woke on the event, read the old value (TryWaitNativeSync)
+// and aborted (svcBreak after IApplicationFunctions::22, subsdk0+0x4540 / 0x4690).
+void mirror_syncpt(u32 id) {
+    const u64 ro = g_syncpt_ro.load(std::memory_order_acquire);
+    if (ro && id < std::min<u32>(g_syncpt_count.load(std::memory_order_relaxed), HostSyncpoints))
+        raise_value(guest_u64(ro + SyncptValuesOffset + id * 8), sync_value(id));
+}
+
 // Events a session creates on demand by id.
 struct EventMap {
     std::mutex m;
@@ -125,6 +149,7 @@ struct Syncpt : Service {
                 std::scoped_lock lk{sh->m};
                 if (!sh->alive || req.gen != gen) return;
                 req.pending = false;
+                mirror_syncpt(id);   // (before the waiter can read it)
                 ev->signal();
             });
         });
@@ -595,7 +620,7 @@ struct Gsv : Service {
     std::shared_ptr<NativeObjects> objects = std::make_shared<NativeObjects>();
 
     // Syncpoint memory (204): RO page header + values, RW armed bits; polled every 500 us.
-    static constexpr u32 SyncptValuesOffset = 0x40, SyncptRoSummaryOffset = 0x1040, SyncptRoBitsOffset = 0x1100;
+    static constexpr u32 SyncptRoSummaryOffset = 0x1040, SyncptRoBitsOffset = 0x1100;
     static constexpr u32 SyncptRwSummaryOffset = 0x0, SyncptRwBitsOffset = 0x100;
     std::shared_ptr<kern::ServiceEvent> syncpt_request, syncpt_notify;
     std::atomic<u64> syncpt_rw{0}, syncpt_ro{0};
@@ -785,6 +810,8 @@ struct Gsv : Service {
             syncpt_rw = rw->addr;
             syncpt_ro = ro->addr;
             syncpt_count = max_syncpoints;
+            g_syncpt_count = max_syncpoints;
+            g_syncpt_ro = ro->addr;
             const u64 base = ro->addr;
             const u32 header[8] = {1, 0, max_syncpoints, SyncptValuesOffset, SyncptRwSummaryOffset,
                                    SyncptRoSummaryOffset, SyncptRwBitsOffset, SyncptRoBitsOffset};
@@ -819,7 +846,7 @@ struct Gsv : Service {
         const u64 ro = syncpt_ro, rw = syncpt_rw;
         const u32 count = syncpt_count;
         if (!ro) return;
-        for (u32 id = 0; id < std::min(count, HostSyncpoints); id++) at64(ro + SyncptValuesOffset + id * 8) = sync_value(id);
+        for (u32 id = 0; id < std::min(count, HostSyncpoints); id++) raise_value(at64(ro + SyncptValuesOffset + id * 8), sync_value(id));
         bool acked = false;
         for (u32 w = 0; w < (count + 63) / 64; w++) {
             const u64 bits = at64(rw + SyncptRwBitsOffset + w * 8);
