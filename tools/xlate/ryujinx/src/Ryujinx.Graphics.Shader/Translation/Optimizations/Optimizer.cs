@@ -133,6 +133,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                         modified = true;
                     }
                 }
+
+                // nxnative: once the passes above have settled (copies propagated into the phi sources), replace each phi read by the one source that
+                // can reach it where a branch condition is known; the passes above then remove the phis left without uses.
+                if (!modified)
+                {
+                    modified = PhiThreading.RunPass(blocks);
+                }
             }
             while (modified);
         }
