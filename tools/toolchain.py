@@ -135,7 +135,9 @@ def file_sha256(path):
 def fetch(url, dest, sha256, what):
     print(f"downloading {url}", flush=True)
     h = hashlib.sha256()
-    with urllib.request.urlopen(url, timeout=60) as r, open(dest, "wb") as f:
+    # A name of our own: LunarG's server answers Python's default (Python-urllib) with 403 Forbidden
+    req = urllib.request.Request(url, headers={"User-Agent": "kart-recomp-setup"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         done, last = 0, 0.0
         while chunk := r.read(1 << 20):
