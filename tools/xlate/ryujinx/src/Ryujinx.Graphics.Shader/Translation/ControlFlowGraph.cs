@@ -164,7 +164,6 @@ namespace Ryujinx.Graphics.Shader.Translation
                 switch (operation.Inst)
                 {
                     case Instruction.Branch:
-                    case Instruction.Discard:
                     case Instruction.Return:
                         return true;
                 }

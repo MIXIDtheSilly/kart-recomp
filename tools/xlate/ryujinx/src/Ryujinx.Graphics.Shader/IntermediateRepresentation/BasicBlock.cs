@@ -80,7 +80,6 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
                 case Instruction.Branch:
                 case Instruction.BranchIfFalse:
                 case Instruction.BranchIfTrue:
-                case Instruction.Discard:
                 case Instruction.Return:
                     return true;
                 default:

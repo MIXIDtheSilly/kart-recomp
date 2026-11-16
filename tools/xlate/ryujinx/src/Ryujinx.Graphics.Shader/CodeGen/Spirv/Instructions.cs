@@ -167,7 +167,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateAbsolute(CodeGenContext context, AstOperation operation)
         {
-            return GenerateUnary(context, operation, context.Delegates.GlslFAbs, context.Delegates.GlslSAbs);
+            // Integer abs as x * ((x >> 31) | 1), not GLSL SAbs (the same for every 32-bit input): NVIDIA's compiler
+            // mis-compiles an SAbs of a small select result followed by an add or xor, and the GPU hangs (device lost,
+            // "instruction pointer invalid") in particle vertex shaders.
+            return GenerateUnary(context, operation, context.Delegates.GlslFAbs, (t, x) =>
+                context.IMul(t, x, context.BitwiseOr(t, context.ShiftRightArithmetic(t, x, context.Constant(t, 31)), context.Constant(t, 1))));
         }
 
         private static OperationResult GenerateAdd(CodeGenContext context, AstOperation operation)
@@ -515,9 +519,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             return GenerateUnaryFP32(context, operation, context.Delegates.DPdy);
         }
 
+        // Demote, not OpKill: the pixel stays a helper (no writes) and runs on, instead of ending inside divergent flow,
+        // which hung NVIDIA GPUs in particle draws (every hung draw's fragment shader killed, against 30 % of them).
+        // Discard is no longer a block terminator (BasicBlock, ControlFlowGraph); an unconditional KIL returns after it.
         private static OperationResult GenerateDiscard(CodeGenContext context, AstOperation operation)
         {
-            context.Kill();
+            context.AddExtension("SPV_EXT_demote_to_helper_invocation");
+            context.AddCapability(Capability.DemoteToHelperInvocationEXT);
+            context.DemoteToHelperInvocationEXT();
             return OperationResult.Invalid;
         }
 

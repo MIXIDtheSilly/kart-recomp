@@ -199,7 +199,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             // Functions must always end with a return.
             if (function.MainBlock.Last is not AstOperation operation ||
-                (operation.Inst != Instruction.Return && operation.Inst != Instruction.Discard))
+                operation.Inst != Instruction.Return)
             {
                 context.Return();
             }
@@ -394,8 +394,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                         // We only need a branch if the last instruction didn't
                         // already cause the program to exit or jump elsewhere.
                         bool lastIsCf = e.Block.Last is AstOperation lastOp &&
-                            (lastOp.Inst == Instruction.Discard ||
-                             lastOp.Inst == Instruction.LoopBreak ||
+                            (lastOp.Inst == Instruction.LoopBreak ||
                              lastOp.Inst == Instruction.LoopContinue ||
                              lastOp.Inst == Instruction.Return);
 

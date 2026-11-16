@@ -192,6 +192,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             context.GetOp<InstKil>();
 
             context.Discard();
+            context.Return();   // Discard demotes and goes on; nothing follows a KIL
         }
 
         public static void Pbk(EmitterContext context)

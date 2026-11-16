@@ -491,6 +491,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             else
             {
                 context.Discard();
+
+                // Discard demotes and goes on. A guarded KILL (@P) goes on to the next instruction (the guard is a branch
+                // around it); after an unguarded one nothing was decoded, so it returns.
+                if (op.Pred == RegisterConsts.PredicateTrueIndex && !op.PredInv)
+                {
+                    context.Return();
+                }
             }
         }
 
