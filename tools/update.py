@@ -186,7 +186,7 @@ def install(v):
     if not a:
         sys.exit(f"release {v} has no archive for this system (*{ASSET_END})")
     root = paths.ROOT
-    tmp = root / f".update-{v}.download"
+    tmp = root / f".update-{v}{ASSET_END}"   # unpack goes by the ending: .zip or .tar.gz
     part = root / f".update-{v}"
     shutil.rmtree(part, ignore_errors=True)
     leftovers = []
