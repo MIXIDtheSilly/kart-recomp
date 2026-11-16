@@ -208,7 +208,9 @@ HWND create_window() {
     if (!hwnd) fatal("CreateWindow failed (%lu)", GetLastError());
     g_main = hwnd;
     create_overlay(hwnd);
-    ShowWindow(hwnd, SW_SHOW);
+    // Hidden test runs (HOST_RENDER_HIDDEN, as video_sdl.cpp): the window keeps its client area, so the swapchain and
+    // presents work the same; nothing appears on screen or takes the focus.
+    if (!std::getenv("HOST_RENDER_HIDDEN")) ShowWindow(hwnd, SW_SHOW);
     return hwnd;
 }
 
