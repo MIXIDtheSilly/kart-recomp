@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <optional>
@@ -22,6 +23,7 @@
 #include "../os.h"
 #include "../memory.h"
 #include "../syncpoints.h"
+#include "aot_modules.h"
 #include "vdec_mf.h"
 
 namespace ipc {
@@ -309,6 +311,7 @@ struct VideoSession : Service {
         u32 image, width, height;
         u64 pts;
         bool end;
+        bool unfilled = false;  // an image given its value at the end of the stream (release_unfilled), 1.0.0
     };
     struct Fence {
         u32 syncpoint, value;
@@ -332,6 +335,7 @@ struct VideoSession : Service {
     u32 handed = 0;  // output images handed out (registered or released) so far
     u64 frames_out = 0, frames_out_owed = 0;
     u64 last_pts = 0;  // of the newest frame written
+    u32 last_w = 0, last_h = 0;  // its size
     std::deque<Input> inputs;
     std::deque<Decoded> decoded;
     std::deque<u32> free_images;  // in the order the client acquires them
@@ -439,15 +443,33 @@ struct VideoSession : Service {
     // (subsdk0+0x4540 after nn::gs::TryWaitNativeSync: svcBreak after IApplicationFunctions::22); stopping after the
     // last frame with images still out did that now and then. (m held)
     // Also at a flush or stop (any_time), where nothing queued will fill them either. Returns how many.
-    u32 release_unfilled(bool any_time = false) {
+    u32 release_unfilled(bool any_time = false, bool frames = true) {
         if ((!any_time && (!at_end || !inputs.empty() || !decoded.empty())) || syncpoint == NoSyncpoint) return 0;
         u32 n = 0;
         for (; !free_images.empty(); free_images.pop_front(), n++) {
             release_fences.erase(free_images.front());
             owed_images.push_back(free_images.front());
+            // 1.0.0: an end-of-stream frame for it (with the last frame's time and size) instead of "nothing finished"
+            if (frames && unfilled_get_frames())
+                outputs.push_back({free_images.front(), last_w ? last_w : width, last_h ? last_h : height, last_pts, true, true});
             sync::increment(syncpoint);
         }
         return n;
+    }
+
+    // 1.0.0's movie player (in main; 1.8.0's is subsdk0's, which skips "nothing finished") asks 213 about every image
+    // whose value is reached while the movie plays and aborts on any failure (main+0x19e8110, after
+    // nn::codec::Get*DecoderOutputBufferProperties: svcBreak after IApplicationFunctions::22, info 0x1c286f): the
+    // images given their values at the end of the stream aborted the intro movie's end in 2 of 6 boots, and so did
+    // those of a flush (8) when a looping movie starts over. An image that gets its value at a stop (207) is recycled
+    // without asking (main+0x19e6e00).
+    static bool unfilled_get_frames() {
+        static const bool v = [] {
+            for (size_t i = 0; i < g_aot_module_count; i++)
+                if (std::strcmp(g_aot_modules[i].name, "main") == 0) return std::strncmp(g_aot_modules[i].module_id, "9e244438", 8) == 0;
+            return false;
+        }();
+        return v;
     }
 
     // 109(A: one compressed frame, u64 pts in us, u8 end of stream): reply a u64.
@@ -479,7 +501,10 @@ struct VideoSession : Service {
             decoded.clear();
             flush = true;
             room = true;
-            released = release_unfilled(true);
+            // 1.0.0 asks 213 about the images a flush gives their values; a stop recycles them without asking, so their
+            // end-of-stream frames go (the next 213 answers belong to new frames)
+            if (r.cmd == 207) std::erase_if(outputs, [](const Output& o) { return o.unfilled; });
+            released = release_unfilled(true, r.cmd != 207);
             if (r.cmd == 207) owed_images.clear();   // stopped: no more frames come for them
         }
         cv.notify_all();
@@ -549,7 +574,7 @@ struct VideoSession : Service {
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 outputs.push_back({image, w, h, frame.pts, frame.end});
-                last_pts = frame.pts;
+                last_pts = frame.pts, last_w = w, last_h = h;
                 if (!owed) sync::increment(syncpoint);
                 ++frames_out;
                 if (frame.end) at_end = true, release_unfilled();
