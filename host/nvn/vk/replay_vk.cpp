@@ -333,6 +333,7 @@ void clear_ds(VkCommandBuffer cb, const p_clear_ds* c) {
 
 void clear_tex(VkCommandBuffer cb, const p_clear_tex* c) {
     Image* img = image_of(c->tex, draw_pre_cb());
+    if (img && img->drop) img = image_undrop(img, c->tex, draw_pre_cb());   // (a smaller texture, HOST_TEX_SCALE: whole again)
     if (!img) return;
     end_rendering(cb);
     img->gpu_written = true;

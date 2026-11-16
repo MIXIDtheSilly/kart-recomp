@@ -41,12 +41,20 @@ struct Image {
     struct SparseImage* sparse = nullptr;  // a sparse-residency image (sparse.h), shared by the textures over its storage
     u64 last_use = 0;           // frame (nvn::g_frame) it was last viewed for a draw, copy or target
     std::shared_ptr<struct CpuWatch> cpu_watch;  // storage the CPU writes unannounced (a linear texture): see cpu_writes_poll
+    // Top levels left out (HOST_TEX_SCALE: smaller textures). width, height and levels stay the guest's; the Vulkan image is
+    // width >> drop, levels - drop, and its level k holds guest level k + drop (the same size). Only sampled block-compressed
+    // textures: a copy into or out of one makes it whole again first (image_undrop).
+    u32 drop = 0;
+    u32 vk_levels() const { return levels - drop; }
 };
 
 // The image of texture t, created when first asked for; `cb` gets the layout transition of a new image
 // (the command buffer it is used in next). Null for textures the renderer cannot make (logged once).
 Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb);
 Image* image_find(u64 serial);
+// A texture whose image left levels out (Image::drop), made again whole (its storage never shrinks again): a copy reads or
+// writes it. Returns the new image (content not uploaded yet: draw_ensure_content), or img when it was whole.
+Image* image_undrop(Image* img, const nvn::tex_t* t, VkCommandBuffer cb);
 void image_release(u64 serial);
 // Once a submission (after it began, renderer thread): when device memory is short, the textures not used for
 // HOST_NVN_EVICT_IMAGES_S seconds (default 30, 0 = never) go; their next use makes them again from guest storage.

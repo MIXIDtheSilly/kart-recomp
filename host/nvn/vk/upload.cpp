@@ -253,8 +253,26 @@ u64 content_key(const Geom& g, const nvn_texdesc& d, const Untiled& u) {
 // The GPU part: a staging buffer with the prepared data, copied into img in cb.
 bool record(Image* img, const Prepared& p, VkCommandBuffer cb) {
     Device& c = ctx();
+    // An image with its top levels left out (Image::drop): only the levels it has, moved down, and only their bytes (the
+    // prepared data and the caches keep every level: the same at any HOST_TEX_SCALE).
+    std::vector<VkBufferImageCopy> kept;
+    const std::vector<VkBufferImageCopy>* regions = &p.regions;
+    size_t from = 0;
+    if (img->drop) {
+        from = p.staging.size();
+        for (const VkBufferImageCopy& r : p.regions)
+            if (r.imageSubresource.mipLevel >= img->drop) {
+                kept.push_back(r);
+                kept.back().imageSubresource.mipLevel -= img->drop;
+                from = std::min<size_t>(from, r.bufferOffset);
+            }
+        if (kept.empty()) return false;
+        from &= ~size_t{15};
+        for (VkBufferImageCopy& r : kept) r.bufferOffset -= from;
+        regions = &kept;
+    }
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = p.staging.size();
+    bci.size = p.staging.size() - from;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -266,9 +284,9 @@ bool record(Image* img, const Prepared& p, VkCommandBuffer cb) {
         red_once("staging buffer allocation failed, bytes", static_cast<int>(p.staging.size()));
         return false;
     }
-    std::memcpy(info.pMappedData, p.staging.data(), p.staging.size());
+    std::memcpy(info.pMappedData, p.staging.data() + from, p.staging.size() - from);
     vmaFlushAllocation(c.vma, alloc, 0, VK_WHOLE_SIZE);
-    vkCmdCopyBufferToImage(cb, buf, img->image, VK_IMAGE_LAYOUT_GENERAL, static_cast<u32>(p.regions.size()), p.regions.data());
+    vkCmdCopyBufferToImage(cb, buf, img->image, VK_IMAGE_LAYOUT_GENERAL, static_cast<u32>(regions->size()), regions->data());
     defer([buf, alloc] { vmaDestroyBuffer(ctx().vma, buf, alloc); });
     img->has_content = true;
     return true;

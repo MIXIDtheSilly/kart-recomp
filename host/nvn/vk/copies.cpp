@@ -214,6 +214,7 @@ void copy_buffer_texture(VkCommandBuffer cb, const nvn::p_copy_b2t* c, bool to_t
     if (!c->tex) return;
     end_rendering(cb);
     Image* img = image_of(c->tex, draw_pre_cb());
+    if (img && img->drop) img = image_undrop(img, c->tex, draw_pre_cb());   // (a smaller texture, HOST_TEX_SCALE: whole again)
     if (!img) return;
     draw_ensure_content(img, c->tex);
     if (img->samples != VK_SAMPLE_COUNT_1_BIT) {
@@ -332,6 +333,13 @@ void copy_texture_texture(VkCommandBuffer cb, const nvn::p_copy_t2t* c) {
     end_rendering(cb);
     Image* si = image_of(c->src, draw_pre_cb());
     Image* di = image_of(c->dst, draw_pre_cb());
+    if ((si && si->drop) || (di && di->drop)) {   // smaller textures (HOST_TEX_SCALE): whole again (they may be one image)
+        if (si && si->drop) image_undrop(si, c->src, draw_pre_cb());
+        di = image_of(c->dst, draw_pre_cb());
+        if (di && di->drop) image_undrop(di, c->dst, draw_pre_cb());
+        si = image_of(c->src, draw_pre_cb());
+        di = image_of(c->dst, draw_pre_cb());
+    }
     if (!si || !di) return;
     draw_ensure_content(si, c->src);
     draw_ensure_content(di, c->dst);

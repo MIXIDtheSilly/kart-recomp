@@ -238,11 +238,15 @@ Logs go to `host\out\user\host.log`. `HOST_IPC_TRACE=1` logs every service reque
 
 ## Every setting
 
-Set them in the environment, or as `HOST_*` lines in `local.cfg`.
+Set them in the environment, or as `HOST_*` lines in `local.cfg` (the launcher's Play step has a Settings page for the
+first ones).
 
 | option | effect |
 |--------|--------|
 | `HOST_HANDHELD=0` | docked (higher resolution); handheld by default |
+| `HOST_RES_3D=<height>` | the game's 3D render height in every mode (720, 900, 1080, 1440); its own is 1080 handheld, 1440 docked. It renders at that and scales to the screen; above 1440 it crashes, so it is capped there (host/gamecfg.cpp changes the game's performance settings as the romfs is built) |
+| `HOST_LOD=<ratio>` | the game's LODDistanceRatio (2 by default) and the grass distances with it: higher keeps models and grass detailed further away |
+| `HOST_TEX_SCALE=50\|25` | the game's mipmapped compressed textures without their top one or two levels: half / a quarter of the size, ~2 GB less video memory at 25 in a race. A texture a copy uses is made whole again |
 | `HOST_PRESENT_MODE=fifo\|immediate` | swapchain present mode; mailbox by default |
 | `HOST_VULKAN_DEVICE=<index>` | which GPU; by default the discrete GPU with the most memory |
 | `HOST_NVN_UMA=0\|1` | unified-memory mode off / forced; on by itself for an integrated GPU |

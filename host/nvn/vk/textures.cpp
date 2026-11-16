@@ -144,6 +144,7 @@ constexpr u64 ParkNs = 2'000'000'000ull;
 u64 g_shared_hits = 0, g_revived = 0, g_created = 0, g_stats_at = 0;
 // Live image memory: ASTC textures are recompressed to BC3 here, 1 byte a texel (the console has 1 for 4x4 ASTC, 0.25 for 8x8).
 std::atomic<u64> g_bytes_astc{0}, g_bytes_other{0};
+std::atomic<u64> g_dropped_n{0}, g_dropped_bytes{0}, g_dropped_full{0};   // live smaller images, their memory, and theirs whole (estimated)
 
 std::atomic<u64>& bytes_of_kind(const Image* img) { return format(img->nvn_format).kind == FmtKind::Astc ? g_bytes_astc : g_bytes_other; }
 u64 alloc_size(VmaAllocation a) {
@@ -182,6 +183,7 @@ void destroy(Image* img) {
     upload_async_cancel(img);
     const u64 bytes = alloc_size(img->alloc);
     bytes_of_kind(img) -= bytes;
+    if (img->drop) g_dropped_n--, g_dropped_bytes -= bytes, g_dropped_full -= bytes << (2 * img->drop);
     if (img->sysmem) g_sysmem_bytes -= bytes;
     // The last submissions using it may still run, and kept descriptor sets may hold its views.
     defer_past_kept([img] {
@@ -203,6 +205,42 @@ void sweep(u64 now) {
         g_parked[i] = g_parked.back();
         g_parked.pop_back();
     }
+}
+
+// HOST_TEX_SCALE=50 or 25: sampled block-compressed textures (the game's assets) lose their top one or two levels (Image::drop): a
+// half or a quarter of the size, a quarter or a sixteenth of the memory. Only textures with the levels below (mipmapped), 2D, at
+// least 64 texels a side afterwards, not sparse. 100 (or unset): as the game made them.
+u32 tex_scale_drop() {
+    static const u32 d = [] {
+        const char* e = getenv("HOST_TEX_SCALE");
+        const int v = e && *e ? std::atoi(e) : 100;
+        const u32 d = v <= 0 || v >= 100 ? 0 : v >= 50 ? 1 : 2;
+        if (d) LOG("nvk: textures at %d%% (HOST_TEX_SCALE): the top %u level%s of mipmapped compressed textures left out", 100 >> d, d, d > 1 ? "s" : "");
+        return d;
+    }();
+    return d;
+}
+
+std::mutex g_no_drop_mu;
+std::unordered_set<u64> g_no_drop;   // storage (guest address) of textures made whole again (image_undrop)
+
+u32 drop_for(const nvn::tex_t* t, const Format& f, const Image* img) {
+    const u32 want = tex_scale_drop();
+    if (!want || !t->mem) return 0;
+    if (f.block_w <= 1 || f.depth || f.stencil || img->type != VK_IMAGE_TYPE_2D || img->samples != VK_SAMPLE_COUNT_1_BIT) return 0;
+    // (IMAGE and COMPRESSIBLE do not count: the game sets IMAGE on nearly all its textures, and a block-compressed one is
+    // never a shader's image or a render target)
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_DISPLAY |
+                      NVN_TEXTURE_FLAGS_VIDEO_DECODE))
+        return 0;
+    if (t->pool && nvn::sparse_pool(t->pool)) return 0;
+    u32 drop = 0;
+    while (drop < want && drop + 1 < img->levels && (std::min(img->width, img->height) >> (drop + 1)) >= 64) drop++;
+    if (drop) {
+        std::scoped_lock lk{g_no_drop_mu};
+        if (g_no_drop.count(nvn::ga(t->mem))) return 0;
+    }
+    return drop;
 }
 
 VkFormatFeatureFlags features(VkFormat f) {
@@ -228,7 +266,7 @@ VkComponentSwizzle swz(u32 nvn_swizzle) {
 }  // namespace
 
 VkImageSubresourceRange full_range(const Image* img) {
-    return {img->aspect, 0, img->levels, 0, VK_REMAINING_ARRAY_LAYERS};
+    return {img->aspect, 0, img->vk_levels(), 0, VK_REMAINING_ARRAY_LAYERS};
 }
 
 const nvn::view_t* tex_view(const nvn::tex_t* t, const Image* img, const nvn::view_t* v, nvn::view_t& tmp) {
@@ -281,6 +319,9 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
                     static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(blocks >> 20),
                     static_cast<unsigned long long>(used >> 20));
             }
+            if (g_dropped_n)
+                LOG("nvk: smaller textures (HOST_TEX_SCALE): %llu live, %llu MB (about %llu MB whole)", static_cast<unsigned long long>(g_dropped_n.load()),
+                    static_cast<unsigned long long>(g_dropped_bytes.load() >> 20), static_cast<unsigned long long>(g_dropped_full.load() >> 20));
             // HOST_NVN_IMAGE_REPORT=1: the live images by shape, the biggest groups
             {   // memory held by images not viewed for 30 s (1800 frames) or more
                 const u64 frame = nvn::g_frame.load(), cold_at = frame > 1800 ? frame - 1800 : 0;
@@ -420,6 +461,7 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
                    img->samples == VK_SAMPLE_COUNT_1_BIT;
     if (img->cube_ok) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (f.block_w > 1 && f.kind != FmtKind::Astc) flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+    img->drop = drop_for(t, f, img);
 
     const VkFormatFeatureFlags ff = features(img->format);
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -467,8 +509,8 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     ci.flags = flags;
     ci.imageType = img->type;
     ci.format = img->format;
-    ci.extent = {img->width, img->height, img->depth};
-    ci.mipLevels = img->levels;
+    ci.extent = {std::max(img->width >> img->drop, 1u), std::max(img->height >> img->drop, 1u), img->depth};
+    ci.mipLevels = img->vk_levels();
     ci.arrayLayers = img->layers;
     ci.samples = img->samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -554,6 +596,10 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     g_created++;
     bytes_of_kind(img) += alloc_size(img->alloc);
+    if (img->drop) {   // whole, the top level alone takes 3/4 of a mip chain: each level left out was 4x what is left
+        const u64 b = alloc_size(img->alloc);
+        g_dropped_n++, g_dropped_bytes += b, g_dropped_full += b << (2 * img->drop);
+    }
     {   // put in system memory (VRAM full when it was made): the GPU reads it over PCIe
         VmaAllocationInfo ai2;
         vmaGetAllocationInfo(ctx().vma, img->alloc, &ai2);
@@ -571,6 +617,27 @@ Image* image_of(const nvn::tex_t* t, VkCommandBuffer cb) {
     if (const u64 key = shape_key(t); key && g_shared.emplace(key, img).second) img->shape = key;
     watch_add(img, t);
     return img;
+}
+
+Image* image_undrop(Image* img, const nvn::tex_t* t, VkCommandBuffer cb) {
+    if (!img || !img->drop || img->sparse) return img;
+    {
+        std::scoped_lock lk{g_no_drop_mu};
+        g_no_drop.insert(img->mem);
+    }
+    {
+        std::scoped_lock lk{g_lock};
+        for (auto it = g_images.begin(); it != g_images.end();) it = it->second == img ? g_images.erase(it) : std::next(it);
+        if (img->shape)
+            if (auto it = g_shared.find(img->shape); it != g_shared.end() && it->second == img) g_shared.erase(it);
+    }
+    static std::atomic<u32> logged{0};
+    if (logged++ < 20)
+        LOG("nvk: texture %llu %ux%u NVN format %#x made whole again: a copy uses it (HOST_TEX_SCALE leaves its storage alone from now on)",
+            static_cast<unsigned long long>(img->serial), img->width, img->height, img->nvn_format);
+    destroy(img);   // (after the submissions using it; the texture objects over it make the whole one on their next use)
+    bind_epoch_bump();
+    return image_of(t, cb);
 }
 
 void image_release(u64 serial) {
@@ -686,6 +753,11 @@ VkImageView view_of(Image* img, const nvn::view_t* v, bool attachment, VkImageVi
     }
     base_level = std::min(base_level, img->levels - 1);
     nlevels = std::max(1u, std::min(nlevels, img->levels - base_level));
+    if (img->drop) {   // to the Vulkan image's levels; a view of left-out levels only shows the biggest one there is
+        const u32 end = base_level + nlevels;
+        base_level = base_level > img->drop ? base_level - img->drop : 0;
+        nlevels = std::max(1u, (end > img->drop ? end - img->drop : 1) - base_level);
+    }
     if (img->type != VK_IMAGE_TYPE_3D) {
         base_layer = std::min(base_layer, img->layers - 1);
         nlayers = std::max(1u, std::min(nlayers, img->layers - base_layer));

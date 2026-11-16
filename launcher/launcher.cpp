@@ -324,6 +324,26 @@ static bool save_setting(const std::wstring& key, const std::wstring& value) {
     return o.good();
 }
 
+// Removes <key>=... from local.cfg (Linux: local.linux.cfg), the other lines kept
+static bool remove_setting(const std::wstring& key) {
+    auto lines = read_lines(g_root / CFG_NAME);
+    std::vector<std::string> kept;
+    for (const auto& l : lines) {
+        std::wstring w = widen(l);
+        w = w.substr(0, w.find(L'#'));
+        const size_t eq = w.find(L'=');
+        if (!(eq != std::wstring::npos && trim(w.substr(0, eq)) == key)) kept.push_back(l);
+    }
+    if (kept.size() == lines.size()) return true;
+    std::ofstream o(g_root / CFG_NAME, std::ios::binary | std::ios::trunc);
+#ifdef _WIN32
+    for (const auto& l : kept) o << l << "\r\n";
+#else
+    for (const auto& l : kept) o << l << "\n";
+#endif
+    return o.good();
+}
+
 // kart.exe's own settings: the HOST_* lines of local.cfg, which kart.exe reads itself (host\localcfg.cpp; the
 // environment wins). Shown on the Play step.
 static std::vector<std::pair<std::wstring, std::wstring>> game_env() {
@@ -1753,7 +1773,7 @@ static void frame_end() {
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_UPDATE, B_VER = 50, B_CC = 60, B_DOT = 100,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_UPDATE, B_SETTINGS, B_VER = 50, B_CC = 60, B_DOT = 100, B_OPT = 200,
 };
 struct Hit {
     int id;
@@ -1769,6 +1789,7 @@ static ULONGLONG g_job_start = 0;
 static std::wstring g_nup_dest;    // the folder a .nup is being unpacked into (saved as the dump once that finishes)
 static bool g_unpack_log = false;  // the Game step shows the unpacking's status and output
 static bool g_bringing = false;    // an older version being brought over (bring_over)
+static bool g_show_settings = false;   // the Settings page is shown instead of the step
 
 // Updates (the section after bring_over)
 static std::wstring g_release;       // this folder's release (launcher/out/release.txt), '' in a checkout
@@ -2100,7 +2121,109 @@ static float draw_compiler(float x0, float x1, float y, bool enabled) {
 }
 #endif
 
+// The game's settings on the Play step: HOST_* lines in local.cfg that kart.exe reads when it starts. An option whose
+// value is empty is the default: choosing it removes the line.
+struct Choice {
+    const wchar_t* key;
+    const wchar_t* label;
+    std::vector<std::pair<const wchar_t*, const wchar_t*>> opts;   // shown name, value
+};
+static const Choice CHOICES[] = {
+    {L"HOST_HANDHELD", L"Mode", {{L"Handheld", L""}, {L"Docked", L"0"}}},
+    {L"HOST_RES_3D", L"3D resolution", {{L"Game's", L""}, {L"720p", L"720"}, {L"900p", L"900"}, {L"1080p", L"1080"}, {L"1440p", L"1440"}}},
+    {L"HOST_LOD", L"Detail", {{L"Low", L"1"}, {L"Normal", L""}, {L"High", L"3"}, {L"Ultra", L"4"}}},
+    {L"HOST_TEX_SCALE", L"Textures", {{L"100%", L""}, {L"50%", L"50"}, {L"25%", L"25"}}},
+    {L"HOST_FPS_MODE", L"Frame rate", {{L"60 fps", L""}, {L"30 fps", L"30"}}},
+    {L"HOST_PRESENT_MODE", L"V-sync", {{L"Fast", L""}, {L"On", L"fifo"}, {L"Off", L"immediate"}}},
+    {L"HOST_NO_OVERLAY", L"FPS overlay", {{L"On", L""}, {L"Off", L"1"}}},
+};
+static constexpr int CHOICE_COUNT = sizeof CHOICES / sizeof CHOICES[0];
+
+static std::wstring choice_value(const Choice& c) {
+    if (auto e = env_var(c.key); !e.empty()) return e;
+    const auto cfg = local_cfg();
+    const auto it = cfg.find(c.key);
+    return it == cfg.end() ? L"" : it->second;
+}
+
+// One choice: its label above a segmented control at (x0, y), at most w wide; returns the y below it.
+static float draw_choice(int row, float x0, float w, float y) {
+    const Choice& c = CHOICES[row];
+    const std::wstring cur = choice_value(c);
+    const bool env = !env_var(c.key).empty();   // set in the environment: it wins over local.cfg
+    text(c.label, F_LABEL, {x0, y, x0 + w, y + 18}, col::muted);
+    y += 22;
+    const int n = (int)c.opts.size();
+    float seg[8], total = 6;
+    for (int i = 0; i < n; i++) total += seg[i] = measure(c.opts[i].first, F_LABEL, 300).width + 22;
+    const float scale = total > w ? (w - 6) / (total - 6) : 1;
+    if (scale < 1) {
+        total = 6;
+        for (int i = 0; i < n; i++) total += seg[i] *= scale;
+    }
+    const D2D1_RECT_F box{x0, y, x0 + total, y + 32};
+    fill_round(box, R_CTRL, col::inset);
+    stroke_round(box, R_CTRL, col::line);
+    float x = box.left + 3;
+    for (int i = 0; i < n; i++) {
+        const D2D1_RECT_F r{x, box.top + 3, x + seg[i], box.bottom - 3};
+        if (cur == c.opts[i].second) {
+            fill_round(r, R_CTRL - 2, env ? col::dim : col::accent);
+            text(c.opts[i].first, F_LABEL, r, col::accent_ink, T_CENTER | T_VCENTER);
+        } else {
+            const float h = env ? 0 : ease(anim(B_OPT + row * 10 + i).hov);
+            if (h > 0) fill_round(r, R_CTRL - 2, mix(col::inset, col::btn_hover, h));
+            text(c.opts[i].first, F_LABEL, r, env ? col::dim : mix(col::muted, col::text, h), T_CENTER | T_VCENTER);
+            if (!env) g_hits.push_back({B_OPT + row * 10 + i, r});
+        }
+        x += seg[i];
+    }
+    return box.bottom + 12;
+}
+
+static float draw_settings(float x0, float x1, float y) {
+    const float gap = 28, w = (x1 - x0 - gap) / 2;
+    const int half = (CHOICE_COUNT + 1) / 2;
+    float yl = y, yr = y;
+    for (int i = 0; i < CHOICE_COUNT; i++) {
+        if (i < half) yl = draw_choice(i, x0, w, yl);
+        else yr = draw_choice(i, x0 + w + gap, w, yr);
+    }
+    y = std::max(yl, yr) + 2;
+    const wchar_t* note = L"Used the next time the game starts. The game's own 3D resolution is 1080p handheld, 1440p docked.";
+    const float nh = measure(note, F_SMALL, x1 - x0, T_WRAP).height;
+    text(note, F_SMALL, {x0, y, x1, y + nh + 4}, col::muted, T_WRAP);
+    return y + nh + 8;
+}
+
+// The Settings page (the button at the top right): the game's settings, then the other HOST_* lines of local.cfg.
+static void paint_settings_page(D2D1_RECT_F p) {
+    const float x0 = p.left + 36, x1 = p.right - 36;
+    float y = p.top + 30;
+    text(L"Settings", F_TITLE, {x0, y - 1, x1 - 140, y + 35}, col::text);
+    button(B_SETTINGS, L"Done", x1 - button_width(L"Done"), y - 4, true, true);
+    y += 42;
+    text(L"How the game looks and runs.", F_BODY, {x0, y, x1, y + 24}, col::muted);
+    y = draw_settings(x0, x1, y + 40);
+    std::wstring others;
+    for (const auto& [k, v] : game_env()) {
+        bool shown = false;
+        for (const Choice& c : CHOICES) shown |= k == c.key;
+        if (!shown) others += (others.empty() ? L"" : L"   ") + k + L"=" + v;
+    }
+#ifdef _WIN32
+    const std::wstring where = L"local.cfg";
+#else
+    const std::wstring where = L"local.linux.cfg or local.cfg";
+#endif
+    if (!others.empty()) text(L"Also in " + where + L": " + others, F_SMALL, {x0, y + 4, x1, y + 40}, col::dim, T_WRAP);
+}
+
 static void paint_steps(D2D1_RECT_F p) {
+    if (g_show_settings) {
+        paint_settings_page(p);
+        return;
+    }
     const float x0 = p.left + 36, x1 = p.right - 36;
     float y = p.top + 30;
     const float tx1 = draw_versions(x1, y, !g_running);
@@ -2200,17 +2323,7 @@ static void paint_steps(D2D1_RECT_F p) {
         break;
     }
     case 3: {
-        y = draw_rows(g_rows[3], 2, x0, x1, y);
-        std::wstring settings;
-        for (const auto& [k, v] : game_env()) settings += (settings.empty() ? L"" : L"   ") + k + L"=" + v;
-#ifdef _WIN32
-        text(L"Settings: " + (settings.empty() ? std::wstring(L"the defaults") : settings) + L"   (HOST_* lines in local.cfg)", F_SMALL,
-             {x0, y + 6, x1, y + 26}, col::muted);
-#else
-        text(L"Settings: " + (settings.empty() ? std::wstring(L"the defaults") : settings) + L"   (HOST_* lines in local.linux.cfg or local.cfg)",
-             F_SMALL, {x0, y + 6, x1, y + 26}, col::muted);
-#endif
-        y += 40;
+        y = draw_rows(g_rows[3], 2, x0, x1, y) + 18;
         float x = x0;
         if (busy) x = button(B_STOP, L"Stop", x, y, false, true);
         else {
@@ -2288,6 +2401,22 @@ static void paint() {
         stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
         fill_circle(b.left + 11, (b.top + b.bottom) / 2, 3, on ? col::accent : col::dim);
         text(label, F_SMALL, {b.left + 18, b.top, b.right, b.bottom}, on ? col::text : col::dim, T_CENTER | T_VCENTER);
+    }
+
+    {   // Settings: a small button at the top right (left of the update one), opening its own page
+        const std::wstring label = L"Settings";
+        const float w = measure(label, F_SMALL, 400).width + 26;
+        float right = sz.width - m;
+        if (!g_update_ver.empty() && !g_updating) right -= measure(L"Update to " + g_update_ver, F_SMALL, 400).width + 26 + 8;
+        const D2D1_RECT_F b{right - w, 8, right, 33};
+        g_hits.push_back({B_SETTINGS, b});
+        const float h = ease(anim(B_SETTINGS).hov);
+        if (g_show_settings) fill_round(b, R_CTRL, mix(col::accent, col::accent_hover, h));
+        else {
+            fill_round(b, R_CTRL, mix(col::inset, col::btn_hover, h));
+            stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
+        }
+        text(label, F_SMALL, b, g_show_settings ? col::accent_ink : col::text, T_CENTER | T_VCENTER);
     }
 
     paint_panel({m, cy + r + 48, sz.width - m, sz.height - m});
@@ -2912,7 +3041,22 @@ static void run_script() {
 
 static void click(int id) {
     const std::wstring root = g_root.wstring();
-    if (id >= B_DOT) {
+    if (id >= B_OPT && id < B_OPT + CHOICE_COUNT * 10) {
+        const Choice& c = CHOICES[(id - B_OPT) / 10];
+        const int i = (id - B_OPT) % 10;
+        if (i < (int)c.opts.size()) {
+            const std::wstring v = c.opts[i].second;
+            if (!(v.empty() ? remove_setting(c.key) : save_setting(c.key, v))) msg_box(L"Could not write " CFG_NAME L".", L"Launcher", M_ERROR);
+            if (g_running && g_job_name == L"Playing") {
+                g_status = L"Settings apply the next time the game starts.";
+                g_status_color = col::muted;
+            }
+        }
+    } else if (id == B_SETTINGS) {
+        g_show_settings = !g_show_settings;
+        g_step_ms = GetTickCount64();   // (the page rises into place like a step)
+    } else if (id >= B_DOT) {
+        g_show_settings = false;
         g_step = id - B_DOT;
         refresh();
     } else if (id >= B_VER && id < B_VER + VERSION_COUNT) {

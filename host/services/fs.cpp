@@ -4,12 +4,17 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <optional>
 #include <unordered_map>
 
 #include "../host.h"
 #include "../ipc.h"
 
 namespace fs = std::filesystem;
+
+namespace gamecfg {
+std::optional<std::vector<u8>> patched(const std::string& rel, const fs::path& disk);   // gamecfg.cpp
+}
 
 namespace ipc {
 namespace {
@@ -41,6 +46,10 @@ class RomFs {
         for (; it != files.end() && it->offset < off + len; ++it) {
             const u64 lo = std::max(off, it->offset), hi = std::min(off + len, it->offset + it->size);
             if (lo >= hi) continue;
+            if (!it->data.empty()) {   // changed by a setting (gamecfg.cpp)
+                std::memcpy(out + (lo - off), it->data.data() + (lo - it->offset), hi - lo);
+                continue;
+            }
             std::ifstream& f = open(*it);
             f.seekg(static_cast<std::streamoff>(lo - it->offset));
             f.read(reinterpret_cast<char*>(out + (lo - off)), static_cast<std::streamsize>(hi - lo));
@@ -52,6 +61,7 @@ class RomFs {
     struct File {
         u64 offset, size;  // absolute in the image
         fs::path path;
+        std::vector<u8> data;  // the bytes served instead of the file's, when a setting changed it
     };
     struct DirNode {
         std::string name;
@@ -105,6 +115,7 @@ class RomFs {
         std::vector<DirNode> dirs(1);
         std::vector<FileNode> fnodes;
         std::vector<fs::path> fpaths;
+        std::vector<std::vector<u8>> fdata;
         std::vector<std::pair<fs::path, u32>> stack{{root, 0}};
         while (!stack.empty()) {
             auto [path, idx] = stack.back();
@@ -122,8 +133,11 @@ class RomFs {
                     stack.push_back({e.path(), d});
                 } else {
                     const u32 f = static_cast<u32>(fnodes.size());
-                    fnodes.push_back({name, idx, 0, static_cast<u64>(e.file_size()), 0});
+                    const auto rel8 = e.path().lexically_relative(root).generic_u8string();
+                    std::optional<std::vector<u8>> changed = gamecfg::patched(std::string(rel8.begin(), rel8.end()), e.path());
+                    fnodes.push_back({name, idx, 0, changed ? changed->size() : static_cast<u64>(e.file_size()), 0});
                     fpaths.push_back(e.path());
+                    fdata.push_back(changed ? std::move(*changed) : std::vector<u8>{});
                     dirs[idx].files.push_back(f);
                 }
             }
@@ -135,7 +149,7 @@ class RomFs {
         for (size_t i = 0; i < fnodes.size(); i++) {
             cur = (cur + 15) & ~15ull;
             fnodes[i].data_off = cur;
-            files.push_back({data_offset + cur, fnodes[i].size, fpaths[i]});
+            files.push_back({data_offset + cur, fnodes[i].size, fpaths[i], std::move(fdata[i])});
             cur += fnodes[i].size;
         }
         std::sort(files.begin(), files.end(), [](auto& a, auto& b) { return a.offset < b.offset; });
