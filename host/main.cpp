@@ -34,7 +34,10 @@ static void QueryPerformanceCounter(LARGE_INTEGER* t) {
 static void QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1'000'000'000; }
 #endif
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cmath>
 #include <thread>
 
 #include <cstdio>
@@ -56,6 +59,98 @@ static void QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1'000'00
 #include "watch.h"
 
 namespace fs = std::filesystem;
+
+// The game's tick length (s) and rate, as float bits (tools/patches.py mkw_tick_time): its own 1/60 and 1.0 unless HOST_TICK_HZ.
+uint32_t g_mkw_tick_dt = 0x3c888889u, g_mkw_tick_rate = 0x3f800000u;
+// The game's counters that count ticks (tools/patches.py mkw_tick_counters, mkw_frame_counters): each asks once, the
+// first time it runs, where its step is. Named sites (HOST_TICK_PCS=<hex pc>,..., HOST_TICK_FUNCS=<hex function>,...;
+// main offsets, so they belong to one game version; HOST_TICK_FLOATS=all for every float one) step by the tick rate
+// instead of 1: floats by the rate itself, integers by 0 or 1 a tick (g_mkw_tick_whole), so they count 60ths of a second.
+float g_mkw_tick_ratef = 1.f;  // the tick rate (60 / HOST_TICK_HZ)
+float g_mkw_tick_secf = 1.f;   // what tools/patches.py mkw_tick_seconds scales the tick count by: the rate, or 1 (HOST_TICK_STEP)
+bool g_mkw_tick_step_whole = false;  // HOST_TICK_STEP=whole: the tick time's count is the whole 60ths the tick completes
+namespace {
+const uint32_t k_tick_one = 1;
+const float k_tick_onef = 1.f;
+uint32_t g_mkw_tick_whole = 1;
+double g_mkw_tick_acc = 0;
+struct TickSites {
+    std::vector<uint32_t> pcs, funcs, add_funcs;
+    bool all_floats = false;
+    TickSites() {
+        auto list = [](const char* name, std::vector<uint32_t>& into) {
+            const char* v = std::getenv(name);
+            for (const char* p = v; p && *p;) {
+                char* end = nullptr;
+                const unsigned long x = std::strtoul(p, &end, 16);
+                if (end == p) break;
+                into.push_back(static_cast<uint32_t>(x));
+                p = *end ? end + 1 : end;
+            }
+            std::sort(into.begin(), into.end());
+        };
+        list("HOST_TICK_PCS", pcs), list("HOST_TICK_FUNCS", funcs), list("HOST_TICK_ADD_FUNCS", add_funcs);
+        const char* f = std::getenv("HOST_TICK_FLOATS");
+        all_floats = f && !std::strcmp(f, "all");
+    }
+    bool named(uint32_t pc, uint32_t fn) const {
+        return std::binary_search(pcs.begin(), pcs.end(), pc) || std::binary_search(funcs.begin(), funcs.end(), fn);
+    }
+};
+const TickSites& tick_sites() {
+    static const TickSites s;
+    return s;
+}
+int g_job_log = 0;  // HOST_TICK_JOB_LOG: 1 = job lists and modules, 2 = also where each counter first runs
+}  // namespace
+// The job the thread is running (mkw_job_obj / mkw_job_done): the object's vtable and its module's index (-1: none).
+thread_local u64 t_job_vt = 0;
+thread_local int t_job_module = -2;  // -2: not in a job
+thread_local u64 t_job_actor = 0;     // an actor job's actor
+static void log_actor_strings(u64 a);
+static void log_site(const char* kind, uint32_t pc, uint32_t fn) {
+    if (g_job_log < 2) return;
+    if (t_job_module != -2 && t_job_actor) log_actor_strings(t_job_actor);
+    if (t_job_module == -2) LOG("site: %s main+%#x (function %#x) outside jobs", kind, pc, fn);
+    else LOG("site: %s main+%#x (function %#x) in job vt main+%#llx%s module %d actor %#llx vt %#llx", kind, pc, fn,
+             static_cast<unsigned long long>(t_job_vt & ~(1ull << 63)), t_job_vt >> 63 ? " (untagged)" : "", t_job_module,
+             static_cast<unsigned long long>(t_job_actor), static_cast<unsigned long long>(t_job_actor ? ld<u64>(t_job_actor) : 0));
+}
+
+const uint32_t* mkw_tick_slot(uint32_t pc, uint32_t fn) {
+    log_site("int", pc, fn);
+    if (!tick_sites().named(pc, fn)) return &k_tick_one;
+    LOG("tick: counter main+%#x (function %#x) counts 60ths of a second", pc, fn);
+    return &g_mkw_tick_whole;
+}
+// A float accumulator x += y (tools/patches.py mkw_tick_adds): y is multiplied by this (HOST_TICK_PCS, HOST_TICK_ADD_FUNCS).
+const float* mkw_tick_aslot(uint32_t pc, uint32_t fn) {
+    log_site("add", pc, fn);
+    const TickSites& t = tick_sites();
+    if (!std::binary_search(t.pcs.begin(), t.pcs.end(), pc) && !std::binary_search(t.add_funcs.begin(), t.add_funcs.end(), fn))
+        return &k_tick_onef;
+    LOG("tick: accumulator main+%#x (function %#x) adds by the rate", pc, fn);
+    return &g_mkw_tick_ratef;
+}
+const float* mkw_tick_fslot(uint32_t pc, uint32_t fn) {
+    log_site("float", pc, fn);
+    if (!tick_sites().all_floats && !tick_sites().named(pc, fn)) return &k_tick_onef;
+    LOG("tick: float counter main+%#x (function %#x) steps by the rate", pc, fn);
+    return &g_mkw_tick_ratef;
+}
+// The frame's first phase (tools/patches.py mkw_tick_time): one tick begins, so the integer step is how many whole 60ths
+// of a second it completes (0 or 1 at 120 Hz).
+// The tick time's count (tools/patches.py mkw_tick_time; the game's: 1 a tick): with HOST_TICK_STEP=whole, how many whole
+// 60ths of a second this tick completes (0 or 1 at 120 Hz), so what counts by it counts 60ths while dt stays the tick's.
+uint32_t mkw_tick_step(uint32_t count) { return g_mkw_tick_step_whole ? g_mkw_tick_whole : count; }
+void half_tick();  // (below: whether the half rate is on this tick)
+void mkw_tick_begin() {
+    half_tick();
+    g_mkw_tick_acc += g_mkw_tick_ratef;
+    const double whole = std::floor(g_mkw_tick_acc);
+    g_mkw_tick_acc -= whole;
+    g_mkw_tick_whole = static_cast<uint32_t>(whole);
+}
 
 // ------------------------------------------------------------------ logging
 
@@ -613,6 +708,9 @@ static void dump_host_stacks() {
 // HOST_WATCH_STEP=1 (debug aid): hardware watchpoints (debug registers, every thread) on the game's frame step
 // ([g_mkw_frame_obj + 0x214], vblanks per frame) and its vblank counter; after 25 s logs each distinct host stack
 // that touched them, which names the recompiled guest functions reading the step.
+namespace nvn {
+extern std::atomic<uint64_t> g_frame;  // the game's presents so far
+}
 namespace stepwatch {
 std::atomic<bool> armed{false};
 constexpr int Max = 1 << 16, Depth = 6;
@@ -632,10 +730,13 @@ bool on_trap(CONTEXT* ctx) {
     return true;
 }
 
-void arm_all(u64 a0, u64 a1, bool on) {
+void arm_all(const u64 a[4], const bool write_only[4], bool on) {
     const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
     const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
+    u64 dr7 = 0;  // Ln; R/W = 11 (read or write) or 01 (write), LEN = 11 (4 bytes)
+    for (int i = 0; i < 4; i++)
+        if (on && a[i]) dr7 |= (1ull << (2 * i)) | ((write_only[i] ? 0xDull : 0xFull) << (16 + 4 * i));
     THREADENTRY32 te{};
     te.dwSize = sizeof te;
     for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
@@ -646,10 +747,8 @@ void arm_all(u64 a0, u64 a1, bool on) {
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (GetThreadContext(h, &ctx)) {
-                ctx.Dr0 = on ? a0 : 0;
-                ctx.Dr1 = on ? a1 : 0;
-                // L0, L1; R/W = 11 (read or write), LEN = 11 (4 bytes)
-                ctx.Dr7 = on ? (0x1ull | 0x4ull | (0xFull << 16) | (0xFull << 20)) : 0;
+                ctx.Dr0 = on ? a[0] : 0, ctx.Dr1 = on ? a[1] : 0, ctx.Dr2 = on ? a[2] : 0, ctx.Dr3 = on ? a[3] : 0;
+                ctx.Dr7 = dr7;
                 SetThreadContext(h, &ctx);
             }
             ResumeThread(h);
@@ -659,36 +758,334 @@ void arm_all(u64 a0, u64 a1, bool on) {
     CloseHandle(snap);
 }
 
+// Watches a[] for `secs` seconds, then logs each distinct host stack that touched them under its watchpoint's name.
+void run(const u64 a[4], const bool write_only[4], const std::string names[4], int secs) {
+    count = 0;
+    armed = true;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(secs);
+    while (std::chrono::steady_clock::now() < end) {  // (threads made later get armed too)
+        arm_all(a, write_only, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    arm_all(a, write_only, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    armed = false;
+    const int n = std::min(count.load(), Max);
+    std::map<std::vector<u64>, int> uniq;
+    for (int i = 0; i < n; i++) uniq[std::vector<u64>(hits[i], hits[i] + Depth + 1)]++;
+    LOG("stepwatch: %d accesses, %zu distinct stacks", count.load(), uniq.size());
+    for (const auto& [st, c] : uniq) {
+        std::string line;
+        for (int k = 1; k <= Depth && st[k]; k++) {
+            std::string s = host_symbol(st[k]);
+            if (s.size() > 60) s.resize(60);
+            line += k > 1 ? " < " : " ";
+            line += s;
+        }
+        std::string which;
+        for (int i = 0; i < 4; i++)
+            if (st[0] & (1ull << i)) which += (which.empty() ? "" : "+") + names[i];
+        LOG("stepwatch: %s x%d:%s", which.c_str(), c, line.c_str());
+    }
+}
+
+// Whether the 8 bytes at guest address `a` can be read.
+bool readable(u64 a) {
+    MEMORY_BASIC_INFORMATION mi{};
+    if (!a || !VirtualQuery(hp(a), &mi, sizeof mi)) return false;
+    return mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+}
+
+// HOST_WATCH_MEM=<spec>[;<spec>...] (debug aid, up to 4): watchpoints on 4 bytes of game memory each. A spec is hex
+// numbers joined by '>': an offset in main, then for each further number the pointer there is read and the number
+// added, e.g. 37b22f8>e8>58 = [main+0x37b22f8] + 0xe8 read again + 0x58. A leading 'w' watches writes only.
+// HOST_WATCH_AT=<s> waits that long after start first, HOST_WATCH_SECS=<s> is how long it watches (default 10).
+void start_mem() {
+    const char* spec = std::getenv("HOST_WATCH_MEM");
+    if (!spec || !*spec) return;
+    std::thread([text = std::string(spec)] {
+        const int at = std::getenv("HOST_WATCH_AT") ? std::atoi(std::getenv("HOST_WATCH_AT")) : 0;
+        const int secs = std::getenv("HOST_WATCH_SECS") ? std::atoi(std::getenv("HOST_WATCH_SECS")) : 10;
+        std::this_thread::sleep_for(std::chrono::seconds(at));
+        std::string names[4];
+        bool wr[4]{};
+        int n = 0;
+        for (size_t i = 0; i < text.size() && n < 4;) {
+            const size_t e = std::min(text.find(';', i), text.size());
+            names[n] = text.substr(i, e - i);
+            if (!names[n].empty() && names[n][0] == 'w') wr[n] = true;
+            if (!names[n].empty()) n++;
+            i = e + 1;
+        }
+        u64 a[4]{};
+        for (;;) {  // (until every chain resolves)
+            bool all = module_base("main") != 0;
+            for (int k = 0; k < n && all; k++) {
+                const char* p = names[k].c_str() + (wr[k] ? 1 : 0);
+                char* end = nullptr;
+                u64 g = module_base("main") + std::strtoull(p, &end, 16);
+                while (*end == '>' && g) {
+                    g = readable(g) ? ld<u64>(g) : 0;
+                    if (g) g += std::strtoull(end + 1, &end, 16);
+                }
+                if (!g || !readable(g)) all = false;
+                a[k] = g;
+            }
+            if (all) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        u64 h[4]{};
+        for (int k = 0; k < n; k++) {
+            h[k] = reinterpret_cast<u64>(hp(a[k]));
+            LOG("stepwatch: %s = %#llx, now %#x (%g)", names[k].c_str(), static_cast<unsigned long long>(a[k]), ld<u32>(a[k]),
+                static_cast<double>(ld<float>(a[k])));
+        }
+        run(h, wr, names, secs);
+        for (int k = 0; k < n; k++)
+            LOG("stepwatch: %s after %d s: %#x (%g)", names[k].c_str(), secs, ld<u32>(a[k]), static_cast<double>(ld<float>(a[k])));
+    }).detach();
+}
+
+// The guest's writable memory as host ranges [guest, guest + size) of at most 64 MiB, the host pages that are there.
+struct Range {
+    u64 guest, size, off;  // off: where its words start in a snapshot
+};
+std::vector<Range> writable_ranges(u64& total) {
+    std::vector<Range> out;
+    total = 0;
+    for (u64 a = 0; a < mem::AddressSpaceSize;) {
+        const mem::Info b = mem::query(a);
+        if (b.size == 0) break;
+        if (b.state != mem::Free && b.perm == mem::RW)
+            for (u64 p = b.addr; p < b.addr + b.size;) {
+                MEMORY_BASIC_INFORMATION mi{};
+                if (!VirtualQuery(hp(p), &mi, sizeof mi)) break;
+                const u64 end = std::min(b.addr + b.size, p + (reinterpret_cast<u64>(mi.BaseAddress) + mi.RegionSize - reinterpret_cast<u64>(hp(p))));
+                if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                    for (u64 q = p; q < end; q += 64ull << 20) {
+                        const u64 n = std::min(end - q, 64ull << 20);
+                        out.push_back({q, n, total / 4});
+                        total += n;
+                    }
+                p = end;
+            }
+        a = b.addr + b.size;
+    }
+    return out;
+}
+
+// A copy of guest memory the game may free meanwhile: ReadProcessMemory fails on a page that is gone instead of
+// faulting (llvm-mingw's __try catches nothing). False if any of it was gone.
+bool copy_may_fault(void* dst, const void* src, size_t n) {
+    const HANDLE self = GetCurrentProcess();
+    auto* d = static_cast<u8*>(dst);
+    const auto* sp = static_cast<const u8*>(src);
+    bool all = true;
+    for (size_t o = 0; o < n;) {  // 1 MiB at a time, a page at a time where that fails
+        const size_t piece = std::min<size_t>(n - o, 1 << 20);
+        SIZE_T got = 0;
+        if (ReadProcessMemory(self, sp + o, d + o, piece, &got) && got == piece) {
+            o += piece;
+            continue;
+        }
+        for (size_t p = o; p < o + piece; p += 4096) {
+            const size_t len = std::min<size_t>(o + piece - p, 4096);
+            if (!ReadProcessMemory(self, sp + p, d + p, len, &got) || got != len) std::memset(d + p, 0, len), all = false;
+        }
+        o += piece;
+    }
+    return all || n > 4096;  // (a big copy with holes is still worth comparing: the holes read as 0 both times)
+}
+
+bool still_there(u64 guest) {
+    MEMORY_BASIC_INFORMATION mi{};
+    return VirtualQuery(hp(guest), &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+}
+
+// fn(i, thread) for every range index i, on `threads` threads.
+template <class F>
+void each_range(size_t n, int threads, F fn) {
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < threads; t++)
+        ts.emplace_back([&, t] {
+            for (size_t i; (i = next.fetch_add(1)) < n;) fn(i, t);
+        });
+    for (auto& t : ts) t.join();
+}
+
+// HOST_TICK_SCAN=<s>[,<s>...] (debug aid for the 120 Hz work): at each time since start, three snapshots of the guest's
+// writable memory HOST_TICK_SCAN_GAP s apart (default 2) find the 32-bit ints and floats that grow at a steady rate
+// of 0.2-2.2 per game frame (nvn::g_frame, presents) through both gaps: the game's frame counters. Each is logged with
+// its rate; HOST_TICK_SCAN_WATCH=<n> then watches writes to the first n that grow 1 a frame (HOST_TICK_SCAN_STEP, the
+// step to look for) for 1 s per four and logs who wrote them.
+// HOST_TICK_SCAN_THREADS=<n> copies with n threads (default 8).
+void start_scan() {
+    const char* spec = std::getenv("HOST_TICK_SCAN");
+    if (!spec || !*spec) return;
+    std::thread([text = std::string(spec)] {
+        const double default_gap = std::getenv("HOST_TICK_SCAN_GAP") ? std::atof(std::getenv("HOST_TICK_SCAN_GAP")) : 2.0;
+        const int nwatch = std::getenv("HOST_TICK_SCAN_WATCH") ? std::atoi(std::getenv("HOST_TICK_SCAN_WATCH")) : 0;
+        const int threads = std::getenv("HOST_TICK_SCAN_THREADS") ? std::max(1, std::atoi(std::getenv("HOST_TICK_SCAN_THREADS"))) : 8;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto secs = [t0] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+        auto wait_until = [&](double s) {
+            while (secs() < s) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        };
+        auto rate_of = [](u32 a, u32 b, bool fl, double dt) -> double {
+            if (!fl) return static_cast<double>(static_cast<s32>(b - a)) / dt;
+            float fa, fb;
+            std::memcpy(&fa, &a, 4), std::memcpy(&fb, &b, 4);
+            if (!std::isfinite(fa) || !std::isfinite(fb) || std::fabs(fa) > 1e8f) return 0;
+            return (static_cast<double>(fb) - fa) / dt;
+        };
+        const double minrate = std::getenv("HOST_TICK_SCAN_MINRATE") ? std::atof(std::getenv("HOST_TICK_SCAN_MINRATE")) : 0.2;
+        // (HOST_TICK_SCAN_DOWN=1: counters that fall instead, timers counting down)
+        const double sgn = std::getenv("HOST_TICK_SCAN_DOWN") && std::atoi(std::getenv("HOST_TICK_SCAN_DOWN")) ? -1.0 : 1.0;
+        auto plausible = [minrate, sgn](double r, bool fl) { r *= sgn; return r >= (fl ? minrate : 0.2) && r <= 2.2; };  // per frame (HOST_TICK_SCAN_MINRATE: a float's lowest)
+        struct Cand {
+            u64 guest;
+            u32 last, range;
+            bool is_float;
+            double rate;
+        };
+        u32* snap = nullptr;
+        u64 snap_words = 0;
+        for (size_t i = 0; i < text.size();) {
+            const size_t e = std::min(text.find(',', i), text.size());
+            const std::string item = text.substr(i, e - i);
+            i = e + 1;
+            // "<s>" or "f<frame>" (the game's frame count), either with "/<gap s>"
+            const size_t slash = item.find('/');
+            const double gap = slash != std::string::npos ? std::atof(item.c_str() + slash + 1) : default_gap;
+            if (item[0] == 'f') {
+                const u64 f = std::strtoull(item.c_str() + 1, nullptr, 10);
+                while (nvn::g_frame.load() < f) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } else {
+                wait_until(std::atof(item.c_str()));
+            }
+            u64 total = 0;
+            const std::vector<Range> rs = writable_ranges(total);
+            LOG("tickscan: start at frame %llu", static_cast<unsigned long long>(nvn::g_frame.load()));
+            if (std::getenv("HOST_TICK_SCAN_LIST")) {
+                LOG("tickscan: %zu ranges, %llu MiB", rs.size(), static_cast<unsigned long long>(total >> 20));
+                continue;
+            }
+            if (total / 4 > snap_words) {  // (kept for the next scan: its pages are already there)
+                if (snap) VirtualFree(snap, 0, MEM_RELEASE);
+                snap_words = total / 4 + (256ull << 20) / 4;
+                snap = static_cast<u32*>(VirtualAlloc(nullptr, snap_words * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!snap) {
+                    LOG("tickscan: no room for a %llu MiB snapshot", static_cast<unsigned long long>(total >> 20));
+                    return;
+                }
+            }
+            // A: copy each range, noting when.
+            std::vector<double> ta(rs.size()), tb(rs.size());
+            std::vector<u64> fa(rs.size()), fb(rs.size());  // the game's frame count when each was read
+            std::vector<char> ok(rs.size());
+            const double a0 = secs();
+            const u64 f0 = nvn::g_frame.load();
+            each_range(rs.size(), threads, [&](size_t k, int) {
+                ok[k] = still_there(rs[k].guest);
+                ta[k] = secs(), fa[k] = nvn::g_frame.load();
+                if (ok[k]) ok[k] = copy_may_fault(snap + rs[k].off, hp(rs[k].guest), rs[k].size);
+            });
+            const double a1 = secs();
+            // B, a gap later: the words whose change since A is a plausible counter's; then C, a gap after B, for the same
+            // range at once (a clock that restarts every few seconds, such as a camera cut's, still shows): those that kept
+            // their rate.
+            std::vector<std::vector<Cand>> per(threads);
+            std::vector<size_t> ncands(threads);
+            std::vector<std::vector<u32>> copy(threads, std::vector<u32>((64ull << 20) / 4));
+            each_range(rs.size(), threads, [&](size_t k, int t) {
+                if (!ok[k] || !still_there(rs[k].guest)) {
+                    ok[k] = 0;
+                    return;
+                }
+                wait_until(ta[k] + gap);
+                tb[k] = secs(), fb[k] = nvn::g_frame.load();
+                if (!copy_may_fault(copy[t].data(), hp(rs[k].guest), rs[k].size)) return;  // (read at one moment, compared after)
+                const u32* now = copy[t].data();
+                const u32* was = snap + rs[k].off;
+                const double frames = static_cast<double>(fb[k] - fa[k]);
+                if (frames < 10) return;
+                std::vector<Cand> mine;
+                for (u64 w = 0; w < rs[k].size / 4; w++) {
+                    const u32 x = was[w], y = now[w];
+                    if (x == y) continue;
+                    for (const bool fl : {false, true})
+                        if (const double rt = rate_of(x, y, fl, frames); plausible(rt, fl) && mine.size() < 100'000)
+                            mine.push_back({rs[k].guest + 4 * w, y, static_cast<u32>(k), fl, rt});
+                }
+                ncands[t] += mine.size();
+                if (mine.empty()) return;
+                wait_until(tb[k] + gap);
+                const u64 fc = nvn::g_frame.load();
+                if (!copy_may_fault(copy[t].data(), hp(rs[k].guest), rs[k].size)) return;
+                const double frames2 = static_cast<double>(fc - fb[k]);
+                if (frames2 < 10) return;
+                for (const Cand& x : mine) {
+                    const u32 v = copy[t][(x.guest - rs[k].guest) / 4];
+                    const double rt = rate_of(x.last, v, x.is_float, frames2);
+                    if (plausible(rt, x.is_float) && std::fabs(rt - x.rate) <= 0.03 * std::fabs(x.rate)) per[t].push_back({x.guest, v, x.range, x.is_float, (rt + x.rate) / 2});
+                }
+            });
+            const double b1 = secs();
+            std::vector<Cand> found;
+            size_t total_cands = 0;
+            for (int t = 0; t < threads; t++) found.insert(found.end(), per[t].begin(), per[t].end()), total_cands += ncands[t];
+            LOG("tickscan at %.1f s (frame %llu): %zu ranges, %llu MiB, copied in %.2f s, compared in %.2f s; %zu candidates, %zu steady counters", a0,
+                static_cast<unsigned long long>(f0), rs.size(), static_cast<unsigned long long>(total >> 20), a1 - a0, b1 - a1, total_cands, found.size());
+            std::sort(found.begin(), found.end(), [](const Cand& x, const Cand& y) { return x.guest < y.guest; });
+            for (size_t k = 0; k < found.size() && k < 20000; k++) {
+                const Cand& c = found[k];
+                float f;
+                std::memcpy(&f, &c.last, 4);
+                LOG("tickscan: %s %.5f/frame %s = %s", describe_guest(c.guest).c_str(), c.rate, c.is_float ? "float" : "int",
+                    c.is_float ? std::to_string(f).c_str() : std::to_string(static_cast<s32>(c.last)).c_str());
+            }
+            // The ones that grow HOST_TICK_SCAN_STEP a frame (within 6%), one per value (instances of one kind of object
+            // usually count alike), are watched; with HOST_TICK_SCAN_MAXVAL=<v> only those still below v (recently started).
+            const double hz = std::getenv("HOST_TICK_SCAN_STEP") ? std::atof(std::getenv("HOST_TICK_SCAN_STEP")) : 1.0;
+            const double maxval = std::getenv("HOST_TICK_SCAN_MAXVAL") ? std::atof(std::getenv("HOST_TICK_SCAN_MAXVAL")) : 1e30;
+            std::vector<Cand> watch;
+            for (const Cand& c : found) {
+                float fv;
+                std::memcpy(&fv, &c.last, 4);
+                const double v = c.is_float ? static_cast<double>(fv) : static_cast<double>(static_cast<s32>(c.last));
+                if (std::fabs(v) >= maxval) continue;
+                if (std::fabs(c.rate - sgn * hz) > 0.06 * hz || static_cast<int>(watch.size()) >= nwatch) continue;
+                bool seen = false;
+                for (const Cand& w : watch) seen |= w.is_float == c.is_float && w.last == c.last;
+                if (!seen) watch.push_back(c);
+            }
+            for (size_t k = 0; k < watch.size(); k += 4) {
+                u64 a[4]{};
+                bool wr[4] = {true, true, true, true};
+                std::string names[4];
+                for (size_t j = 0; j < 4 && k + j < watch.size(); j++) {
+                    char b[32];
+                    std::snprintf(b, sizeof b, "%#llx", static_cast<unsigned long long>(watch[k + j].guest));
+                    a[j] = reinterpret_cast<u64>(hp(watch[k + j].guest)), names[j] = b;
+                }
+                run(a, wr, names, 1);
+            }
+        }
+    }).detach();
+}
+
 void start() {
+    start_mem();
+    start_scan();
     if (!std::getenv("HOST_WATCH_STEP")) return;
     std::thread([] {
         while (!g_mkw_frame_obj) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        const u64 a0 = reinterpret_cast<u64>(hp(g_mkw_frame_obj + 0x214));
-        const u64 a1 = reinterpret_cast<u64>(hp(module_base("main") + 0x33e6ae8));
+        const u64 a[4] = {reinterpret_cast<u64>(hp(g_mkw_frame_obj + 0x214)), reinterpret_cast<u64>(hp(module_base("main") + 0x33e6ae8))};
+        const bool wr[4]{};
+        const std::string names[4] = {"step", "counter"};
         LOG("stepwatch: frame object %#llx, watching for 25 s", static_cast<unsigned long long>(g_mkw_frame_obj));
-        armed = true;
-        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(25);
-        while (std::chrono::steady_clock::now() < end) {  // (threads made later get armed too)
-            arm_all(a0, a1, true);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        arm_all(0, 0, false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        armed = false;
-        const int n = std::min(count.load(), Max);
-        std::map<std::vector<u64>, int> uniq;
-        for (int i = 0; i < n; i++) uniq[std::vector<u64>(hits[i], hits[i] + Depth + 1)]++;
-        LOG("stepwatch: %d accesses, %zu distinct stacks", count.load(), uniq.size());
-        for (const auto& [st, c] : uniq) {
-            std::string line;
-            for (int k = 1; k <= Depth && st[k]; k++) {
-                std::string s = host_symbol(st[k]);
-                if (s.size() > 60) s.resize(60);
-                line += k > 1 ? " < " : " ";
-                line += s;
-            }
-            LOG("stepwatch: %s x%d:%s", st[0] & 1 ? "step" : "counter", c, line.c_str());
-        }
+        run(a, wr, names, 25);
     }).detach();
 }
 }  // namespace stepwatch
@@ -801,6 +1198,372 @@ void dump_guest_stack(Ctx* c) {
     u64 frames[32];
     const int n = walk_frames(c->x[29], frames, 32);
     for (int i = 0; i < n; i++) log_line("  #%-2d %s", i, describe_guest(frames[i]).c_str());
+}
+
+// ------------------------------------------------------------------ 120 Hz: jobs at half rate
+// The game's frame runs its subsystems ("modules") as jobs of a few job lists (tools/patches.py mkw_jobs). At
+// HOST_TICK_HZ=120 the ones that count frames (race sequence, menus) would run twice as fast; the ones named here run
+// every other tick instead (when the tick completes no whole 60th, g_mkw_tick_whole == 0), and named modules get a tick
+// time of their own (1/60 s, rate 1). HOST_TICK_HALF_JOBS=<hex key>,... names jobs by what they call (main offsets the
+// job log shows, HOST_TICK_JOB_LOG=1); HOST_TICK_HALF_MODULES=<hex module vtable>,... names modules: their jobs and
+// their tick time; HOST_TICK_HALF_ALL=1 halves every job not named in HOST_TICK_FULL_JOBS / _FULL_MODULES.
+namespace {
+struct HalfRate {
+    std::vector<u64> jobs, modules, full_jobs, full_modules;
+    std::vector<std::string> actors;  // HOST_TICK_HALF_ACTORS: names, or prefixes ending in '*'
+    std::string while_actor;          // HOST_TICK_HALF_WHILE: only while this actor is about (its jobs run)
+    double from = 0;                  // HOST_TICK_HALF_FROM: not before this many seconds
+    bool all = false, log = false;
+    HalfRate() {
+        auto list = [](const char* name, std::vector<u64>& into) {
+            for (const char* p = std::getenv(name); p && *p;) {
+                char* end = nullptr;
+                const unsigned long long x = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                into.push_back(x);
+                p = *end ? end + 1 : end;
+            }
+            std::sort(into.begin(), into.end());
+        };
+        list("HOST_TICK_HALF_JOBS", jobs), list("HOST_TICK_HALF_MODULES", modules);
+        list("HOST_TICK_FULL_JOBS", full_jobs), list("HOST_TICK_FULL_MODULES", full_modules);
+        if (const char* v = std::getenv("HOST_TICK_HALF_WHILE")) while_actor = v;
+        if (const char* v = std::getenv("HOST_TICK_HALF_FROM")) from = std::atof(v);
+        if (const char* v = std::getenv("HOST_TICK_HALF_ACTORS"))
+            for (std::string t = v; !t.empty();) {
+                const size_t e = std::min(t.find(','), t.size());
+                if (e) actors.push_back(t.substr(0, e));
+                t.erase(0, std::min(e + 1, t.size()));
+            }
+        all = std::getenv("HOST_TICK_HALF_ALL") && std::atoi(std::getenv("HOST_TICK_HALF_ALL"));
+        g_job_log = std::getenv("HOST_TICK_JOB_LOG") ? std::atoi(std::getenv("HOST_TICK_JOB_LOG")) : 0;
+        log = g_job_log > 0;
+    }
+    bool on() const { return all || !jobs.empty() || !modules.empty() || !actors.empty(); }
+    bool actor_named(const std::string& n) const {
+        for (const std::string& a : actors)
+            if (a.back() == '*' ? n.compare(0, a.size() - 1, a, 0, a.size() - 1) == 0 : n == a) return true;
+        return false;
+    }
+    static bool has(const std::vector<u64>& v, u64 x) { return x && std::binary_search(v.begin(), v.end(), x); }
+};
+const HalfRate& half_rate() {
+    static const HalfRate h;
+    return h;
+}
+u64 main_off(u64 a) {
+    for (const auto& m : g_loaded)
+        if (m.name == "main") return a - m.base < m.size ? a - m.base : 0;
+    return 0;
+}
+bool guest_readable(u64 a, u64 n = 8) {
+    if (!a || a >= mem::AddressSpaceSize) return false;
+    const mem::Info b = mem::query(a);
+    return b.state != mem::Free && (b.perm & mem::R) && a + n <= b.addr + b.size;
+}
+u64 peek(u64 a) { return guest_readable(a) ? ld<u64>(a) : 0; }
+
+std::atomic<const std::vector<u64>*> g_half_objs{nullptr};  // job objects (tagged as in the list) to skip, sorted
+struct JobWho {
+    u64 obj, vt;
+    int module;
+    bool operator<(const JobWho& o) const { return obj < o.obj; }
+};
+std::atomic<const std::vector<JobWho>*> g_job_who{nullptr};  // every listed job: its vtable and module (HOST_TICK_JOB_LOG=2)
+std::mutex g_half_lock;
+std::vector<u64> g_all_modules;   // the module system's modules (guest addresses)
+std::vector<u64> g_half_modules;  // module objects with a tick time of their own (guest addresses)
+u64 g_half_page = 0;              // guest page: [0] the skip job's vtable pointer, [0x10..] its vtable, [0x80] the 60 Hz tick time
+u64 g_mkw_sys = 0;
+
+// A guest page for the skip job and the 60 Hz tick time, and a function that returns at once for the skip job to run.
+u64 half_page() {
+    if (g_half_page) return g_half_page;
+    u64 ret_fn = 0;
+    for (const auto& m : g_loaded)
+        if (m.name == "main")
+            for (u64 a = m.base; a < m.base + m.size && !ret_fn; a += 4)
+                if (mem::query(a).perm == mem::RX && ld<u32>(a) == 0xd65f03c0u && recompiled_fn(a)) ret_fn = a;
+    const u64 page = mem::find_free(mem::AslrBase, mem::AslrSize, mem::PageSize);
+    if (!ret_fn || !page) {
+        LOG("half rate: no room for the skip job");
+        return 0;
+    }
+    mem::map(page, mem::PageSize, mem::Normal, mem::RW);
+    st<u64>(page, page + 0x10);
+    for (int i = 0; i < 8; i++) st<u64>(page + 0x10 + 8 * i, ret_fn);
+    LOG("half rate: skip job at %#llx runs %s", static_cast<unsigned long long>(page), describe_guest(ret_fn).c_str());
+    return g_half_page = page;
+}
+
+// What a job calls: the job object's run function, or (the default run: an inner callable at +0x10) the callable's,
+// or (that one a member-function delegate: object +8, function +0x10, adjust +0x18) the member function. `self` gets
+// the object it runs on when one is known.
+u64 job_target(u64 obj, u64* self, std::string* how) {
+    *self = 0;
+    const bool tagged = obj & 1;
+    obj &= ~1ull;
+    const u64 vt = peek(obj), run = peek(vt + 0x10);
+    char b[256];
+    if (tagged) {
+        if (how) snprintf(b, sizeof b, "tagged obj %#llx vt %s run %s", obj, describe_guest(vt).c_str(), describe_guest(run).c_str()), *how = b;
+        *self = obj;
+        return run;
+    }
+    const u64 inner = peek(obj + 0x10), ivt = peek(inner), irun = peek(ivt + 0x20);
+    const u64 dobj = peek(inner + 8), dfn = peek(inner + 0x10), dadj = peek(inner + 0x18);
+    u64 target = irun;
+    if (dobj && main_off(dobj) == 0) {
+        const u64 thiz = dobj + (static_cast<s64>(dadj) >> 1);
+        u64 fn = dfn;
+        if (dadj & 1) fn = peek(peek(thiz) + dfn);
+        if (main_off(fn)) target = fn, *self = thiz;
+    }
+    if (how) {
+        snprintf(b, sizeof b, "obj %#llx vt %s run %s; inner %#llx vt %s run %s; delegate %#llx %#llx %#llx",
+                 obj, describe_guest(vt).c_str(), describe_guest(run).c_str(), inner, describe_guest(ivt).c_str(),
+                 describe_guest(irun).c_str(), dobj, dfn, dadj);
+        *how = b;
+    }
+    return target;
+}
+}  // namespace
+
+// The strings an actor points to (directly or one pointer away, first 0x800 bytes): its name among them (HOST_TICK_JOB_LOG=2).
+static void log_actor_strings(u64 a) {
+    static std::mutex lock;
+    static std::vector<u64> seen;
+    std::lock_guard<std::mutex> lk(lock);
+    if (std::find(seen.begin(), seen.end(), a) != seen.end()) return;
+    seen.push_back(a);
+    auto str = [](u64 p, std::string& out) {
+        if (!guest_readable(p, 4)) return false;
+        out.clear();
+        for (u64 k = 0; k < 64; k++) {
+            if (!guest_readable(p + k, 1)) return false;
+            const char ch = static_cast<char>(ld<u8>(p + k));
+            if (!ch) break;
+            if (ch < 32 || ch > 126) return false;
+            out += ch;
+        }
+        return out.size() >= 4;
+    };
+    std::string line, sv;
+    for (u64 off = 0; off < 0x800 && line.size() < 900; off += 8) {
+        const u64 p = peek(a + off);
+        if (!p || main_off(p) && main_off(p) < 0x2c00000) continue;  // (code)
+        if (str(p, sv)) {
+            line += " +" + std::to_string(off) + "=\"" + sv + "\"";
+            continue;
+        }
+        for (u64 o2 = 0; o2 < 0x40; o2 += 8)
+            if (const u64 q = peek(p + o2); q && str(q, sv)) {
+                line += " +" + std::to_string(off) + ">" + std::to_string(o2) + "=\"" + sv + "\"";
+                break;
+            }
+    }
+    LOG("actor %#llx:%s", static_cast<unsigned long long>(a), line.c_str());
+}
+
+// The scheduler starts a job list (tools/patches.py mkw_jobs): {..., +8 count, +0x10 descriptors (+8 the job object)}.
+// A list is looked at again whenever its jobs change (scenes add and remove some).
+void mkw_job_list(u64 list) {
+    const HalfRate& h = half_rate();
+    if (!h.on() && !h.log) return;
+    const s32 n = static_cast<s32>(ld<u32>(list + 8));
+    const u64 descs = ld<u64>(list + 0x10);
+    if (n < 0 || n > 4096 || (n && !guest_readable(descs, 8ull * n))) return;
+    u64 sig = static_cast<u64>(n) * 0x9E3779B97F4A7C15ull ^ descs;
+    for (s32 i = 0; i < n; i++) sig = (sig ^ ld<u64>(ld<u64>(descs + 8 * i) + 8)) * 0x100000001B3ull;
+    std::lock_guard<std::mutex> lk(g_half_lock);
+    static std::map<u64, std::pair<u64, std::vector<u64>>> seen;  // list -> its signature, its jobs to skip
+    static std::map<u64, std::vector<JobWho>> who;                // list -> its jobs
+    auto& entry = seen[list];
+    who[list].clear();
+    if (entry.first == sig && sig) return;
+    entry.first = sig;
+    entry.second.clear();
+    if (h.on()) half_page();
+    const char* name = "?";
+    static const char* const names[] = {"4d0", "4d8", "4e0", "4e8", "4f0", "4f8"};
+    for (int i = 0; i < 6 && g_mkw_sys; i++)
+        if (peek(g_mkw_sys + 0x4d0 + 8 * i) == list) name = names[i];
+    if (h.log) LOG("jobs: list %#llx (sys+0x%s), %d jobs", static_cast<unsigned long long>(list), name, n);
+    for (s32 i = 0; i < n; i++) {
+        const u64 d = peek(descs + 8 * i), obj = peek(d + 8);
+        u64 self = 0;
+        std::string how;
+        const u64 target = job_target(obj, &self, h.log ? &how : nullptr);
+        // A module's own job runs on the module; its helper jobs (+0x10 the module) count as the module's too.
+        const auto is_module = [](u64 m) { return m && std::find(g_all_modules.begin(), g_all_modules.end(), m) != g_all_modules.end(); };
+        u64 module = is_module(self) ? self : 0;
+        if (!module && (obj & 1) && is_module(peek((obj & ~1ull) + 0x10))) module = peek((obj & ~1ull) + 0x10);
+        const u64 key = main_off(target), svt = main_off(peek(self)), mvt = main_off(peek(module));
+        const bool full = HalfRate::has(h.full_jobs, key) || HalfRate::has(h.full_modules, svt) || HalfRate::has(h.full_modules, mvt);
+        const bool half = !full && (h.all || HalfRate::has(h.jobs, key) || HalfRate::has(h.modules, svt) || HalfRate::has(h.modules, mvt));
+        if (half) entry.second.push_back(obj);
+        const auto mi = std::find(g_all_modules.begin(), g_all_modules.end(), module);
+        who[list].push_back({obj, module ? mvt : svt, module && mi != g_all_modules.end() ? static_cast<int>(mi - g_all_modules.begin()) : -1});
+        if (h.log)
+            LOG("jobs:  %s[%d] key %#llx self %#llx (vt main+%#llx) module vt main+%#llx%s  %s", name, i,
+                static_cast<unsigned long long>(key), static_cast<unsigned long long>(self), static_cast<unsigned long long>(svt),
+                static_cast<unsigned long long>(mvt), half ? " HALF" : "", how.c_str());
+    }
+    std::vector<u64> skip;
+    for (const auto& [l, e] : seen) skip.insert(skip.end(), e.second.begin(), e.second.end());
+    std::sort(skip.begin(), skip.end());
+    g_half_objs.store(new std::vector<u64>(std::move(skip)));  // (the old one stays: a job may be reading it)
+    if (g_job_log >= 2) {
+        std::vector<JobWho> all;
+        for (const auto& [l, v] : who) all.insert(all.end(), v.begin(), v.end());
+        std::sort(all.begin(), all.end());
+        g_job_who.store(new std::vector<JobWho>(std::move(all)));
+    }
+}
+
+// An actor's job (+0x18 its tick time, +0x20 the actor; the actor's name at actor +0x20) of an actor HOST_TICK_HALF_ACTORS
+// names: -1 not one, 0 sit this tick out, 1 run, with a 60 Hz copy of its tick time. Each worker keeps what it found
+// per job object (checked again when the actor or its name changes).
+namespace {
+std::mutex g_shadow_lock;
+std::atomic<u64> g_shadow_of[32];  // tick times the shadows at half page + 0x200 + 0x40 * k copy
+u64 shadow_for(u64 orig) {
+    for (int k = 0; k < 32; k++)
+        if (g_shadow_of[k].load(std::memory_order_relaxed) == orig) return g_half_page + 0x200 + 0x40 * k;
+    std::lock_guard<std::mutex> lk(g_shadow_lock);
+    for (int k = 0; k < 32; k++) {
+        const u64 v = g_shadow_of[k].load();
+        if (v == orig) return g_half_page + 0x200 + 0x40 * k;
+        if (!v) {
+            g_shadow_of[k].store(orig);
+            LOG("half rate: 60 Hz copy %d of the tick time at %#llx", k, static_cast<unsigned long long>(orig));
+            return g_half_page + 0x200 + 0x40 * k;
+        }
+    }
+    return 0;
+}
+}  // namespace
+std::atomic<s64> g_while_seen{-1};  // the tick (g_half_ticks) the HOST_TICK_HALF_WHILE actor's job last came by
+std::atomic<s64> g_half_ticks{0};
+std::atomic<bool> g_half_on{false};  // the half rate is on this tick (half_tick)
+static s64 steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int half_actor_job(u64 obj, bool active) {
+    struct Seen {
+        u64 actor, namep, orig;
+        bool half, is_actor, is_while;
+    };
+    thread_local std::unordered_map<u64, Seen> seen;
+    const u64 o = obj & ~1ull, actor = ld<u64>(o + 0x20);
+    auto it = seen.find(o);
+    if (it == seen.end() || it->second.actor != actor || (it->second.is_actor && ld<u64>(actor + 0x20) != it->second.namep)) {
+        Seen e{actor, 0, 0, false, false, false};
+        std::string name;
+        if (guest_readable(actor + 0x20) && (e.namep = ld<u64>(actor + 0x20)) && guest_readable(e.namep, 1))
+            for (u64 k = 0; k < 64 && guest_readable(e.namep + k, 1); k++) {
+                const char ch = static_cast<char>(ld<u8>(e.namep + k));
+                if (!ch) break;
+                if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+                    name.clear();
+                    break;
+                }
+                name += ch;
+            }
+        if (name.size() < 3) name.clear();  // (not an actor's name: some other job's +0x20)
+        e.is_actor = guest_readable(actor + 0x20);
+        e.half = !name.empty() && half_rate().actor_named(name);
+        e.is_while = !name.empty() && name == half_rate().while_actor;
+        if (e.half) LOG("half rate: actor %s (%#llx) job %#llx runs every other tick", name.c_str(), static_cast<unsigned long long>(actor),
+                        static_cast<unsigned long long>(o));
+        it = seen.insert_or_assign(o, e).first;
+    }
+    Seen& e = it->second;
+    if (e.is_while) g_while_seen.store(g_half_ticks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    if (!e.half) return -1;
+    if (!active) {  // (its own tick time back)
+        if (e.orig && ld<u64>(o + 0x18) - g_half_page < mem::PageSize) st<u64>(o + 0x18, e.orig);
+        return -1;
+    }
+    if (g_mkw_tick_whole == 0) return 0;
+    const u64 cur = ld<u64>(o + 0x18);
+    if (cur - g_half_page >= mem::PageSize) e.orig = cur;  // (the game set it: follow)
+    if (const u64 sh = e.orig ? shadow_for(e.orig) : 0) {
+        for (u64 k = 0; k < 0x40; k += 8) st<u64>(sh + k, ld<u64>(e.orig + k));
+        st<u32>(sh, 0x3c888889u), st<u32>(sh + 4, 0x3f800000u);
+        st<u64>(o + 0x18, sh);
+    }
+    return 1;
+}
+
+// A job is about to run (tools/patches.py mkw_jobs): the object it runs, or the skip job on the ticks it sits out.
+// Each tick: whether the half rate is on (HOST_TICK_HALF_FROM: not before that many seconds after the first tick;
+// HOST_TICK_HALF_WHILE: only while that actor's jobs come by, within the last 30 ticks).
+void half_tick() {
+    const HalfRate& h = half_rate();
+    if (!h.on()) return;
+    static const s64 t0 = steady_ms();
+    const s64 tick = g_half_ticks.fetch_add(1) + 1, seen = g_while_seen.load(std::memory_order_relaxed);
+    const bool on = steady_ms() - t0 >= static_cast<s64>(h.from * 1000) && (h.while_actor.empty() || (seen >= 0 && tick - seen <= 30));
+    if (on != g_half_on.exchange(on)) LOG("half rate: %s", on ? "on" : "off");
+}
+static bool half_active() { return g_half_on.load(std::memory_order_relaxed); }
+u64 mkw_job_obj(u64 obj) {
+    if (const std::vector<JobWho>* w = g_job_who.load(std::memory_order_acquire)) {
+        const auto it = std::lower_bound(w->begin(), w->end(), JobWho{obj, 0, 0});
+        if (it != w->end() && it->obj == obj) t_job_vt = it->vt, t_job_module = it->module, t_job_actor = 0;
+        else {  // a job of another list: its vtable (untagged: the job wraps a callable); an actor's job: +0x20 the actor
+            t_job_vt = main_off(ld<u64>(obj & ~1ull)) | (obj & 1 ? 0 : 1ull << 63), t_job_module = -1;
+            const u64 a = (obj & 1) ? peek((obj & ~1ull) + 0x20) : 0;
+            t_job_actor = a && main_off(peek(a)) ? a : 0;
+        }
+    }
+    if (!g_half_page) return obj;
+    const bool active = half_active();
+    if ((obj & 1) && (!half_rate().actors.empty() || !half_rate().while_actor.empty())) {
+        if (const int r = half_actor_job(obj, active); r >= 0) return r ? obj : g_half_page | 1;
+    }
+    if (!active) return obj;
+    if (g_mkw_tick_whole != 0) return obj;
+    const std::vector<u64>* s = g_half_objs.load(std::memory_order_acquire);
+    if (!s || !std::binary_search(s->begin(), s->end(), obj)) return obj;
+    return g_half_page | 1;
+}
+
+// A job returned (tools/patches.py mkw_jobs).
+void mkw_job_done() { t_job_module = -2; }
+
+// The frame's module phase hands each module its tick time (tools/patches.py mkw_jobs; the module system: +0x280 count,
+// +0x288 modules, +0x500 the tick time): the named modules get the 60 Hz one.
+void mkw_tick_modules(u64 sys) {
+    const HalfRate& h = half_rate();
+    if (!h.on() && !h.log) return;
+    const s32 n = static_cast<s32>(ld<u32>(sys + 0x280));
+    const u64 mods = ld<u64>(sys + 0x288);
+    if (sys != g_mkw_sys) {
+        std::lock_guard<std::mutex> lk(g_half_lock);
+        g_mkw_sys = sys;
+        g_half_modules.clear(), g_all_modules.clear();
+        if (h.on()) half_page();
+        for (s32 i = 0; i < n && i < 1024; i++) {
+            const u64 m = peek(mods + 8 * i), vt = main_off(peek(m));
+            const bool full = HalfRate::has(h.full_modules, vt);
+            const bool half = !full && (h.all || HalfRate::has(h.modules, vt));
+            if (half) g_half_modules.push_back(m);
+            g_all_modules.push_back(m);
+            if (h.log)
+                LOG("jobs: module %d %#llx vt main+%#llx phase obj %#llx%s", i, static_cast<unsigned long long>(m),
+                    static_cast<unsigned long long>(vt), static_cast<unsigned long long>(peek(m + 0x60)), half ? " HALF" : "");
+        }
+        if (h.log)
+            for (int i = 0; i < 6; i++) LOG("jobs: sys+%#x list %#llx", 0x4d0 + 8 * i, static_cast<unsigned long long>(ld<u64>(sys + 0x4d0 + 8 * i)));
+    }
+    if (!g_half_page || g_half_modules.empty() || !half_active()) return;
+    // A copy of the shared tick time (+0x10: the set of paused modules, and more) at 1/60 s, rate 1.
+    const u64 t = g_half_page + 0x80, shared = ld<u64>(sys + 0x500);
+    for (u64 k = 0; k < 0x40; k += 8) st<u64>(t + k, ld<u64>(shared + k));
+    st<u32>(t, 0x3c888889u), st<u32>(t + 4, 0x3f800000u);
+    for (const u64 m : g_half_modules) st<u64>(m + 0x58, t);
 }
 
 void host_override(u64 addr, GuestFn fn) { g_overrides[addr] = fn; }
@@ -962,6 +1725,21 @@ int main(int argc, char** argv) {
         const std::string mode = v ? v : "dynamic";
         g_mkw_frame_mode = mode == "game" ? -1 : mode == "60" ? 1 : mode == "30" ? 2 : 0;
         LOG("frame mode %s (%d)", mode.c_str(), g_mkw_frame_mode);
+    }
+    // HOST_TICK_HZ=<n> (experiment): the game's ticks last 1/n s instead of 1/60 (tools/patches.py mkw_tick_time),
+    // rate 60/n; HOST_TICK_DT=<s> and HOST_TICK_RATE=<x> set the two apart. With HOST_NVN_PRESENT_HZ=<n> and
+    // HOST_FPS_MODE=60 that is one shorter tick per frame.
+    {
+        float dt = 1.f / 60.f, rate = 1.f;
+        if (const char* v = std::getenv("HOST_TICK_HZ"); v && std::atof(v) > 0) dt = 1.f / static_cast<float>(std::atof(v)), rate = 60.f * dt;
+        if (const char* v = std::getenv("HOST_TICK_DT"); v && std::atof(v) > 0) dt = static_cast<float>(std::atof(v));
+        if (const char* v = std::getenv("HOST_TICK_RATE"); v && std::atof(v) > 0) rate = static_cast<float>(std::atof(v));
+        std::memcpy(&g_mkw_tick_dt, &dt, 4), std::memcpy(&g_mkw_tick_rate, &rate, 4);
+        if (g_mkw_tick_dt != 0x3c888889u || g_mkw_tick_rate != 0x3f800000u) LOG("tick time %g s, rate %g", dt, rate);
+        g_mkw_tick_ratef = rate;  // (the counters' step: mkw_tick_slot)
+        if (const char* v = std::getenv("HOST_TICK_STEP"); v && !std::strcmp(v, "whole")) g_mkw_tick_step_whole = true, LOG("tick count: whole 60ths");
+        g_mkw_tick_secf = g_mkw_tick_step_whole ? 1.f : rate;
+        half_rate();              // (reads HOST_TICK_JOB_LOG before the first counter runs)
     }
     stepwatch::start();
 
