@@ -43,12 +43,12 @@ void reply64(Request& r, std::initializer_list<u64> values) {
 // A session on `s` returned as a copy handle (word 3, result at word 4).
 void return_session(Request& r, ServicePtr s) { r.out_copy.push_back(new_session(std::move(s))); }
 
-constexpr u32 HostSyncpoints = sync::Count;
+constexpr u32 HostSyncpoints = syncpoints::Count;
 
-u32 sync_value(u32 id) { return sync::value(id); }
-bool sync_ready(u32 id, u32 value) { return sync::ready(id, value); }
-template <typename F> sync::Handle on_sync(u32 id, u32 value, F&& f) { return sync::on_reach(id, value, std::forward<F>(f)); }
-void cancel_sync(u32 id, sync::Handle h) { sync::cancel(id, h); }
+u32 sync_value(u32 id) { return syncpoints::value(id); }
+bool sync_ready(u32 id, u32 value) { return syncpoints::ready(id, value); }
+template <typename F> syncpoints::Handle on_sync(u32 id, u32 value, F&& f) { return syncpoints::on_reach(id, value, std::forward<F>(f)); }
+void cancel_sync(u32 id, syncpoints::Handle h) { syncpoints::cancel(id, h); }
 
 // The syncpoint values the guest reads (the RO page of nx2:gsv 204: nn::gs::TryWaitNativeSync and the syncpt SDK
 // read them there), and how many it has; 0 before the game attaches it.
@@ -105,8 +105,8 @@ struct Syncpt : Service {
     struct SlotRequest {
         u32 syncpoint = 0;
         std::atomic<bool> pending{false};
-        sync::Handle handle = 0;
-        // Which request of the slot an action belongs to (under Shared::m). sync::increment runs the actions due after
+        syncpoints::Handle handle = 0;
+        // Which request of the slot an action belongs to (under Shared::m). syncpoints::increment runs the actions due after
         // letting go of its lock, and the client may meanwhile see the value reached (TryWait), take the frame and arm the
         // slot for the next one: cancel misses the action already taken out, and it signalled the new request's event
         // early. The movie module then found the next image's value not reached and aborted (subsdk0+0x4540 / 0x4690,
@@ -377,7 +377,7 @@ struct VideoSession : Service {
         cv.notify_all();
         if (worker.joinable()) worker.join();
         if (ticker.joinable()) ticker.join();
-        if (syncpoint != NoSyncpoint) sync::release(syncpoint);
+        if (syncpoint != NoSyncpoint) syncpoints::release(syncpoint);
     }
 
     // 101(A: codec name; u32 width, u32 height, u32 rate, u32).
@@ -420,7 +420,7 @@ struct VideoSession : Service {
     // {~syncpoint, mode, u64 value} that signals once that frame is in it.
     void hand_out(Request& r, u32 image, std::optional<Fence> release) {
         if (syncpoint == NoSyncpoint) {
-            syncpoint = sync::allocate();
+            syncpoint = syncpoints::allocate();
             sync_base = sync_value(syncpoint);
             LOG("%s counts decoded frames on syncpoint %u from %u", name.c_str(), syncpoint, sync_base);
         }
@@ -452,7 +452,7 @@ struct VideoSession : Service {
             // 1.0.0: an end-of-stream frame for it (with the last frame's time and size) instead of "nothing finished"
             if (frames && unfilled_get_frames())
                 outputs.push_back({free_images.front(), last_w ? last_w : width, last_h ? last_h : height, last_pts, true, true});
-            sync::increment(syncpoint);
+            syncpoints::increment(syncpoint);
         }
         return n;
     }
@@ -575,7 +575,7 @@ struct VideoSession : Service {
                 // Even an image written during a flush counts: the client waits for its value.
                 outputs.push_back({image, w, h, frame.pts, frame.end});
                 last_pts = frame.pts, last_w = w, last_h = h;
-                if (!owed) sync::increment(syncpoint);
+                if (!owed) syncpoints::increment(syncpoint);
                 ++frames_out;
                 if (frame.end) at_end = true, release_unfilled();
                 if (frames_out == 1 || frames_out % 600 == 0 || frame.end)

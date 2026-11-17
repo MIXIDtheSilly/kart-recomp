@@ -5,7 +5,7 @@
 #include <mutex>
 #include <vector>
 
-namespace sync {
+namespace syncpoints {
 namespace {
 
 struct Action {
@@ -102,4 +102,4 @@ void release(u32 id) {
     if (id < Count) g_allocated[id] = false;
 }
 
-}  // namespace sync
+}  // namespace syncpoints

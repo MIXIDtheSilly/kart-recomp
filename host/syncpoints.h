@@ -5,7 +5,7 @@
 
 #include "common.h"
 
-namespace sync {
+namespace syncpoints {
 
 constexpr u32 Count = 192;
 
@@ -24,4 +24,4 @@ void cancel(u32 id, Handle h);
 u32 allocate();
 void release(u32 id);
 
-}  // namespace sync
+}  // namespace syncpoints
