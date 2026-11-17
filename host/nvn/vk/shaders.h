@@ -5,6 +5,7 @@
 // translator's support buffer) up. Here each stage gets a set of its own (Stage::set), so the stages of
 // one pipeline never collide: the module's DescriptorSet decorations are rewritten at load.
 #pragma once
+#include <memory>
 #include <vector>
 
 #include "vkctx.h"
@@ -49,7 +50,8 @@ struct Shader {
     ShStage stage = SH_VS;
     u32 set = 0;                    // its descriptor set in a pipeline layout
     VkShaderStageFlagBits vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
-    VkShaderModule module = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;   // (none with inline_code)
+    bool inline_code = false;       // no module: pipelines take its SPIR-V from shader_code (inline_spirv)
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     std::vector<Binding> bindings;
     u32 kinds = 0;                  // bit 1 << BKind of each kind among its bindings
@@ -79,6 +81,11 @@ bool ssbo_deltas();
 const Shader* shader(const u8 key[8]);
 // The same by the key as a number (Shader::key). Any thread.
 const Shader* shader_by_key(u64 key);
+// Whether pipelines can be made with it (a module, or SPIR-V given inline).
+inline bool shader_has_code(const Shader* s) { return s && (s->module || s->inline_code); }
+// The SPIR-V of a shader with inline_code, as its module would have had it (read and patched again when not cached).
+// Null for the others, or when it cannot be made again. Any thread.
+std::shared_ptr<const std::vector<u32>> shader_code(const Shader* s);
 // The folder of the translated shaders (work/nvn_shaders, or HOST_NVN_SHADERS).
 std::string shader_folder();
 // Number of shaders in the reflection table (0: table missing).

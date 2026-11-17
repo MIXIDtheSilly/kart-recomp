@@ -245,6 +245,11 @@ void create_device(Device& c) {
     opt(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     opt(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
     opt(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    // Shaders given to pipelines as SPIR-V, no modules kept (shaders.cpp inline_spirv): on NVIDIA by default (measured
+    // there), elsewhere with HOST_NVN_INLINE_SPIRV=1; =0 keeps modules everywhere.
+    const char* inl = getenv("HOST_NVN_INLINE_SPIRV");
+    c.feat.inline_wanted = inl && *inl ? *inl != '0' : c.props.vendorID == 0x10de;
+    const bool maintenance5 = c.feat.inline_wanted && opt(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 
     // Every feature the GPU has is enabled: the game's shaders and state need many of them, and
     // which ones is only known per draw.
@@ -262,6 +267,7 @@ void create_device(Device& c) {
     VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR fu8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR};
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance5FeaturesKHR fm5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     void** tail = &f2.pNext;
     auto chain = [&](auto& s) {
         *tail = &s;
@@ -280,7 +286,9 @@ void create_device(Device& c) {
     if (clip_enable) chain(fdce);
     if (uint8) chain(fu8);
     if (fault) chain(ffault);
+    if (maintenance5) chain(fm5);
     vkGetPhysicalDeviceFeatures2(c.phys, &f2);
+    c.feat.maintenance5 = maintenance5 && fm5.maintenance5;
     // Multiview and shading-rate features of mesh shaders need features the device may lack.
     fmesh.multiviewMeshShader = VK_FALSE;
     fmesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;

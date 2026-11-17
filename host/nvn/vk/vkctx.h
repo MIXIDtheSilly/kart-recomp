@@ -40,6 +40,9 @@ struct Features {
     // memory or a small host heap, issue #4). On by default everywhere since 2026-11-17; HOST_NVN_LEAN_IMPORTS=0 imports up front.
     bool lean_imports = false;
     u64 import_alignment = 4096;
+    // VK_KHR_maintenance5: a pipeline stage can take its SPIR-V without a VkShaderModule (shaders.cpp inline_spirv).
+    bool maintenance5 = false;
+    bool inline_wanted = false;     // shaders inline (NVIDIA by default; HOST_NVN_INLINE_SPIRV=0/1 overrides)
     // The stages whose pipelines ask for 32-wide subgroups (subgroup size control): the translated shaders are NVIDIA warp
     // code (ballots and lane masks are 32 bits, shuffles index lanes 0-31), so an AMD wave64 or an Intel SIMD16 runs them
     // wrong. Empty where the GPU's subgroups are always 32 wide (NVIDIA). HOST_NVN_SUBGROUP32=0/1 overrides.

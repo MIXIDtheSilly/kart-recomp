@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -603,14 +604,9 @@ VkShaderStageFlagBits vk_stage(ShStage s) {
     }
 }
 
-std::unique_ptr<Shader> load(u64 key, const Row& row) {
-    auto sh = std::make_unique<Shader>();
-    sh->key = key;
-    snprintf(sh->name, sizeof sh->name, "%016llx", static_cast<unsigned long long>(key));
-    sh->stage = row.stage;
-    sh->set = stage_set(row.stage);
-    sh->vk_stage = vk_stage(row.stage);
-    sh->c1 = row.c1;
+// The SPIR-V of a shader as its module gets it: the file read and patched (reflection, base builtins, barriers, storage
+// buffer offsets). Fills the shader's reflection; false (sh->unsupported says why) when there is none.
+bool make_words(Shader* sh, const Row& row, std::vector<u32>& words) {
     // Task and mesh shaders: the translator made compute kernels of them; tools/nvn_mesh.py turns those into
     // TaskEXT / MeshEXT modules (<key>.mesh.spv), and per-primitive outputs into flat per-vertex ones where they fit
     // (<key>.meshflat.spv), which the translated fragment shaders read without PerPrimitiveEXT.
@@ -640,14 +636,14 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     std::ifstream f(file, std::ios::binary);
     if (!f) {
         sh->unsupported = "no SPIR-V file";
-        return sh;
+        return false;
     }
     std::vector<char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    std::vector<u32> words(bytes.size() / 4);
+    words.assign(bytes.size() / 4, 0);
     std::memcpy(words.data(), bytes.data(), words.size() * 4);
     if (!reflect(words, *sh, row)) {
         sh->unsupported = "malformed SPIR-V";
-        return sh;
+        return false;
     }
     // HOST_NVN_BASE_BUILTINS=0: the shaders as translated
     static const bool base_builtins = !getenv("HOST_NVN_BASE_BUILTINS") || atoi(getenv("HOST_NVN_BASE_BUILTINS")) != 0;
@@ -693,16 +689,91 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
         if (logged++ < 3) LOG("nvk: shader %s: %u storage buffers read with offsets from push constants (aligned to %llu bytes)", sh->name,
                               sh->delta_n, static_cast<unsigned long long>(ssbo_align()));
     }
+    return true;
+}
+
+// Inline SPIR-V (VK_KHR_maintenance5; NVIDIA by default, HOST_NVN_INLINE_SPIRV=0/1 overrides): no VkShaderModule is
+// kept, a pipeline gets its stages' SPIR-V inline (shader_code). The NVIDIA driver keeps a copy of every module's SPIR-V
+// for as long as the module lives, and the warm-up loads every shader: 1.8.0's ~11,700 took ~360 MB of host memory, and
+// destroying them gives none of it back (the driver keeps its heap). Pipelines are made from a few of them at a time: a
+// 1.8.0 race read 128 shaders again (63 MB cache), and the warm-up was no slower (0.7 s against 0.9 s).
+bool inline_spirv() {
+    static const bool on = [] {
+        const bool want = ctx().feat.inline_wanted;
+        if (want && !ctx().feat.maintenance5) LOG("nvk: no VK_KHR_maintenance5 on this GPU: shader modules kept");
+        else if (want) LOG("nvk: shaders given to pipelines as SPIR-V, no shader modules kept (HOST_NVN_INLINE_SPIRV=0: kept)");
+        return want && ctx().feat.maintenance5;
+    }();
+    return on;
+}
+
+// The SPIR-V of inline shaders used lately, at most HOST_NVN_SPIRV_CACHE_MB (64) of it.
+struct CodeCache {
+    using Code = std::shared_ptr<const std::vector<u32>>;
+    std::mutex mu;
+    std::list<u64> lru;   // most recent first
+    std::unordered_map<u64, std::pair<Code, std::list<u64>::iterator>> m;
+    u64 bytes = 0, hits = 0, misses = 0;
+    static u64 cap() {
+        static const u64 c = [] {
+            const char* e = getenv("HOST_NVN_SPIRV_CACHE_MB");
+            return (e && *e ? std::strtoull(e, nullptr, 0) : 64ull) << 20;
+        }();
+        return c;
+    }
+    Code get(u64 key) {
+        std::scoped_lock lk{mu};
+        auto it = m.find(key);
+        if (it == m.end()) {
+            misses++;
+            return nullptr;
+        }
+        hits++;
+        lru.splice(lru.begin(), lru, it->second.second);
+        return it->second.first;
+    }
+    void put(u64 key, Code c) {
+        std::scoped_lock lk{mu};
+        if (m.count(key)) return;
+        lru.push_front(key);
+        bytes += c->size() * 4;
+        m.emplace(key, std::make_pair(std::move(c), lru.begin()));
+        while (bytes > cap() && lru.size() > 1) {
+            auto old = m.find(lru.back());
+            bytes -= old->second.first->size() * 4;
+            m.erase(old);
+            lru.pop_back();
+        }
+    }
+};
+CodeCache g_code;
+
+std::unique_ptr<Shader> load(u64 key, const Row& row) {
+    auto sh = std::make_unique<Shader>();
+    sh->key = key;
+    snprintf(sh->name, sizeof sh->name, "%016llx", static_cast<unsigned long long>(key));
+    sh->stage = row.stage;
+    sh->set = stage_set(row.stage);
+    sh->vk_stage = vk_stage(row.stage);
+    sh->c1 = row.c1;
+    std::vector<u32> words;
+    if (!make_words(sh.get(), row, words)) return sh;
+    Device& c = ctx();
     // HOST_NVN_DUMP_PATCHED=<folder>: the modules as given to the driver written there (to check with spirv-val)
     if (const char* d = getenv("HOST_NVN_DUMP_PATCHED"))
         std::ofstream(std::string(d) + OS_SEP + sh->name + ".spv", std::ios::binary).write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
-    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mi.codeSize = words.size() * 4;
-    mi.pCode = words.data();
-    if (vkCreateShaderModule(c.dev, &mi, nullptr, &sh->module) != VK_SUCCESS) {
-        sh->module = VK_NULL_HANDLE;
-        sh->unsupported = "vkCreateShaderModule failed";
-        return sh;
+    if (inline_spirv()) {
+        sh->inline_code = true;
+        g_code.put(sh->key, std::make_shared<const std::vector<u32>>(std::move(words)));
+    } else {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = words.size() * 4;
+        mi.pCode = words.data();
+        if (vkCreateShaderModule(c.dev, &mi, nullptr, &sh->module) != VK_SUCCESS) {
+            sh->module = VK_NULL_HANDLE;
+            sh->unsupported = "vkCreateShaderModule failed";
+            return sh;
+        }
     }
     std::vector<VkDescriptorSetLayoutBinding> lb;
     for (const Binding& b : sh->bindings)
@@ -713,23 +784,44 @@ std::unique_ptr<Shader> load(u64 key, const Row& row) {
     check(vkCreateDescriptorSetLayout(c.dev, &li, nullptr, &sh->layout), "vkCreateDescriptorSetLayout");
     // HOST_NVN_SKIP_SHADERS=<key>,<key>...: draws with these shaders are skipped (to find one the GPU faults on)
     if (const char* e = getenv("HOST_NVN_SKIP_SHADERS"); e && std::strstr(e, sh->name)) sh->unsupported = "skipped (HOST_NVN_SKIP_SHADERS)";
-    // Shaders the GPU faults on: the free-roam device loss ("instruction pointer invalid", 11-08 and 11-11) came, in every
-    // crash with HOST_NVN_CHECKPOINTS=1, with vs 7bc86687f83f86ab + ps 443a31bcc678184a the oldest unfinished draw (a small
-    // instanced object, 18 indices, drawn into a 960x540 target). Skipping it was the only change that got past the crash
-    // spot; a fresh pipeline cache, a spirv-opt rewrite, no pipeline destruction, and blank cube / depth inputs did not, and
-    // blank vertex-stage textures only delayed it (80 s -> 17 min): data dependent. A sibling vs (a7f9fb429f44f663, same
-    // draw state) works. Skipped until the cause is found; HOST_NVN_KNOWN_BAD=0 draws it.
-    static const bool skip_bad = !getenv("HOST_NVN_KNOWN_BAD") || atoi(getenv("HOST_NVN_KNOWN_BAD")) != 0;
-    if (skip_bad && !sh->unsupported && std::strcmp(sh->name, "7bc86687f83f86ab") == 0) {
-        sh->unsupported = "skipped (the GPU faults on it: HOST_NVN_KNOWN_BAD=0 draws it)";
-        LOG("nvk: shader %s skipped: the GPU faults on it (HOST_NVN_KNOWN_BAD=0 draws it)", sh->name);
-    }
     return sh;
 }
 
 }  // namespace
 
 std::string shader_folder() { return shader_dir(); }
+
+std::shared_ptr<const std::vector<u32>> shader_code(const Shader* s) {
+    if (!s || !s->inline_code) return nullptr;
+    if (auto c = g_code.get(s->key)) return c;
+    const Row* row;
+    {
+        std::scoped_lock lk{g_mu};
+        auto r = g_rows.find(s->key);
+        if (r == g_rows.end()) return nullptr;
+        row = &r->second;   // g_rows is not changed after load_table
+    }
+    HitchTimer ht{HI_SHADER};
+    Shader scratch;   // (make_words fills its reflection again: the shader's own stays as it is)
+    scratch.key = s->key;
+    std::memcpy(scratch.name, s->name, sizeof scratch.name);
+    scratch.stage = s->stage;
+    scratch.set = s->set;
+    scratch.vk_stage = s->vk_stage;
+    scratch.c1 = s->c1;
+    std::vector<u32> words;
+    if (!make_words(&scratch, *row, words)) {
+        LOG("[RED] nvk: shader %s: its SPIR-V could not be read again (%s)", s->name, scratch.unsupported ? scratch.unsupported : "?");
+        return nullptr;
+    }
+    auto c = std::make_shared<const std::vector<u32>>(std::move(words));
+    g_code.put(s->key, c);
+    static std::atomic<u64> n{0};
+    if (const u64 k = ++n; (k & (k - 1)) == 0 && k >= 64)
+        LOG("nvk: inline SPIR-V: %llu shaders read again so far (cache %llu MB, %llu hits, %llu misses)", static_cast<unsigned long long>(k),
+            static_cast<unsigned long long>(g_code.bytes >> 20), static_cast<unsigned long long>(g_code.hits), static_cast<unsigned long long>(g_code.misses));
+    return c;
+}
 
 u64 ssbo_align() {
     static const u64 a = [] {

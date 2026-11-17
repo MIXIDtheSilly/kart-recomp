@@ -770,6 +770,9 @@ VkPipeline make_graphics(const PipeDesc& d, const Shader* ts, const Shader* vs, 
     const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg32{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
                                                                    nullptr, 32};
     u32 nst = 0;
+    // Stages without a module take their SPIR-V inline (shaders.cpp inline_spirv): held here until the pipeline is made
+    std::shared_ptr<const std::vector<u32>> code[3];
+    VkShaderModuleCreateInfo inl[3]{};
     for (const Shader* s : {ts, vs, ps}) {
         if (!s) continue;
         st[nst].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -777,6 +780,12 @@ VkPipeline make_graphics(const PipeDesc& d, const Shader* ts, const Shader* vs, 
         st[nst].module = s->module;
         st[nst].pName = "main";
         if (c.feat.subgroup32 & s->vk_stage) st[nst].pNext = &sg32;
+        if (!s->module) {
+            code[nst] = shader_code(s);
+            if (!code[nst]) return VK_NULL_HANDLE;
+            inl[nst] = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, st[nst].pNext, 0, code[nst]->size() * 4, code[nst]->data()};
+            st[nst].pNext = &inl[nst];
+        }
         nst++;
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -855,6 +864,14 @@ VkPipeline make_compute(const Shader* cs, VkPipelineLayout layout) {
                                                                    nullptr, 32};
     const u64 threads = static_cast<u64>(cs->local[0]) * cs->local[1] * cs->local[2];
     if ((ctx().feat.subgroup32 & VK_SHADER_STAGE_COMPUTE_BIT) && threads <= 32ull * ctx().feat.max_workgroup_subgroups) ci.stage.pNext = &sg32;
+    std::shared_ptr<const std::vector<u32>> code;   // (no module: the SPIR-V inline, shaders.cpp inline_spirv)
+    VkShaderModuleCreateInfo inl{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    if (!cs->module) {
+        code = shader_code(cs);
+        if (!code) return VK_NULL_HANDLE;
+        inl.pNext = ci.stage.pNext, inl.codeSize = code->size() * 4, inl.pCode = code->data();
+        ci.stage.pNext = &inl;
+    }
     ci.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     HitchTimer ht{HI_PIPELINE};
@@ -913,7 +930,7 @@ VkPipeline compute_pipeline(const Shader* cs, VkPipelineLayout layout) {
     return pipeline_for(d, nullptr, cs, nullptr, layout);
 }
 
-bool usable(const Shader* s) { return s && s->module && !s->unsupported; }
+bool usable(const Shader* s) { return shader_has_code(s) && !s->unsupported; }
 
 // One pipeline of the list, made into g_warm (any thread).
 void warm_one(const PipeDesc& d) {
@@ -2882,7 +2899,7 @@ void do_mesh(VkCommandBuffer cb, const nvn::p_draw* d) {
     if (s.prog_bad) { g_stats[ST_NO_SHADER]++; return; }
     if (!ms) { g_stats[ST_NO_PROGRAM]++; return; }
     if (g_skip_mesh) { g_stats[ST_DISABLED]++; return; }
-    if (!ms->module || ms->unsupported || (ts && (!ts->module || ts->unsupported)) || (ps && (!ps->module || ps->unsupported))) {
+    if (!shader_has_code(ms) || ms->unsupported || (ts && (!shader_has_code(ts) || ts->unsupported)) || (ps && (!shader_has_code(ps) || ps->unsupported))) {
         g_stats[ST_UNSUPPORTED]++;
         return;
     }
@@ -2974,7 +2991,7 @@ void do_draw(VkCommandBuffer cb, u32 op, const u8* a, u32 size, const u8* next) 
     const Shader* vs = s.sh[SH_VS];
     const Shader* ps = s.sh[SH_PS];
     if (!vs) { g_stats[ST_NO_PROGRAM]++; return; }
-    if (!vs->module || vs->unsupported || (ps && (!ps->module || ps->unsupported)) || s.sh[SH_GS]) {
+    if (!shader_has_code(vs) || vs->unsupported || (ps && (!shader_has_code(ps) || ps->unsupported)) || s.sh[SH_GS]) {
         g_stats[ST_UNSUPPORTED]++;
         dump_note("draw skipped: vs %s ps %s unsupported", vs->name, ps ? ps->name : "-");
         return;
@@ -3121,7 +3138,7 @@ void do_dispatch(VkCommandBuffer cb, const nvn::p_dispatch* d) {
     const Shader* cs = s.sh[SH_CS];
     if (s.prog_bad) { g_stats[ST_NO_SHADER]++; return; }
     if (!cs) { g_stats[ST_NO_PROGRAM]++; return; }
-    if (!cs->module || cs->unsupported) { g_stats[ST_UNSUPPORTED]++; return; }
+    if (!shader_has_code(cs) || cs->unsupported) { g_stats[ST_UNSUPPORTED]++; return; }
     if (g_skip_cs) { g_stats[ST_DISABLED]++; return; }
     BufferRef ind{};
     if (d->ind && (g_skip_ind || !pool_find(d->ind, 12, ind))) { g_stats[ST_INDIRECT]++; return; }
