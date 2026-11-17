@@ -1427,6 +1427,21 @@ static void fill_triangle(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, uin
     g->Release();
 }
 
+// A closed outline through <n> points, each scaled by <s> and moved to (x, y), with round joins
+static void stroke_closed(const D2D1_POINT_2F* p, int n, float x, float y, float s, float width, uint32_t color) {
+    ID2D1PathGeometry* g = nullptr;
+    ID2D1GeometrySink* k = nullptr;
+    if (FAILED(g_d2d->CreatePathGeometry(&g))) return;
+    g->Open(&k);
+    k->BeginFigure({x + p[0].x * s, y + p[0].y * s}, D2D1_FIGURE_BEGIN_HOLLOW);
+    for (int i = 1; i < n; i++) k->AddLine({x + p[i].x * s, y + p[i].y * s});
+    k->EndFigure(D2D1_FIGURE_END_CLOSED);
+    k->Close();
+    k->Release();
+    g_rt->DrawGeometry(g, brush(color), width, g_round);
+    g->Release();
+}
+
 // What is drawn until pop_xform: scaled by <s> around (cx, cy), then moved down by <dy>
 static std::vector<D2D1_MATRIX_3X2_F> g_xforms;
 static void push_xform(float s, float cx, float cy, float dy) {
@@ -1727,6 +1742,18 @@ static void fill_triangle(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, uin
     cairo_fill(g_cr);
 }
 
+// A closed outline through <n> points, each scaled by <s> and moved to (x, y), with round joins
+static void stroke_closed(const D2D1_POINT_2F* p, int n, float x, float y, float s, float width, uint32_t color) {
+    cairo_new_path(g_cr);
+    cairo_move_to(g_cr, x + p[0].x * s, y + p[0].y * s);
+    for (int i = 1; i < n; i++) cairo_line_to(g_cr, x + p[i].x * s, y + p[i].y * s);
+    cairo_close_path(g_cr);
+    cairo_set_line_join(g_cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_line_width(g_cr, width);
+    source(color);
+    cairo_stroke(g_cr);
+}
+
 // What is drawn until pop_xform: scaled by <s> around (cx, cy), then moved down by <dy>
 static void push_xform(float s, float cx, float cy, float dy) {
     cairo_save(g_cr);
@@ -1773,7 +1800,7 @@ static void frame_end() {
 // UI state
 
 enum {
-    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_UPDATE, B_SETTINGS, B_VER = 50, B_CC = 60, B_DOT = 100, B_OPT = 200,
+    B_NONE = -1, B_BROWSE = 1, B_CONTINUE, B_SETUP, B_BUILD, B_REBUILD, B_PLAY, B_BAKE, B_STOP, B_NUP, B_IMPORT, B_UPDATE, B_SETTINGS, B_DONE, B_VER = 50, B_CC = 60, B_DOT = 100, B_OPT = 200,
 };
 struct Hit {
     int id;
@@ -2058,6 +2085,55 @@ static void draw_play_icon(float x, float y, uint32_t color) {
     fill_triangle({x - 5, y - 8}, {x + 8.5f, y}, {x - 5, y + 8}, color);
 }
 
+// Lucide's "settings" icon (lucide.dev, ISC license): its outline flattened to points round the middle of its 24x24 box
+static const D2D1_POINT_2F LUCIDE_SETTINGS[] = {
+    {0.22f,-10}, {-0.22f,-10}, {-0.74f,-9.93f}, {-1.22f,-9.73f}, {-1.63f,-9.41f}, {-1.95f,-9}, {-2.15f,-8.52f},
+    {-2.22f,-8}, {-2.22f,-7.82f}, {-2.29f,-7.30f}, {-2.49f,-6.82f}, {-2.81f,-6.41f}, {-3.22f,-6.09f}, {-3.65f,-5.84f},
+    {-4.13f,-5.64f}, {-4.65f,-5.57f}, {-5.17f,-5.64f}, {-5.65f,-5.84f}, {-5.80f,-5.92f}, {-6.28f,-6.12f},
+    {-6.80f,-6.19f}, {-7.32f,-6.12f}, {-7.80f,-5.92f}, {-8.21f,-5.60f}, {-8.53f,-5.19f}, {-8.75f,-4.81f},
+    {-8.95f,-4.33f}, {-9.02f,-3.81f}, {-8.95f,-3.29f}, {-8.75f,-2.81f}, {-8.43f,-2.40f}, {-8.02f,-2.08f},
+    {-7.87f,-1.98f}, {-7.46f,-1.66f}, {-7.14f,-1.25f}, {-6.94f,-0.77f}, {-6.87f,-0.26f}, {-6.87f,0.25f}, {-6.94f,0.77f},
+    {-7.14f,1.25f}, {-7.45f,1.67f}, {-7.87f,1.99f}, {-8.02f,2.08f}, {-8.43f,2.40f}, {-8.75f,2.81f}, {-8.95f,3.29f},
+    {-9.02f,3.81f}, {-8.95f,4.33f}, {-8.75f,4.81f}, {-8.53f,5.19f}, {-8.21f,5.60f}, {-7.80f,5.92f}, {-7.32f,6.12f},
+    {-6.80f,6.19f}, {-6.28f,6.12f}, {-5.80f,5.92f}, {-5.65f,5.84f}, {-5.17f,5.64f}, {-4.65f,5.57f}, {-4.13f,5.64f},
+    {-3.65f,5.84f}, {-3.22f,6.09f}, {-2.81f,6.41f}, {-2.49f,6.82f}, {-2.29f,7.30f}, {-2.22f,7.82f}, {-2.22f,8},
+    {-2.15f,8.52f}, {-1.95f,9}, {-1.63f,9.41f}, {-1.22f,9.73f}, {-0.74f,9.93f}, {-0.22f,10}, {0.22f,10},
+    {0.74f,9.93f}, {1.22f,9.73f}, {1.63f,9.41f}, {1.95f,9}, {2.15f,8.52f}, {2.22f,8}, {2.22f,7.82f}, {2.29f,7.30f},
+    {2.49f,6.82f}, {2.81f,6.41f}, {3.22f,6.09f}, {3.65f,5.84f}, {4.13f,5.64f}, {4.65f,5.57f}, {5.17f,5.64f},
+    {5.65f,5.84f}, {5.80f,5.92f}, {6.28f,6.12f}, {6.80f,6.19f}, {7.32f,6.12f}, {7.80f,5.92f}, {8.21f,5.60f},
+    {8.53f,5.19f}, {8.75f,4.80f}, {8.95f,4.32f}, {9.02f,3.80f}, {8.95f,3.28f}, {8.75f,2.80f}, {8.43f,2.39f},
+    {8.02f,2.07f}, {7.87f,1.99f}, {7.45f,1.67f}, {7.14f,1.25f}, {6.94f,0.77f}, {6.87f,0.25f}, {6.87f,-0.25f},
+    {6.94f,-0.77f}, {7.14f,-1.25f}, {7.45f,-1.67f}, {7.87f,-1.99f}, {8.02f,-2.08f}, {8.43f,-2.40f}, {8.75f,-2.81f},
+    {8.95f,-3.29f}, {9.02f,-3.81f}, {8.95f,-4.33f}, {8.75f,-4.81f}, {8.53f,-5.19f}, {8.21f,-5.60f}, {7.80f,-5.92f},
+    {7.32f,-6.12f}, {6.80f,-6.19f}, {6.28f,-6.12f}, {5.80f,-5.92f}, {5.65f,-5.84f}, {5.17f,-5.64f}, {4.65f,-5.57f},
+    {4.13f,-5.64f}, {3.65f,-5.84f}, {3.22f,-6.09f}, {2.81f,-6.41f}, {2.49f,-6.82f}, {2.29f,-7.30f}, {2.22f,-7.82f},
+    {2.22f,-8}, {2.15f,-8.52f}, {1.95f,-9}, {1.63f,-9.41f}, {1.22f,-9.73f}, {0.74f,-9.93f},
+};
+
+// Lucide's settings gear, <size> pixels wide, centred on (x, y), drawn as Lucide draws it: a 2/24 outline
+static void draw_gear(float x, float y, float size, uint32_t color) {
+    const float s = size / 24;
+    stroke_closed(LUCIDE_SETTINGS, (int)(sizeof LUCIDE_SETTINGS / sizeof LUCIDE_SETTINGS[0]), x, y, s, 2 * s, color);
+    stroke_circle(x, y, 3 * s, color, 2 * s);
+}
+
+// The Settings button: a square with a gear, as tall as the other buttons, right-aligned in the panel's title row
+// (x1 its right edge, y the row's top), lit while the Settings page is open; returns where it starts
+static float draw_settings_button(float x1, float y) {
+    const D2D1_RECT_F b{x1 - 40, y - 3, x1, y + 37};
+    g_hits.push_back({B_SETTINGS, b});
+    const Anim a = anim(B_SETTINGS);
+    const float h = ease(a.hov);
+    Lift lift(b, a);
+    if (g_show_settings) fill_round(b, R_CTRL, mix(col::accent, col::accent_hover, h));
+    else {
+        fill_round(b, R_CTRL, mix(col::inset, col::btn_hover, h));
+        stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
+    }
+    draw_gear((b.left + b.right) / 2, (b.top + b.bottom) / 2, 20, g_show_settings ? col::accent_ink : col::text);
+    return b.left - 12;
+}
+
 // The game version: one segmented control, right-aligned in the title row; returns where it starts
 static float draw_versions(float x1, float y, bool enabled) {
     float seg[VERSION_COUNT], total = 6;
@@ -2189,34 +2265,17 @@ static float draw_settings(float x0, float x1, float y) {
         if (i < half) yl = draw_choice(i, x0, w, yl);
         else yr = draw_choice(i, x0 + w + gap, w, yr);
     }
-    y = std::max(yl, yr) + 2;
-    const wchar_t* note = L"Used the next time the game starts. The game's own 3D resolution is 1080p handheld, 1440p docked.";
-    const float nh = measure(note, F_SMALL, x1 - x0, T_WRAP).height;
-    text(note, F_SMALL, {x0, y, x1, y + nh + 4}, col::muted, T_WRAP);
-    return y + nh + 8;
+    return std::max(yl, yr) + 2;
 }
 
-// The Settings page (the button at the top right): the game's settings, then the other HOST_* lines of local.cfg.
+// The Settings page (the gear in the title row): the game's settings, used the next time the game starts
 static void paint_settings_page(D2D1_RECT_F p) {
     const float x0 = p.left + 36, x1 = p.right - 36;
-    float y = p.top + 30;
-    text(L"Settings", F_TITLE, {x0, y - 1, x1 - 140, y + 35}, col::text);
-    button(B_SETTINGS, L"Done", x1 - button_width(L"Done"), y - 4, true, true);
-    y += 42;
-    text(L"How the game looks and runs.", F_BODY, {x0, y, x1, y + 24}, col::muted);
-    y = draw_settings(x0, x1, y + 40);
-    std::wstring others;
-    for (const auto& [k, v] : game_env()) {
-        bool shown = false;
-        for (const Choice& c : CHOICES) shown |= k == c.key;
-        if (!shown) others += (others.empty() ? L"" : L"   ") + k + L"=" + v;
-    }
-#ifdef _WIN32
-    const std::wstring where = L"local.cfg";
-#else
-    const std::wstring where = L"local.linux.cfg or local.cfg";
-#endif
-    if (!others.empty()) text(L"Also in " + where + L": " + others, F_SMALL, {x0, y + 4, x1, y + 40}, col::dim, T_WRAP);
+    const float y = p.top + 30;
+    const float gx = draw_settings_button(x1, y);
+    text(L"Settings", F_TITLE, {x0, y - 1, gx - 140, y + 35}, col::text);
+    button(B_DONE, L"Done", gx - button_width(L"Done"), y - 3, true, true);
+    draw_settings(x0, x1, y + 62);
 }
 
 static void paint_steps(D2D1_RECT_F p) {
@@ -2226,7 +2285,7 @@ static void paint_steps(D2D1_RECT_F p) {
     }
     const float x0 = p.left + 36, x1 = p.right - 36;
     float y = p.top + 30;
-    const float tx1 = draw_versions(x1, y, !g_running);
+    const float tx1 = draw_versions(draw_settings_button(x1, y), y, !g_running);
     text(STEP_TITLES[g_step], F_TITLE, {x0, y - 1, tx1, y + 35}, col::text);
     y += 42;
     const float dh = measure(STEP_TEXT[g_step], F_BODY, x1 - x0, T_WRAP).height;
@@ -2401,22 +2460,6 @@ static void paint() {
         stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
         fill_circle(b.left + 11, (b.top + b.bottom) / 2, 3, on ? col::accent : col::dim);
         text(label, F_SMALL, {b.left + 18, b.top, b.right, b.bottom}, on ? col::text : col::dim, T_CENTER | T_VCENTER);
-    }
-
-    {   // Settings: a small button at the top right (left of the update one), opening its own page
-        const std::wstring label = L"Settings";
-        const float w = measure(label, F_SMALL, 400).width + 26;
-        float right = sz.width - m;
-        if (!g_update_ver.empty() && !g_updating) right -= measure(L"Update to " + g_update_ver, F_SMALL, 400).width + 26 + 8;
-        const D2D1_RECT_F b{right - w, 8, right, 33};
-        g_hits.push_back({B_SETTINGS, b});
-        const float h = ease(anim(B_SETTINGS).hov);
-        if (g_show_settings) fill_round(b, R_CTRL, mix(col::accent, col::accent_hover, h));
-        else {
-            fill_round(b, R_CTRL, mix(col::inset, col::btn_hover, h));
-            stroke_round(b, R_CTRL, mix(col::line_strong, col::muted, h * 0.35f));
-        }
-        text(label, F_SMALL, b, g_show_settings ? col::accent_ink : col::text, T_CENTER | T_VCENTER);
     }
 
     paint_panel({m, cy + r + 48, sz.width - m, sz.height - m});
@@ -3052,7 +3095,7 @@ static void click(int id) {
                 g_status_color = col::muted;
             }
         }
-    } else if (id == B_SETTINGS) {
+    } else if (id == B_SETTINGS || id == B_DONE) {
         g_show_settings = !g_show_settings;
         g_step_ms = GetTickCount64();   // (the page rises into place like a step)
     } else if (id >= B_DOT) {
