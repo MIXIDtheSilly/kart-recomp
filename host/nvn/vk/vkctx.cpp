@@ -385,13 +385,12 @@ void create_device(Device& c) {
     for (u32 h = 0; h < c.mem_props.memoryHeapCount; h++)
         if (!(c.mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) host_heap = std::max(host_heap, c.mem_props.memoryHeaps[h].size);
     if (const u64 cap = test_heap_bytes(false); cap && host_heap) host_heap = std::min(host_heap, cap);
-    c.feat.lean_imports = c.feat.uma || (host_heap && host_heap < (12ull << 30));
-#ifndef _WIN32
-    // Linux: an import makes every page it covers resident and pins it (mem::pin), also pages the game never touches,
-    // and the whole-pool windows held ~2 GB more in a race (8.5 GB of guest memory, 6.5 with small windows). An import
-    // takes ~4 ms here (75 on Windows), so the small windows cost little.
+    // Small windows imported at first use on every machine: an import makes every page it covers resident (Linux pins
+    // them, mem::pin; NVIDIA on Windows makes a fresh 2 GB section 2.1 GB resident at once), also pages the game never
+    // touches, so the overlapping 256 MB windows imported up front held ~5 GB more in a 1.8.0 race on Windows (pool view
+    // 7.9 GB resident, half of it zero pages, against 2.6 GB) and ~2 GB more on Linux. The small windows cost little:
+    // ~50 imports of ~40 ms (Windows; ~4 ms on Linux), nearly all while loading, and no more slow frames in races.
     c.feat.lean_imports = true;
-#endif
     if (const char* e = std::getenv("HOST_NVN_LEAN_IMPORTS"); e && *e) c.feat.lean_imports = std::strcmp(e, "0") != 0;
     if (c.feat.lean_imports && !c.feat.uma)
         LOG("nvk: host heap %llu MB: memory pools imported at first use, in small windows (HOST_NVN_LEAN_IMPORTS=0: off)",
